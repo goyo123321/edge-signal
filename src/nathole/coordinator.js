@@ -45,7 +45,7 @@ function parsePort(sock) {
   return i < 0 ? 0 : parseInt(sock.slice(i + 1), 10) || 0;
 }
 
-// ★ P0 修复：PeerRecord 的唯一标识字段是 `mac`，不是 `macAddr`
+// PeerRecord 的唯一标识字段是 `mac`
 function peerKey(p) {
   return p && p.mac;
 }
@@ -54,7 +54,7 @@ export class NatHoleCoordinator {
   constructor(env = {}) {
     this.analyzer = new NatHoleAnalyzer();
     this.backoff = new Map();
-    this.punchState = new Map();
+    this.punchState = new Map();   // ★ 现在存 { aState, bState, ... }
     this.failCounts = new Map();
     this.lastDispatchedRung = new Map();
 
@@ -84,6 +84,7 @@ export class NatHoleCoordinator {
     this.analyzer.forgetMAC(mac);
   }
 
+  // ★ 分方向记录双方各自的打洞状态
   recordPunchResult(reporterMAC, peerMAC, result) {
     if (!reporterMAC || !peerMAC || !result) return;
     const key = pairKeyFor(reporterMAC, peerMAC);
@@ -95,15 +96,40 @@ export class NatHoleCoordinator {
         ? result.behaviorIndex
         : this.lastDispatchedRung.get(key) ?? null;
 
-    this.punchState.set(key, {
-      state,
-      attempts: result.attempts || 0,
-      detail: result.detail || "",
-      behaviorIndex,
-      at: Date.now(),
-    });
+    let entry = this.punchState.get(key);
+    if (!entry) {
+      entry = {
+        aState: 0,
+        bState: 0,
+        aAttempts: 0,
+        bAttempts: 0,
+        behaviorIndex,
+        at: 0,
+      };
+      this.punchState.set(key, entry);
+    }
 
-    if (state === 3) {
+    const [a, b] = key.split("|");
+    const reporter = String(reporterMAC).toLowerCase();
+
+    if (reporter === a) {
+      entry.aState = state;
+      entry.aAttempts = result.attempts || 0;
+    } else if (reporter === b) {
+      entry.bState = state;
+      entry.bAttempts = result.attempts || 0;
+    } else {
+      // 理论上不会发生
+      return;
+    }
+
+    if (behaviorIndex != null) {
+      entry.behaviorIndex = behaviorIndex;
+    }
+    entry.at = Date.now();
+
+    // 只有双方都 state===3 才认为真成功
+    if (state === 3 && entry.aState === 3 && entry.bState === 3) {
       this.backoff.delete(key);
       this.failCounts.delete(key);
     } else if (state === 2) {
@@ -113,6 +139,10 @@ export class NatHoleCoordinator {
     if (behaviorIndex != null && (state === 2 || state === 3)) {
       this.analyzer.report(key, behaviorIndex, state === 3);
     }
+
+    console.log(
+      `[Coord] recordPunchResult ${reporter} ${state} → pair=${key} aState=${entry.aState} bState=${entry.bState}`
+    );
   }
 
   nextStaggerDeadline() {
@@ -151,8 +181,13 @@ export class NatHoleCoordinator {
 
         const key = pairKeyFor(aKey, bKey);
 
+        // ★ 只有双方都 state===3 才算真成功，否则继续下发
         const prev = this.punchState.get(key);
-        if (prev && prev.state === 3) continue;
+        if (prev && prev.aState === 3 && prev.bState === 3) {
+          paired.add(aKey);
+          paired.add(bKey);
+          continue;
+        }
 
         if (!a.pubSocket || !b.pubSocket) continue;
         const portA = parsePort(a.pubSocket);
