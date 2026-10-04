@@ -1,0 +1,86 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: #0f172a; color: #e2e8f0; min-height: 100vh; line-height: 1.6;
+}
+header {
+  background: #1e293b; padding: 16px 24px; display: flex;
+  justify-content: space-between; align-items: center;
+  border-bottom: 1px solid #334155; position: sticky; top: 0; z-index: 10;
+  flex-wrap: wrap; gap: 12px;
+}
+header h1 { font-size: 18px; font-weight: 600; }
+.controls { display: flex; gap: 12px; align-items: center; font-size: 13px; color: #94a3b8; flex-wrap: wrap; }
+button {
+  background: #3b82f6; color: white; border: none; padding: 6px 14px;
+  border-radius: 6px; cursor: pointer; font-size: 13px; font-family: inherit;
+}
+button:hover { background: #2563eb; }
+button.danger { background: #dc2626; }
+button.danger:hover { background: #b91c1c; }
+button.small { padding: 4px 10px; font-size: 12px; }
+main { padding: 24px; max-width: 1400px; margin: 0 auto; }
+section { margin-bottom: 32px; }
+section h2 { font-size: 16px; font-weight: 600; margin-bottom: 12px; color: #cbd5e1; }
+.rooms-list {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px;
+}
+.room-card {
+  background: #1e293b; border: 1px solid #334155; border-radius: 8px;
+  padding: 16px; cursor: pointer; transition: all 0.15s;
+}
+.room-card:hover { border-color: #3b82f6; transform: translateY(-2px); }
+.room-card.active { border-color: #3b82f6; background: #1e3a5f; }
+.room-card .name { font-weight: 600; font-size: 14px; margin-bottom: 4px; word-break: break-all; }
+.room-card .stats { font-size: 12px; color: #94a3b8; }
+.empty { color: #64748b; padding: 24px; text-align: center; font-size: 14px; }
+table {
+  width: 100%; border-collapse: collapse; background: #1e293b;
+  border-radius: 8px; overflow: hidden; font-size: 13px;
+}
+th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #334155; }
+th {
+  background: #0f172a; font-weight: 600; color: #94a3b8;
+  font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em;
+}
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover { background: #263449; }
+.badge {
+  display: inline-block; padding: 2px 8px; border-radius: 4px;
+  font-size: 11px; font-weight: 600; text-transform: uppercase;
+}
+.badge.p2p { background: #065f46; color: #6ee7b7; }
+.badge.relay { background: #92400e; color: #fcd34d; }
+.badge.unknown { background: #374151; color: #9ca3af; }
+.badge.online { background: #065f46; color: #6ee7b7; }
+.mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; color: #cbd5e1; }
+.bytes { color: #a5b4fc; font-family: ui-monospace, monospace; }
+.conn-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.conn-item { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; }
+.conn-item .peer { color: #94a3b8; max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+a { color: #60a5fa; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* ★ 管理面板入口按钮 */
+.admin-btn {
+  background: #475569;
+  color: white;
+  border: none;
+  padding: 6px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  font-family: inherit;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  transition: background 0.15s;
+}
+.admin-btn:hover {
+  background: #64748b;
+  text-decoration: none;
+  color: white;
+}
+/* ★ TURN 徽章 */
+.badge.turn { background: #1e40af; color: #93c5fd; }
