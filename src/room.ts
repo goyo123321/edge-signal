@@ -204,7 +204,7 @@ export class Room extends DurableObject {
     const delay = SAVE_THROTTLE_MS - (now - this.lastSaveAt);
     this.pendingSaveTimer = setTimeout(() => {
       this.pendingSaveTimer = null;
-      this.lastSaveAt = Date.now(); // ★ 修复：更新 lastSaveAt 防止反复排定时器
+      this.lastSaveAt = Date.now();
       this.saveStateNow().catch(() => {});
     }, delay);
   }
@@ -349,7 +349,7 @@ export class Room extends DurableObject {
       await this.ctx.storage.put(COMMUNITY_STORAGE_KEY, this.community);
     } catch {}
 
-    // ★ 修复：带上 turnRelayAddr
+    // 带上 turnRelayAddr
     const onlinePeersForClient = Array.from(this.peers.values())
       .filter((p) => p.online && p.clientId !== clientId)
       .map((p) => ({
@@ -424,7 +424,7 @@ export class Room extends DurableObject {
       },
     }));
 
-    // ★ 修复：广播 joined 时也带 turnRelayAddr
+    // 广播 joined 时也带 turnRelayAddr
     this.broadcast(clientId, {
       type: "joined",
       from: clientId,
@@ -460,7 +460,6 @@ export class Room extends DurableObject {
 
     switch (msg.type) {
       case "ping":
-        // ★ 修复：回 pong
         try {
           ws.send(JSON.stringify({ type: "pong", from, t: msg.ts || Date.now() }));
         } catch {}
@@ -554,16 +553,12 @@ export class Room extends DurableObject {
         this.broadcast(from, { ...msg, from });
         return;
 
-      // ★ 已删除死代码 case "turn_request"（客户端不走此路径）
-
-      // Edge 上报自己的 TURN 中继地址
       case "turn_relay_info": {
         if (!peer) return;
         const relayAddr = msg.relayAddr || "";
         if (!relayAddr) return;
         peer.turnRelayAddr = relayAddr;
         this.saveStateThrottled();
-        // 广播给其他 Peer
         for (const [id, p] of this.peers) {
           if (id === from) continue;
           if (!p.online) continue;
@@ -599,7 +594,7 @@ export class Room extends DurableObject {
     if (data.length < 20) return;
     if (data[0] >> 4 !== 4) return;
 
-    // ★ 修复：只允许 10.64.0.0/24 网段
+    // 只允许 10.64.0.0/24
     if (data[16] !== 10 || data[17] !== 64 || data[18] !== 0) return;
 
     const from = this.findClientId(ws);
@@ -772,13 +767,15 @@ export class Room extends DurableObject {
     );
   }
 
+  // ★ 更新 punchState 字段结构（aState / bState）
   private getNatHoleStatusResponse(): Response {
     const c = this.coordinator as any;
     const now = Date.now();
     const backoff: any[] = [];
     for (const [k, v] of c.backoff) {
       backoff.push({
-        pair: k, signature: v.signature,
+        pair: k,
+        signature: v.signature,
         remainingMs: Math.max(0, v.nextAllowedAt - now),
         staggered: !!v.staggered,
       });
@@ -786,8 +783,13 @@ export class Room extends DurableObject {
     const punch: any[] = [];
     for (const [k, v] of c.punchState) {
       punch.push({
-        pair: k, state: v.state, attempts: v.attempts,
-        behaviorIndex: v.behaviorIndex, ageMs: now - v.at,
+        pair: k,
+        aState: v.aState,
+        bState: v.bState,
+        aAttempts: v.aAttempts,
+        bAttempts: v.bAttempts,
+        behaviorIndex: v.behaviorIndex,
+        ageMs: now - v.at,
       });
     }
     return new Response(JSON.stringify({ now, backoff, punch }, null, 2), {
@@ -802,7 +804,6 @@ export class Room extends DurableObject {
     let wakeAt = Date.now() + STAGGER_FALLBACK_SAVE_MS;
     const staggerAt = this.coordinator.nextStaggerDeadline();
     if (staggerAt != null && staggerAt < wakeAt) wakeAt = staggerAt;
-    // ★ 已删除 pendingStaggerAt 死代码判断
     await this.ctx.storage.setAlarm(wakeAt);
     this.saveAlarmScheduled = true;
   }
@@ -881,7 +882,6 @@ export class Room extends DurableObject {
       if (this.ipCounter > 254) this.ipCounter = 2;
       if (!this.ipToClient.has(ip)) return ip;
     }
-    // ★ 修复：池满时抛错，而不是返回可能冲突的 IP
     throw new Error("IP pool exhausted");
   }
 
@@ -896,7 +896,6 @@ export class Room extends DurableObject {
         method: "POST",
         body: JSON.stringify({
           roomName: this.community,
-          // ★ 修复：peerCount = 全部设备数，不再是 online 数
           peerCount: this.peers.size,
           onlineCount: onlineCount(this.peers),
           offlineCount: this.peers.size - onlineCount(this.peers),
