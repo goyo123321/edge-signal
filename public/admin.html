@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>edge-signal 管理面板</title>
+  <link rel="stylesheet" href="/style.css" />
+  <style>
+    .prompt { max-width: 400px; margin: 80px auto; background: #1e293b;
+      border: 1px solid #334155; border-radius: 12px; padding: 32px; }
+    .prompt h2 { margin-bottom: 16px; font-size: 18px; color: #e2e8f0; }
+    .prompt input { width: 100%; padding: 10px 14px; border: 1px solid #334155;
+      border-radius: 6px; background: #0f172a; color: #e2e8f0;
+      font-size: 14px; font-family: inherit; margin-bottom: 12px; }
+    .prompt input:focus { outline: none; border-color: #3b82f6; }
+    .prompt button { width: 100%; padding: 10px; }
+    .toast { position: fixed; top: 80px; right: 24px; background: #1e293b;
+      border: 1px solid #334155; border-radius: 8px; padding: 12px 20px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.3); font-size: 14px;
+      transform: translateX(150%); transition: transform 0.3s; z-index: 100;
+      max-width: 320px; }
+    .toast.show { transform: translateX(0); }
+    .toast.error { border-color: #dc2626; background: #7f1d1d; }
+    .toast.success { border-color: #16a34a; background: #14532d; }
+    .back-link { color: #60a5fa; text-decoration: none; font-size: 13px; margin-left: 12px; }
+    .back-link:hover { text-decoration: underline; }
+    .row-actions { display: flex; gap: 6px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🔧 edge-signal 管理面板</h1>
+    <div class="controls">
+      <span id="status">--</span>
+      <a href="/" class="back-link">← 公开面板</a>
+      <button id="refreshBtn">刷新</button>
+      <button id="clearAllBtn" class="danger">清空全部</button>
+      <button id="logoutBtn">退出</button>
+    </div>
+  </header>
+  <main>
+    <div id="tokenPrompt" class="prompt" style="display:none;">
+      <h2>输入管理员 Token</h2>
+      <input type="password" id="tokenInput" placeholder="ADMIN_TOKEN" autocomplete="off" />
+      <button id="tokenSubmit">进入</button>
+    </div>
+    <div id="content" style="display:none;">
+      <section>
+        <h2>房间列表 (<span id="roomCount">0</span>)</h2>
+        <div id="roomsList" class="rooms-list"><p class="empty">加载中...</p></div>
+      </section>
+      <section id="detailSection" style="display:none;">
+        <h2>房间详情：<span id="detailRoomName"></span></h2>
+        <div id="detailContent"></div>
+      </section>
+    </div>
+  </main>
+  <div id="toast" class="toast"></div>
+  <script src="/admin.js"></script>
+</body>
+</html>
