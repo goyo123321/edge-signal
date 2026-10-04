@@ -1,19 +1,41 @@
+// ============================================================
+// 轮询配置（想改间隔改这里）
+// ============================================================
+const POLL_INTERVAL_MS = 30000;         // 页面可见时：30 秒
+const POLL_INTERVAL_HIDDEN_MS = 0;      // 页面不可见时：0 = 完全停止
+const POLL_BACKOFF_BASE_MS = 5000;      // 首次失败等 5 秒
+const POLL_BACKOFF_MULTIPLIER = 2;      // 每次失败翻倍
+const POLL_BACKOFF_MAX_MS = 300000;     // 上限 5 分钟
+
+// ============================================================
+// 状态
+// ============================================================
 const state = { rooms: [], selectedRoom: null };
 
+let pollTimer = null;
+let consecutiveFailures = 0;
+
+// ============================================================
+// 数据请求
+// ============================================================
 async function fetchRooms() {
-  try {
-    const r = await fetch("/api/public/rooms");
-    return r.ok ? await r.json() : [];
-  } catch { return []; }
+  // 网络错误或非 2xx 时抛错，让轮询层决定是否退避
+  const r = await fetch("/api/public/rooms");
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
 }
 
 async function fetchRoomStatus(name) {
+  // 详情是可选展示，失败静默返回 null（不影响轮询健康）
   try {
     const r = await fetch(`/api/public/status/${encodeURIComponent(name)}`);
     return r.ok ? await r.json() : null;
   } catch { return null; }
 }
 
+// ============================================================
+// 格式化
+// ============================================================
 function fmtBytes(b) {
   if (!b) return "0 B";
   const u = ["B", "KB", "MB", "GB", "TB"];
@@ -79,6 +101,9 @@ function formatConnStatus(connections) {
   return parts.join(" ");
 }
 
+// ============================================================
+// 渲染
+// ============================================================
 function renderRooms(rooms) {
   const c = document.getElementById("roomsList");
   if (!rooms.length) {
@@ -176,10 +201,21 @@ function renderDetail(status) {
   `;
 }
 
+// ============================================================
+// 刷新逻辑
+// ============================================================
 async function refreshAll() {
-  state.rooms = await fetchRooms();
+  const rooms = await fetchRooms();  // 失败会 throw
+  state.rooms = rooms;
   renderRooms(state.rooms);
-  if (state.selectedRoom) await refreshDetail();
+  if (state.selectedRoom) {
+    try {
+      await refreshDetail();
+    } catch (e) {
+      // 详情失败不影响列表展示
+      console.warn("[poll] refreshDetail failed:", e);
+    }
+  }
   document.getElementById("lastUpdate").textContent =
     `最后更新：${new Date().toLocaleTimeString()}`;
 }
@@ -190,6 +226,90 @@ async function refreshDetail() {
   renderDetail(status);
 }
 
-document.getElementById("refreshBtn").addEventListener("click", refreshAll);
-refreshAll();
-setInterval(refreshAll, 5000);
+// ============================================================
+// 轮询调度（含指数退避 + 页面可见性）
+// ============================================================
+function getPollDelay() {
+  if (document.hidden) {
+    return POLL_INTERVAL_HIDDEN_MS;
+  }
+  if (consecutiveFailures > 0) {
+    const delay = POLL_BACKOFF_BASE_MS *
+      Math.pow(POLL_BACKOFF_MULTIPLIER, consecutiveFailures - 1);
+    return Math.min(delay, POLL_BACKOFF_MAX_MS);
+  }
+  return POLL_INTERVAL_MS;
+}
+
+function schedulePoll() {
+  if (pollTimer) {
+    clearTimeout(pollTimer);
+    pollTimer = null;
+  }
+  const delay = getPollDelay();
+  if (delay <= 0) return;  // 停止调度
+
+  pollTimer = setTimeout(async () => {
+    pollTimer = null;
+    try {
+      await refreshAll();
+      consecutiveFailures = 0;
+    } catch (e) {
+      consecutiveFailures++;
+      const nextDelay = getPollDelay();
+      console.warn(
+        `[poll] 失败 ${consecutiveFailures} 次，${Math.round(nextDelay / 1000)}s 后重试:`,
+        e
+      );
+    }
+    schedulePoll();
+  }, delay);
+}
+
+// ============================================================
+// 事件绑定
+// ============================================================
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) {
+    // 恢复可见：立即刷一次，重置退避
+    (async () => {
+      try {
+        await refreshAll();
+        consecutiveFailures = 0;
+      } catch (e) {
+        consecutiveFailures++;
+      }
+      schedulePoll();
+    })();
+  } else {
+    // 隐藏：取消定时器，按配置决定是否重排
+    if (pollTimer) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+    schedulePoll();
+  }
+});
+
+document.getElementById("refreshBtn").addEventListener("click", async () => {
+  try {
+    await refreshAll();
+    consecutiveFailures = 0;
+  } catch (e) {
+    console.error("[manual refresh] failed:", e);
+  }
+  schedulePoll();
+});
+
+// ============================================================
+// 启动
+// ============================================================
+(async () => {
+  try {
+    await refreshAll();
+  } catch (e) {
+    console.error("[init] refreshAll failed:", e);
+    consecutiveFailures++;
+  }
+  schedulePoll();
+})();
