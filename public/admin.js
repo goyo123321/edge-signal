@@ -1,5 +1,23 @@
+// ============================================================
+// 轮询配置
+// ============================================================
+const POLL_INTERVAL_MS = 30000;
+const POLL_INTERVAL_HIDDEN_MS = 0;
+const POLL_BACKOFF_BASE_MS = 5000;
+const POLL_BACKOFF_MULTIPLIER = 2;
+const POLL_BACKOFF_MAX_MS = 300000;
+
+// ============================================================
+// 状态
+// ============================================================
 const state = { token: "", rooms: [], selectedRoom: null };
 
+let pollTimer = null;
+let consecutiveFailures = 0;
+
+// ============================================================
+// Token 处理
+// ============================================================
 function loadToken() {
   const params = new URLSearchParams(location.search);
   const urlToken = params.get("token");
@@ -19,7 +37,9 @@ function logout() {
   showPrompt();
 }
 
-// ★ 修复：token 用 Header 传递，不再拼到 query string
+// ============================================================
+// API 调用
+// ============================================================
 async function apiCall(path, options = {}) {
   const url = new URL(path, location.origin);
   const resp = await fetch(url.toString(), {
@@ -48,21 +68,21 @@ async function apiCall(path, options = {}) {
   return resp.json();
 }
 
+// ============================================================
+// 数据请求
+// ============================================================
 async function fetchRooms() {
-  try {
-    const rooms = await apiCall("/api/admin/rooms");
-    state.rooms = rooms || [];
-    renderRooms();
-    document.getElementById("roomCount").textContent = state.rooms.length;
-    document.getElementById("status").textContent =
-      `更新于 ${new Date().toLocaleTimeString()}`;
-  } catch (e) { console.error("fetchRooms failed:", e); }
+  const rooms = await apiCall("/api/admin/rooms");
+  return rooms || [];
 }
 
 async function fetchRoomStatus(roomName) {
   return apiCall(`/api/admin/status/${encodeURIComponent(roomName)}`);
 }
 
+// ============================================================
+// 操作（不变）
+// ============================================================
 async function clearRoom(roomName) {
   if (!confirm(`确定清空房间 "${roomName}"？\n\n⚠️ 如果房间里有设备在线，操作会被拒绝。`)) return;
   try {
@@ -72,8 +92,7 @@ async function clearRoom(roomName) {
       state.selectedRoom = null;
       document.getElementById("detailSection").style.display = "none";
     }
-    await fetchRooms();
-    if (state.selectedRoom) await refreshDetail();
+    await refreshAll();
   } catch (e) {
     if (e.status === 409) {
       const n = e.body?.onlineCount || 0;
@@ -98,8 +117,7 @@ async function kickPeer(roomName, cid) {
       { method: "POST" }
     );
     showToast(`✅ 已踢出`, "success");
-    await refreshDetail();
-    await fetchRooms();
+    await refreshAll();
   } catch (e) { showToast(`❌ 踢人失败: ${e.message}`, "error"); }
 }
 
@@ -124,12 +142,15 @@ async function clearAll() {
 
     state.selectedRoom = null;
     document.getElementById("detailSection").style.display = "none";
-    await fetchRooms();
+    await refreshAll();
   } catch (e) {
     showToast(`❌ 清空失败: ${e.message}`, "error");
   }
 }
 
+// ============================================================
+// 渲染
+// ============================================================
 function renderRooms() {
   const c = document.getElementById("roomsList");
   if (!state.rooms.length) {
@@ -265,6 +286,24 @@ async function refreshDetail() {
   }
 }
 
+// ============================================================
+// 刷新逻辑
+// ============================================================
+async function refreshAll() {
+  const rooms = await fetchRooms();
+  state.rooms = rooms;
+  renderRooms();
+  document.getElementById("roomCount").textContent = state.rooms.length;
+  document.getElementById("status").textContent =
+    `更新于 ${new Date().toLocaleTimeString()}`;
+  if (state.selectedRoom) {
+    await refreshDetail();
+  }
+}
+
+// ============================================================
+// 格式化（不变）
+// ============================================================
 function formatConnStatus(connections) {
   if (!connections || Object.keys(connections).length === 0) {
     return `<span style="color:#64748b">--</span>`;
@@ -334,12 +373,85 @@ function showPrompt() {
   document.getElementById("detailSection").style.display = "none";
   document.getElementById("tokenInput").value = "";
   document.getElementById("tokenInput").focus();
+  // 停止轮询
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
 }
 function showContent() {
   document.getElementById("tokenPrompt").style.display = "none";
   document.getElementById("content").style.display = "block";
-  fetchRooms();
+  (async () => {
+    try {
+      await refreshAll();
+      consecutiveFailures = 0;
+    } catch (e) {
+      console.error("[admin] init refreshAll failed:", e);
+      consecutiveFailures++;
+    }
+    schedulePoll();
+  })();
 }
+
+// ============================================================
+// 轮询调度（与 app.js 同构）
+// ============================================================
+function getPollDelay() {
+  if (document.hidden) return POLL_INTERVAL_HIDDEN_MS;
+  if (consecutiveFailures > 0) {
+    const delay = POLL_BACKOFF_BASE_MS *
+      Math.pow(POLL_BACKOFF_MULTIPLIER, consecutiveFailures - 1);
+    return Math.min(delay, POLL_BACKOFF_MAX_MS);
+  }
+  return POLL_INTERVAL_MS;
+}
+
+function schedulePoll() {
+  if (pollTimer) {
+    clearTimeout(pollTimer);
+    pollTimer = null;
+  }
+  if (!state.token) return;  // 未登录不轮询
+  const delay = getPollDelay();
+  if (delay <= 0) return;
+
+  pollTimer = setTimeout(async () => {
+    pollTimer = null;
+    try {
+      await refreshAll();
+      consecutiveFailures = 0;
+    } catch (e) {
+      consecutiveFailures++;
+      // 401 已经 logout，不必继续轮询
+      if (e.message === "Unauthorized") return;
+      const nextDelay = getPollDelay();
+      console.warn(
+        `[admin poll] 失败 ${consecutiveFailures} 次，${Math.round(nextDelay / 1000)}s 后重试:`,
+        e
+      );
+    }
+    schedulePoll();
+  }, delay);
+}
+
+// ============================================================
+// 事件绑定
+// ============================================================
+document.addEventListener("visibilitychange", () => {
+  if (!state.token) return;
+  if (!document.hidden) {
+    (async () => {
+      try {
+        await refreshAll();
+        consecutiveFailures = 0;
+      } catch (e) {
+        consecutiveFailures++;
+      }
+      schedulePoll();
+    })();
+  } else {
+    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+    schedulePoll();
+  }
+});
 
 document.getElementById("tokenSubmit").addEventListener("click", () => {
   const t = document.getElementById("tokenInput").value.trim();
@@ -352,18 +464,20 @@ document.getElementById("tokenInput").addEventListener("keydown", (e) => {
   if (e.key === "Enter") document.getElementById("tokenSubmit").click();
 });
 document.getElementById("refreshBtn").addEventListener("click", async () => {
-  await fetchRooms();
-  if (state.selectedRoom) await refreshDetail();
+  try {
+    await refreshAll();
+    consecutiveFailures = 0;
+  } catch (e) {
+    console.error("[manual refresh] failed:", e);
+  }
+  schedulePoll();
 });
 document.getElementById("clearAllBtn").addEventListener("click", clearAll);
 document.getElementById("logoutBtn").addEventListener("click", logout);
 
-setInterval(async () => {
-  if (!state.token) return;
-  await fetchRooms();
-  if (state.selectedRoom) await refreshDetail();
-}, 5000);
-
+// ============================================================
+// 启动
+// ============================================================
 state.token = loadToken();
 if (state.token) showContent();
 else showPrompt();
