@@ -14,6 +14,9 @@ export interface Env {
   TURN_PASSWORD?: string;
 }
 
+// ★ 保留默认值，可通过环境变量 ADMIN_TOKEN 覆盖
+const DEFAULT_ADMIN_TOKEN = "12332100";
+
 function safeEqual(a: string, b: string): boolean {
   if (!a || !b) return false;
   if (a.length !== b.length) return false;
@@ -24,23 +27,20 @@ function safeEqual(a: string, b: string): boolean {
   return result === 0;
 }
 
-// ★ 修复：未配置 ADMIN_TOKEN 时返回 null，强制管理员必须配置
-function getAdminToken(env: Env): string | null {
+function getAdminToken(env: Env): string {
   if (env.ADMIN_TOKEN && env.ADMIN_TOKEN.trim() !== "") {
     return env.ADMIN_TOKEN;
   }
-  return null;
+  return DEFAULT_ADMIN_TOKEN;
 }
 
 function checkAdmin(request: Request, env: Env): boolean {
-  const expected = getAdminToken(env);
-  if (!expected) return false; // ★ 修复：未配置就拒绝
   const url = new URL(request.url);
   const provided =
     url.searchParams.get("token") ||
     request.headers.get("X-Admin-Token") ||
     "";
-  return safeEqual(provided, expected);
+  return safeEqual(provided, getAdminToken(env));
 }
 
 function jsonResp(obj: any, status = 200): Response {
@@ -291,7 +291,7 @@ export default {
       return reg.fetch(new Request("http://internal/rooms"));
     }
 
-    // ★ 修复：用 slice 替代 split("/")[4]，防止多段路径截断
+    // 用 slice 替代 split("/")[4]，防止多段路径截断
     if (pathname.startsWith("/api/public/status/")) {
       const roomId = decodeURIComponent(
         pathname.slice("/api/public/status/".length)
