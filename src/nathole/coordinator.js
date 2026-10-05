@@ -35,16 +35,21 @@ function parsePort(sock) {
   return i < 0 ? 0 : parseInt(sock.slice(i + 1), 10) || 0;
 }
 
-// ★ P0 修复：PeerRecord 字段是 `mac`，不是 `macAddr`
-function peerKey(p) {
-  return p && p.mac;
+function peerKey(p) { return p && p.mac; }
+
+// 检测 IPv6 地址（形如 [::1]:port 或 2409:xxx:...:port）
+function isIPv6Sock(sock) {
+  if (!sock) return false;
+  if (sock.includes("[")) return true;
+  const colonCount = (sock.match(/:/g) || []).length;
+  return colonCount > 1;
 }
 
 export class NatHoleCoordinator {
   constructor(env = {}) {
     this.analyzer = new NatHoleAnalyzer();
     this.backoff = new Map();
-    this.punchState = new Map();   // { aState, bState, aAttempts, bAttempts, behaviorIndex, at }
+    this.punchState = new Map();
     this.failCounts = new Map();
     this.lastDispatchedRung = new Map();
 
@@ -63,7 +68,6 @@ export class NatHoleCoordinator {
     this.analyzer.forgetMAC(mac);
   }
 
-  // ★ 修复：分方向记录双方状态
   recordPunchResult(reporterMAC, peerMAC, result) {
     if (!reporterMAC || !peerMAC || !result) return;
     const key = pairKeyFor(reporterMAC, peerMAC);
@@ -88,7 +92,6 @@ export class NatHoleCoordinator {
     if (behaviorIndex != null) entry.behaviorIndex = behaviorIndex;
     entry.at = Date.now();
 
-    // ★ 双方都 state===3 才认为真成功
     if (state === 3 && entry.aState === 3 && entry.bState === 3) {
       this.backoff.delete(key);
       this.failCounts.delete(key);
@@ -135,7 +138,6 @@ export class NatHoleCoordinator {
 
         const key = pairKeyFor(aKey, bKey);
 
-        // ★ 双方都 state===3 才跳过
         const prev = this.punchState.get(key);
         if (prev && prev.aState === 3 && prev.bState === 3) {
           paired.add(aKey);
@@ -144,6 +146,13 @@ export class NatHoleCoordinator {
         }
 
         if (!a.pubSocket || !b.pubSocket) continue;
+
+        if (isIPv6Sock(a.pubSocket) || isIPv6Sock(b.pubSocket)) {
+          paired.add(aKey);
+          paired.add(bKey);
+          continue;
+        }
+
         const portA = parsePort(a.pubSocket);
         const portB = parsePort(b.pubSocket);
         const sender = portA <= portB ? a : b;
@@ -219,7 +228,6 @@ export class NatHoleCoordinator {
           ...shared,
         };
 
-        // ★ 修复：signature 去掉 @rung，让退避生效
         const signature = `${senderKey}->${receiverKey}`;
         const prevBackoff = this.backoff.get(key);
 
