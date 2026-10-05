@@ -73,6 +73,35 @@ export class Room extends DurableObject {
     this.coordinator = new NatHoleCoordinator(env || {});
   }
 
+  /**
+   * ★ 从 endpoint 字符串 "ip:port" 里提取 IP
+   */
+  private extractIp(endpoint: string): string {
+    if (!endpoint) return "";
+    const i = endpoint.lastIndexOf(":");
+    if (i < 0) return endpoint;
+    return endpoint.slice(0, i);
+  }
+
+  /**
+   * ★ 从 peer 里取它"正确的"公网地址
+   *   优先级：publicEndpoint（STUN 结果） > p2pEndpoint > cf-connecting-ip（兜底）
+   */
+  private peerPublicAddr(p: PeerRecord): { ip: string; port: number } {
+    if (p.publicEndpoint) {
+      const ip = this.extractIp(p.publicEndpoint);
+      const port = this.extractPort(p.publicEndpoint);
+      if (ip && port > 0) return { ip, port };
+    }
+    if (p.p2pEndpoint) {
+      const ip = this.extractIp(p.p2pEndpoint);
+      const port = this.extractPort(p.p2pEndpoint);
+      if (ip && port > 0) return { ip, port };
+    }
+    // 兜底：cf-connecting-ip + 无端口（打洞不可能成功，但不崩溃）
+    return { ip: p._publicIp || "", port: 0 };
+  }
+
   private async ensureLoaded(): Promise<void> {
     if (this.loadedFromStorage) return;
     this.loadedFromStorage = true;
@@ -163,7 +192,6 @@ export class Room extends DurableObject {
     }
   }
 
-  // ★ 修复：延迟回调也更新 lastSaveAt
   private saveStateThrottled(): void {
     const now = Date.now();
     if (now - this.lastSaveAt >= SAVE_THROTTLE_MS) {
@@ -175,7 +203,7 @@ export class Room extends DurableObject {
     const delay = SAVE_THROTTLE_MS - (now - this.lastSaveAt);
     this.pendingSaveTimer = setTimeout(() => {
       this.pendingSaveTimer = null;
-      this.lastSaveAt = Date.now();   // ★ 修复
+      this.lastSaveAt = Date.now();
       this.saveStateNow().catch(() => {});
     }, delay);
   }
@@ -264,18 +292,21 @@ export class Room extends DurableObject {
     const now = Date.now();
     try { await this.ctx.storage.put(COMMUNITY_STORAGE_KEY, this.community); } catch {}
 
-    // ★ 修复：ready 里带 turnRelayAddr
+    // ★ 修复：publicIp 从 publicEndpoint 解析，不能用 cf-connecting-ip
     const onlinePeersForClient = Array.from(this.peers.values())
       .filter((p) => p.online && p.clientId !== clientId)
-      .map((p) => ({
-        id: p.clientId,
-        virtualIp: p.virtualIp,
-        publicIp: p._publicIp || "",
-        publicPort: p.publicEndpoint ? this.extractPort(p.publicEndpoint) : this.extractPort(p.p2pEndpoint),
-        sharePort: p.sharePort || 0,
-        natType: p.natType || "unknown",
-        turnRelayAddr: p.turnRelayAddr || "",
-      }));
+      .map((p) => {
+        const addr = this.peerPublicAddr(p);
+        return {
+          id: p.clientId,
+          virtualIp: p.virtualIp,
+          publicIp: addr.ip,
+          publicPort: addr.port,
+          sharePort: p.sharePort || 0,
+          natType: p.natType || "unknown",
+          turnRelayAddr: p.turnRelayAddr || "",
+        };
+      });
 
     let peer = this.peers.get(clientId);
     if (peer) {
@@ -310,6 +341,7 @@ export class Room extends DurableObject {
       payload: {
         id: clientId,
         virtualIp: peer.virtualIp,
+        yourPublicIp: publicIp,
         peers: onlinePeersForClient,
         shares: Array.from(this.shareAnnounces.entries())
           .filter(([id]) => { const p = this.peers.get(id); return p && p.online; })
@@ -317,14 +349,15 @@ export class Room extends DurableObject {
       },
     }));
 
-    // ★ 修复：joined 里带 turnRelayAddr
+    // ★ 修复：joined 里也要用 peerPublicAddr
+    const peerAddr = this.peerPublicAddr(peer);
     this.broadcast(clientId, {
       type: "joined", from: clientId,
       payload: {
         id: clientId,
         virtualIp: peer.virtualIp,
-        publicIp: peer._publicIp || "",
-        publicPort: peer.publicEndpoint ? this.extractPort(peer.publicEndpoint) : this.extractPort(peer.p2pEndpoint),
+        publicIp: peerAddr.ip,
+        publicPort: peerAddr.port,
         sharePort: peer.sharePort || 0,
         natType: peer.natType || "unknown",
         turnRelayAddr: peer.turnRelayAddr || "",
@@ -348,7 +381,6 @@ export class Room extends DurableObject {
     if (peer) peer.lastSeen = Date.now();
 
     switch (msg.type) {
-      // ★ 修复：ping 回 pong
       case "ping":
         try { ws.send(JSON.stringify({ type: "pong", from, t: msg.ts || Date.now() })); } catch {}
         return;
@@ -377,12 +409,13 @@ export class Room extends DurableObject {
           }
           this.saveStateThrottled();
           if (oldSharePort === 0 && peer.sharePort > 0) {
+            const addr = this.peerPublicAddr(peer);
             this.broadcast(from, {
               type: "joined", from,
               payload: {
                 id: from, virtualIp: peer.virtualIp,
-                publicIp: peer._publicIp || "",
-                publicPort: peer.publicEndpoint ? this.extractPort(peer.publicEndpoint) : this.extractPort(peer.p2pEndpoint),
+                publicIp: addr.ip,
+                publicPort: addr.port,
                 sharePort: peer.sharePort,
                 natType: peer.natType || "unknown",
                 turnRelayAddr: peer.turnRelayAddr || "",
@@ -424,8 +457,6 @@ export class Room extends DurableObject {
         this.broadcast(from, { ...msg, from });
         return;
 
-      // ★ 修复：删除死代码 case "turn_request"
-
       case "turn_relay_info": {
         if (!peer) return;
         const relayAddr = msg.relayAddr || "";
@@ -459,8 +490,6 @@ export class Room extends DurableObject {
     const data = new Uint8Array(buffer);
     if (data.length < 20) return;
     if (data[0] >> 4 !== 4) return;
-
-    // ★ 修复：只允许 10.64.0.0/24
     if (data[16] !== 10 || data[17] !== 64 || data[18] !== 0) return;
 
     const from = this.findClientId(ws);
@@ -581,7 +610,6 @@ export class Room extends DurableObject {
     }), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
   }
 
-  // ★ 修复：用 aState/bState
   private getNatHoleStatusResponse(): Response {
     const c = this.coordinator as any;
     const now = Date.now();
@@ -608,7 +636,6 @@ export class Room extends DurableObject {
     let wakeAt = Date.now() + STAGGER_FALLBACK_SAVE_MS;
     const staggerAt = this.coordinator.nextStaggerDeadline();
     if (staggerAt != null && staggerAt < wakeAt) wakeAt = staggerAt;
-    // ★ 修复：删除 pendingStaggerAt 死代码
     await this.ctx.storage.setAlarm(wakeAt);
     this.saveAlarmScheduled = true;
   }
@@ -672,7 +699,6 @@ export class Room extends DurableObject {
     }
   }
 
-  // ★ 修复：池满抛错
   private allocateIp(): string {
     for (let i = 0; i < 254; i++) {
       const ip = `10.64.0.${this.ipCounter}`;
@@ -683,7 +709,6 @@ export class Room extends DurableObject {
     throw new Error("IP pool exhausted");
   }
 
-  // ★ 修复：peerCount = peers.size
   private async reportToRegistry(force = false): Promise<void> {
     const now = Date.now();
     if (!force && now - this.lastReport < 5000) return;
