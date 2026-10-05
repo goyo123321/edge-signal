@@ -15,21 +15,11 @@ const FAIL_BACKOFF_CAP_MS = 300000;
 
 function classifyNat(peer) {
   if (!peer || !peer.natType) {
-    return {
-      natType: "unknown",
-      portsDifference: 0,
-      regularPortsChange: false,
-      behavior: "BehaviorPortChanged",
-    };
+    return { natType: "unknown", portsDifference: 0, regularPortsChange: false, behavior: "BehaviorPortChanged" };
   }
   const t = peer.natType;
   if (t === "EasyNAT") {
-    return {
-      natType: "EasyNAT",
-      portsDifference: 0,
-      regularPortsChange: false,
-      behavior: "BehaviorNoChange",
-    };
+    return { natType: "EasyNAT", portsDifference: 0, regularPortsChange: false, behavior: "BehaviorNoChange" };
   }
   return {
     natType: "HardNAT",
@@ -45,7 +35,7 @@ function parsePort(sock) {
   return i < 0 ? 0 : parseInt(sock.slice(i + 1), 10) || 0;
 }
 
-// PeerRecord 的唯一标识字段是 `mac`
+// ★ P0 修复：PeerRecord 字段是 `mac`，不是 `macAddr`
 function peerKey(p) {
   return p && p.mac;
 }
@@ -54,81 +44,51 @@ export class NatHoleCoordinator {
   constructor(env = {}) {
     this.analyzer = new NatHoleAnalyzer();
     this.backoff = new Map();
-    this.punchState = new Map();   // ★ 现在存 { aState, bState, ... }
+    this.punchState = new Map();   // { aState, bState, aAttempts, bAttempts, behaviorIndex, at }
     this.failCounts = new Map();
     this.lastDispatchedRung = new Map();
 
-    this.staggerMs = parseInt(
-      env.NAT_PUNCH_STAGGER_MS ?? PUNCH_STAGGER_MS_DEFAULT,
-      10
-    );
-    this.senderDelayMs = parseInt(
-      env.NAT_SENDER_DISPATCH_DELAY_MS ?? SENDER_DISPATCH_DELAY_MS_DEFAULT,
-      10
-    );
+    this.staggerMs = parseInt(env.NAT_PUNCH_STAGGER_MS ?? PUNCH_STAGGER_MS_DEFAULT, 10);
+    this.senderDelayMs = parseInt(env.NAT_SENDER_DISPATCH_DELAY_MS ?? SENDER_DISPATCH_DELAY_MS_DEFAULT, 10);
   }
 
   clearPairStateFor(mac) {
     if (!mac) return;
     const needle = String(mac).toLowerCase();
-    const touches = (key) =>
-      key.split("|").some((m) => m.toLowerCase() === needle);
-    for (const k of [...this.backoff.keys()])
-      if (touches(k)) this.backoff.delete(k);
-    for (const k of [...this.punchState.keys()])
-      if (touches(k)) this.punchState.delete(k);
-    for (const k of [...this.failCounts.keys()])
-      if (touches(k)) this.failCounts.delete(k);
-    for (const k of [...this.lastDispatchedRung.keys()])
-      if (touches(k)) this.lastDispatchedRung.delete(k);
+    const touches = (key) => key.split("|").some((m) => m.toLowerCase() === needle);
+    for (const k of [...this.backoff.keys()]) if (touches(k)) this.backoff.delete(k);
+    for (const k of [...this.punchState.keys()]) if (touches(k)) this.punchState.delete(k);
+    for (const k of [...this.failCounts.keys()]) if (touches(k)) this.failCounts.delete(k);
+    for (const k of [...this.lastDispatchedRung.keys()]) if (touches(k)) this.lastDispatchedRung.delete(k);
     this.analyzer.forgetMAC(mac);
   }
 
-  // ★ 分方向记录双方各自的打洞状态
+  // ★ 修复：分方向记录双方状态
   recordPunchResult(reporterMAC, peerMAC, result) {
     if (!reporterMAC || !peerMAC || !result) return;
     const key = pairKeyFor(reporterMAC, peerMAC);
     const state = typeof result.state === "number" ? result.state : 0;
     if (state === 0) return;
 
-    const behaviorIndex =
-      typeof result.behaviorIndex === "number"
-        ? result.behaviorIndex
-        : this.lastDispatchedRung.get(key) ?? null;
+    const behaviorIndex = typeof result.behaviorIndex === "number"
+      ? result.behaviorIndex
+      : this.lastDispatchedRung.get(key) ?? null;
 
     let entry = this.punchState.get(key);
     if (!entry) {
-      entry = {
-        aState: 0,
-        bState: 0,
-        aAttempts: 0,
-        bAttempts: 0,
-        behaviorIndex,
-        at: 0,
-      };
+      entry = { aState: 0, bState: 0, aAttempts: 0, bAttempts: 0, behaviorIndex, at: 0 };
       this.punchState.set(key, entry);
     }
-
     const [a, b] = key.split("|");
     const reporter = String(reporterMAC).toLowerCase();
+    if (reporter === a) { entry.aState = state; entry.aAttempts = result.attempts || 0; }
+    else if (reporter === b) { entry.bState = state; entry.bAttempts = result.attempts || 0; }
+    else return;
 
-    if (reporter === a) {
-      entry.aState = state;
-      entry.aAttempts = result.attempts || 0;
-    } else if (reporter === b) {
-      entry.bState = state;
-      entry.bAttempts = result.attempts || 0;
-    } else {
-      // 理论上不会发生
-      return;
-    }
-
-    if (behaviorIndex != null) {
-      entry.behaviorIndex = behaviorIndex;
-    }
+    if (behaviorIndex != null) entry.behaviorIndex = behaviorIndex;
     entry.at = Date.now();
 
-    // 只有双方都 state===3 才认为真成功
+    // ★ 双方都 state===3 才认为真成功
     if (state === 3 && entry.aState === 3 && entry.bState === 3) {
       this.backoff.delete(key);
       this.failCounts.delete(key);
@@ -139,10 +99,6 @@ export class NatHoleCoordinator {
     if (behaviorIndex != null && (state === 2 || state === 3)) {
       this.analyzer.report(key, behaviorIndex, state === 3);
     }
-
-    console.log(
-      `[Coord] recordPunchResult ${reporter} ${state} → pair=${key} aState=${entry.aState} bState=${entry.bState}`
-    );
   }
 
   nextStaggerDeadline() {
@@ -151,8 +107,7 @@ export class NatHoleCoordinator {
     for (const [, entry] of this.backoff) {
       if (!entry || !entry.staggered) continue;
       if (entry.nextAllowedAt <= now) return now;
-      if (earliest === null || entry.nextAllowedAt < earliest)
-        earliest = entry.nextAllowedAt;
+      if (earliest === null || entry.nextAllowedAt < earliest) earliest = entry.nextAllowedAt;
     }
     return earliest;
   }
@@ -175,13 +130,12 @@ export class NatHoleCoordinator {
         const bKey = peerKey(b);
         if (!bKey || paired.has(bKey)) continue;
 
-        const fa = classifyNat(a),
-          fb = classifyNat(b);
+        const fa = classifyNat(a), fb = classifyNat(b);
         if (fa.natType === "unknown" || fb.natType === "unknown") continue;
 
         const key = pairKeyFor(aKey, bKey);
 
-        // ★ 只有双方都 state===3 才算真成功，否则继续下发
+        // ★ 双方都 state===3 才跳过
         const prev = this.punchState.get(key);
         if (prev && prev.aState === 3 && prev.bState === 3) {
           paired.add(aKey);
@@ -199,12 +153,8 @@ export class NatHoleCoordinator {
         const senderFeature = classifyNat(sender);
         const receiverFeature = classifyNat(receiver);
 
-        const bothEasy =
-          senderFeature.natType === "EasyNAT" &&
-          receiverFeature.natType === "EasyNAT";
-        const mode = bothEasy
-          ? NAT_HOLE_MODE_EASY_PAIR
-          : NAT_HOLE_MODE_HARD_PAIR;
+        const bothEasy = senderFeature.natType === "EasyNAT" && receiverFeature.natType === "EasyNAT";
+        const mode = bothEasy ? NAT_HOLE_MODE_EASY_PAIR : NAT_HOLE_MODE_HARD_PAIR;
         const ladder = behaviorsForMode(mode);
         const rung = this.analyzer.recommend(key);
         const behavior = ladder[Math.min(rung, ladder.length - 1)] || ladder[0];
@@ -214,14 +164,10 @@ export class NatHoleCoordinator {
 
         const senderPort = parsePort(sender.pubSocket);
         const receiverPort = parsePort(receiver.pubSocket);
-        const diff = Math.abs(
-          senderFeature.portsDifference - receiverFeature.portsDifference
-        );
+        const diff = Math.abs(senderFeature.portsDifference - receiverFeature.portsDifference);
 
-        let senderRangeFrom = 0,
-          senderRangeTo = 0;
-        let receiverRangeFrom = 0,
-          receiverRangeTo = 0;
+        let senderRangeFrom = 0, senderRangeTo = 0;
+        let receiverRangeFrom = 0, receiverRangeTo = 0;
         if (!bothEasy) {
           senderRangeFrom = Math.max(1, receiverPort - diff - PORTS_RANGE_NUMBER);
           senderRangeTo = Math.min(65535, receiverPort + diff + PORTS_RANGE_NUMBER);
@@ -273,24 +219,20 @@ export class NatHoleCoordinator {
           ...shared,
         };
 
-        const signature = `${senderKey}->${receiverKey}@${rung}`;
+        // ★ 修复：signature 去掉 @rung，让退避生效
+        const signature = `${senderKey}->${receiverKey}`;
         const prevBackoff = this.backoff.get(key);
 
-        if (
-          prevBackoff &&
-          prevBackoff.signature === signature &&
-          now < prevBackoff.nextAllowedAt
-        ) {
+        if (prevBackoff && prevBackoff.signature === signature && now < prevBackoff.nextAllowedAt) {
+          paired.add(senderKey);
+          paired.add(receiverKey);
           continue;
         }
 
         let backoffMs = FAIL_BACKOFF_BASE_MS;
         const fc = this.failCounts.get(key) || 0;
         if (fc > 0) {
-          backoffMs = Math.min(
-            FAIL_BACKOFF_BASE_MS * Math.pow(2, fc),
-            FAIL_BACKOFF_CAP_MS
-          );
+          backoffMs = Math.min(FAIL_BACKOFF_BASE_MS * Math.pow(2, fc), FAIL_BACKOFF_CAP_MS);
         }
 
         const regA = a.registeredAt || a.connectedAt || 0;
