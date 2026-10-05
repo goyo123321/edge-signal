@@ -182,8 +182,12 @@ async function generateCloudflareTURN(
   for (const ice of data.iceServers || []) {
     for (const u of ice.urls || []) {
       if (u.startsWith("turn:") || u.startsWith("turns:")) {
+        // ★ 修复：剥离 ?transport=udp|tcp 后缀
+        // Cloudflare 返回形如 "turn:turn.cloudflare.com:3478?transport=udp"
+        // 客户端 net.ResolveUDPAddr / pion/turn 不认 query，会解析失败
+        const cleanUrl = u.split("?")[0];
         servers.push({
-          url: u,
+          url: cleanUrl,
           username: ice.username,
           password: ice.credential,
           ttl,
@@ -423,8 +427,6 @@ export default {
     }
 
     // ========== ★ Workers 出口代理（必须在 /ws/ 之前）==========
-    // 只接受 /ws/out/stream/，其他 /ws/out/* 一律 404
-    // 防止客户端拼错 URL（如 /ws/out/ws/default-room）被当成房间名
     if (pathname.startsWith("/ws/out/")) {
       if (pathname !== "/ws/out/stream/") {
         return new Response("Not found", { status: 404 });
