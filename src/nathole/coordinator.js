@@ -41,6 +41,15 @@ function peerKey(p) { return p && p.mac; }
 function isIPv6Sock(sock) {
   if (!sock) return false;
   if (sock.includes("[")) return true;
+// PeerRecord 唯一标识字段是 `mac`
+function peerKey(p) { return p && p.mac; }
+
+// ★ 检测 IPv6 地址（形如 [::1]:port 或 2409:xxx:...:port）
+function isIPv6Sock(sock) {
+  if (!sock) return false;
+  if (sock.includes("[")) return true;
+  // 冒号数量：IPv4 "1.2.3.4:5678" 只有 1 个冒号
+  // IPv6 至少有 2 个冒号
   const colonCount = (sock.match(/:/g) || []).length;
   return colonCount > 1;
 }
@@ -147,6 +156,7 @@ export class NatHoleCoordinator {
 
         if (!a.pubSocket || !b.pubSocket) continue;
 
+        // ★ IPv6 过滤：避免旧数据污染（IPv6 socket 无法被 IPv4 客户端连接）
         if (isIPv6Sock(a.pubSocket) || isIPv6Sock(b.pubSocket)) {
           paired.add(aKey);
           paired.add(bKey);
