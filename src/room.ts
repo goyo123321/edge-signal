@@ -73,6 +73,27 @@ export class Room extends DurableObject {
     this.coordinator = new NatHoleCoordinator(env || {});
   }
 
+  private extractIp(endpoint: string): string {
+    if (!endpoint) return "";
+    const i = endpoint.lastIndexOf(":");
+    if (i < 0) return endpoint;
+    return endpoint.slice(0, i);
+  }
+
+  private peerPublicAddr(p: PeerRecord): { ip: string; port: number } {
+    if (p.publicEndpoint) {
+      const ip = this.extractIp(p.publicEndpoint);
+      const port = this.extractPort(p.publicEndpoint);
+      if (ip && port > 0) return { ip, port };
+    }
+    if (p.p2pEndpoint) {
+      const ip = this.extractIp(p.p2pEndpoint);
+      const port = this.extractPort(p.p2pEndpoint);
+      if (ip && port > 0) return { ip, port };
+    }
+    return { ip: p._publicIp || "", port: 0 };
+  }
+
   private async ensureLoaded(): Promise<void> {
     if (this.loadedFromStorage) return;
     this.loadedFromStorage = true;
@@ -265,15 +286,18 @@ export class Room extends DurableObject {
 
     const onlinePeersForClient = Array.from(this.peers.values())
       .filter((p) => p.online && p.clientId !== clientId)
-      .map((p) => ({
-        id: p.clientId,
-        virtualIp: p.virtualIp,
-        publicIp: p._publicIp || "",
-        publicPort: p.publicEndpoint ? this.extractPort(p.publicEndpoint) : this.extractPort(p.p2pEndpoint),
-        sharePort: p.sharePort || 0,
-        natType: p.natType || "unknown",
-        turnRelayAddr: p.turnRelayAddr || "",
-      }));
+      .map((p) => {
+        const addr = this.peerPublicAddr(p);
+        return {
+          id: p.clientId,
+          virtualIp: p.virtualIp,
+          publicIp: addr.ip,
+          publicPort: addr.port,
+          sharePort: p.sharePort || 0,
+          natType: p.natType || "unknown",
+          turnRelayAddr: p.turnRelayAddr || "",
+        };
+      });
 
     let peer = this.peers.get(clientId);
     if (peer) {
@@ -303,7 +327,6 @@ export class Room extends DurableObject {
     await this.setupSaveAlarm();
     await this.saveStateNow();
 
-    // ★ 修复：ready 带 yourPublicIp（STUN 失败时客户端可用它兜底）
     server.send(JSON.stringify({
       type: "ready", from: clientId,
       payload: {
@@ -317,13 +340,14 @@ export class Room extends DurableObject {
       },
     }));
 
+    const peerAddr = this.peerPublicAddr(peer);
     this.broadcast(clientId, {
       type: "joined", from: clientId,
       payload: {
         id: clientId,
         virtualIp: peer.virtualIp,
-        publicIp: peer._publicIp || "",
-        publicPort: peer.publicEndpoint ? this.extractPort(peer.publicEndpoint) : this.extractPort(peer.p2pEndpoint),
+        publicIp: peerAddr.ip,
+        publicPort: peerAddr.port,
         sharePort: peer.sharePort || 0,
         natType: peer.natType || "unknown",
         turnRelayAddr: peer.turnRelayAddr || "",
@@ -364,7 +388,6 @@ export class Room extends DurableObject {
           peer.behavior = p.behavior || peer.behavior;
           peer.assistedSockets = Array.isArray(p.assistedSockets) ? p.assistedSockets : [];
           if (typeof p.p2pEndpoint === "string" && p.p2pEndpoint) peer.p2pEndpoint = p.p2pEndpoint;
-          const oldSharePort = peer.sharePort;
           if (typeof p.sharePort === "number" && p.sharePort > 0) peer.sharePort = p.sharePort;
           const publicEndpoint = typeof p.publicEndpoint === "string" ? p.publicEndpoint : "";
           if (publicEndpoint && publicEndpoint !== "") {
@@ -374,13 +397,18 @@ export class Room extends DurableObject {
             if (!peer.publicEndpoint) peer.pubSocket = "";
           }
           this.saveStateThrottled();
-          if (oldSharePort === 0 && peer.sharePort > 0) {
+
+          // ★ 关键：收到 p2p_metadata 后总是重广播 joined
+          const addr = this.peerPublicAddr(peer);
+          console.log(`[Room] p2p_metadata from ${from}: natType=${peer.natType} pub=${addr.ip}:${addr.port} share=${peer.sharePort}`);
+          if (addr.ip && addr.port > 0) {
             this.broadcast(from, {
               type: "joined", from,
               payload: {
-                id: from, virtualIp: peer.virtualIp,
-                publicIp: peer._publicIp || "",
-                publicPort: peer.publicEndpoint ? this.extractPort(peer.publicEndpoint) : this.extractPort(peer.p2pEndpoint),
+                id: from,
+                virtualIp: peer.virtualIp,
+                publicIp: addr.ip,
+                publicPort: addr.port,
                 sharePort: peer.sharePort,
                 natType: peer.natType || "unknown",
                 turnRelayAddr: peer.turnRelayAddr || "",
@@ -500,13 +528,29 @@ export class Room extends DurableObject {
   }
 
   private async runCoordination(): Promise<void> {
-    const community = { getOnlinePeers: () => Array.from(this.peers.values()).filter((p) => p.online) };
+    const onlinePeers = Array.from(this.peers.values()).filter((p) => p.online);
+    console.log(`[Room] runCoordination: ${onlinePeers.length} 个在线 peer`);
+    for (const p of onlinePeers) {
+      console.log(`  - ${p.clientId}: natType=${p.natType} pubSocket="${p.pubSocket}"`);
+    }
+
+    const community = { getOnlinePeers: () => onlinePeers };
     const instructions = this.coordinator.coordinate(community);
+    console.log(`[Room] runCoordination: 生成 ${instructions.size} 条指令`);
+
     if (instructions.size === 0) return;
     for (const [mac, instr] of instructions) {
-      const ws = this.sessions.get(mac);
-      if (!ws) continue;
-      try { ws.send(JSON.stringify({ type: "nat_hole_instruction", from: "server", payload: instr })); } catch {}
+      const targetWs = this.sessions.get(mac);
+      if (!targetWs) {
+        console.warn(`[Room] 目标 ${mac} 无 WebSocket，跳过`);
+        continue;
+      }
+      try {
+        targetWs.send(JSON.stringify({ type: "nat_hole_instruction", from: "server", payload: instr }));
+        console.log(`[Room] → ${mac} 下发 nat_hole_instruction role=${instr.role} target=${instr.targetPubSocket}`);
+      } catch (e) {
+        console.error(`[Room] 发送给 ${mac} 失败:`, e);
+      }
     }
   }
 
