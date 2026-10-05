@@ -79,26 +79,17 @@ export class Room extends DurableObject {
 
     try {
       const storedCommunity = await this.ctx.storage.get<string>(COMMUNITY_STORAGE_KEY);
-      if (storedCommunity && !this.community) {
-        this.community = storedCommunity;
-      }
+      if (storedCommunity && !this.community) this.community = storedCommunity;
 
       const storedPeers = await this.ctx.storage.get<Record<string, any>>(PEERS_STORAGE_KEY);
       if (storedPeers) {
         const now = Date.now();
-        let restored = 0;
-        let removed = 0;
+        let restored = 0, removed = 0;
 
         for (const [id, p] of Object.entries(storedPeers)) {
           const offlineSince = p.disconnectedAt || p.lastSeen || 0;
-          if (!p.online && now - offlineSince > OFFLINE_TTL_MS) {
-            removed++;
-            continue;
-          }
-          if (p.online && now - (p.lastSeen || 0) > OFFLINE_TTL_MS) {
-            removed++;
-            continue;
-          }
+          if (!p.online && now - offlineSince > OFFLINE_TTL_MS) { removed++; continue; }
+          if (p.online && now - (p.lastSeen || 0) > OFFLINE_TTL_MS) { removed++; continue; }
 
           this.peers.set(id, {
             clientId: p.clientId || id,
@@ -134,15 +125,12 @@ export class Room extends DurableObject {
             const parts = String(p.virtualIp).split(".");
             if (parts.length === 4) {
               const last = parseInt(parts[3], 10);
-              if (!isNaN(last) && last >= this.ipCounter) {
-                this.ipCounter = last + 1;
-              }
+              if (!isNaN(last) && last >= this.ipCounter) this.ipCounter = last + 1;
             }
           }
           restored++;
         }
-
-        console.log(`[Room] 恢复 ${restored} 个 peer（删 ${removed} 个 stale）community="${this.community}"`);
+        console.log(`[Room] 恢复 ${restored} 个 peer（删 ${removed} 个 stale）`);
       }
     } catch (e) {
       console.error("[Room] ensureLoaded failed:", e);
@@ -154,39 +142,21 @@ export class Room extends DurableObject {
       const peersData: Record<string, any> = {};
       for (const [id, p] of this.peers) {
         peersData[id] = {
-          clientId: p.clientId,
-          mac: p.mac,
-          name: p.name,
-          virtualIp: p.virtualIp,
-          online: p.online,
-          connectedAt: p.connectedAt,
-          registeredAt: p.registeredAt,
-          lastSeen: p.lastSeen,
-          disconnectedAt: p.disconnectedAt,
+          clientId: p.clientId, mac: p.mac, name: p.name, virtualIp: p.virtualIp,
+          online: p.online, connectedAt: p.connectedAt, registeredAt: p.registeredAt,
+          lastSeen: p.lastSeen, disconnectedAt: p.disconnectedAt,
           connections: Object.fromEntries(p.connections),
-          pubSocket: p.pubSocket,
-          p2pEndpoint: p.p2pEndpoint,
-          publicEndpoint: p.publicEndpoint,
-          sharePort: p.sharePort,
-          natType: p.natType,
-          portsDifference: p.portsDifference,
-          regularPortsChange: p.regularPortsChange,
-          behavior: p.behavior,
-          assistedSockets: p.assistedSockets,
-          observedRaddr: p.observedRaddr,
-          turnRelayAddr: p.turnRelayAddr,
-          relayBytesIn: p.relayBytesIn,
-          relayBytesOut: p.relayBytesOut,
-          relayPacketsIn: p.relayPacketsIn,
-          relayPacketsOut: p.relayPacketsOut,
-          _publicIp: p._publicIp,
+          pubSocket: p.pubSocket, p2pEndpoint: p.p2pEndpoint, publicEndpoint: p.publicEndpoint,
+          sharePort: p.sharePort, natType: p.natType, portsDifference: p.portsDifference,
+          regularPortsChange: p.regularPortsChange, behavior: p.behavior,
+          assistedSockets: p.assistedSockets, observedRaddr: p.observedRaddr,
+          turnRelayAddr: p.turnRelayAddr, relayBytesIn: p.relayBytesIn,
+          relayBytesOut: p.relayBytesOut, relayPacketsIn: p.relayPacketsIn,
+          relayPacketsOut: p.relayPacketsOut, _publicIp: p._publicIp,
         };
       }
-
       await this.ctx.storage.put(PEERS_STORAGE_KEY, peersData);
-      if (this.community) {
-        await this.ctx.storage.put(COMMUNITY_STORAGE_KEY, this.community);
-      }
+      if (this.community) await this.ctx.storage.put(COMMUNITY_STORAGE_KEY, this.community);
       this.lastSaveAt = Date.now();
     } catch (e) {
       console.error("[Room] saveStateNow failed:", e);
@@ -211,81 +181,42 @@ export class Room extends DurableObject {
 
   async fetch(request: Request): Promise<Response> {
     await this.ensureLoaded();
-
     const url = new URL(request.url);
 
-    // 清空房间
     if (url.pathname === "/_clear") {
       const onlinePeers = Array.from(this.peers.values()).filter((p) => p.online);
       const force = url.searchParams.get("force") === "1";
-
       if (onlinePeers.length > 0 && !force) {
-        console.warn(`[Room] 拒绝清空 "${this.community}"：仍有 ${onlinePeers.length} 个设备在线`);
-        return new Response(
-          JSON.stringify({
-            error: "Room has online peers",
-            onlineCount: onlinePeers.length,
-            onlinePeers: onlinePeers.map((p) => ({
-              clientId: p.clientId,
-              name: p.name,
-              virtualIp: p.virtualIp,
-            })),
-          }),
-          { status: 409, headers: { "Content-Type": "application/json" } }
-        );
+        return new Response(JSON.stringify({
+          error: "Room has online peers",
+          onlineCount: onlinePeers.length,
+          onlinePeers: onlinePeers.map((p) => ({ clientId: p.clientId, name: p.name, virtualIp: p.virtualIp })),
+        }), { status: 409, headers: { "Content-Type": "application/json" } });
       }
-
-      console.log(`[Room] admin clearing room "${this.community}"${force ? " (FORCED)" : ""}`);
-
-      for (const [_, ws] of this.sessions) {
-        try { ws.close(1000, "Admin cleanup"); } catch {}
-      }
+      for (const [_, ws] of this.sessions) { try { ws.close(1000, "Admin cleanup"); } catch {} }
       await new Promise((r) => setTimeout(r, 300));
-
       this.sessions.clear();
       this.peers.clear();
       this.ipToClient.clear();
       this.shareAnnounces.clear();
-
       try {
         this.coordinator = new (this.coordinator as any).constructor(this.env || {});
-      } catch (e) {
-        console.warn("[Room] reset coordinator failed:", e);
-      }
-      try {
-        await this.ctx.storage.deleteAll();
-      } catch (e) {
-        console.error("[Room] storage.deleteAll failed:", e);
-      }
+      } catch (e) {}
+      try { await this.ctx.storage.deleteAll(); } catch (e) {}
       this.ipCounter = 2;
       this.lastSaveAt = 0;
-
       return new Response(JSON.stringify({ ok: true, room: this.community }), {
         headers: { "Content-Type": "application/json" },
       });
     }
 
-    // 踢单个 peer
     if (url.pathname === "/_kick" && request.method === "POST") {
       const cid = url.searchParams.get("cid");
-      if (!cid) {
-        return new Response(JSON.stringify({ error: "Missing cid" }), {
-          status: 400, headers: { "Content-Type": "application/json" },
-        });
-      }
+      if (!cid) return new Response(JSON.stringify({ error: "Missing cid" }), { status: 400, headers: { "Content-Type": "application/json" } });
       const ws = this.sessions.get(cid);
       const peer = this.peers.get(cid);
-      if (!ws && !peer) {
-        return new Response(JSON.stringify({ error: "Peer not found" }), {
-          status: 404, headers: { "Content-Type": "application/json" },
-        });
-      }
-
-      console.log(`[Room] admin kicking peer "${cid}"`);
-      if (ws) {
-        try { ws.close(1000, "Admin kicked"); } catch {}
-      }
-
+      if (!ws && !peer) return new Response(JSON.stringify({ error: "Peer not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
+      if (ws) { try { ws.close(1000, "Admin kicked"); } catch {} }
       if (peer) {
         peer.online = false;
         peer.disconnectedAt = Date.now();
@@ -300,42 +231,28 @@ export class Room extends DurableObject {
       this.broadcast(cid, { type: "left", from: cid });
       await this.reportToRegistry(true);
       await this.saveStateNow();
-
-      return new Response(JSON.stringify({ ok: true, kicked: cid }), {
-        headers: { "Content-Type": "application/json" },
-      });
+      return new Response(JSON.stringify({ ok: true, kicked: cid }), { headers: { "Content-Type": "application/json" } });
     }
 
-    // 状态查询
     if (url.pathname === "/_status") {
       const publicOnly = url.searchParams.get("public") === "1";
       const communityParam = url.searchParams.get("community");
-      if (communityParam && !this.community) {
-        this.community = communityParam;
-      }
+      if (communityParam && !this.community) this.community = communityParam;
       return this.getStatusResponse(publicOnly);
     }
 
     if (url.pathname === "/_nathole") {
       const communityParam = url.searchParams.get("community");
-      if (communityParam && !this.community) {
-        this.community = communityParam;
-      }
+      if (communityParam && !this.community) this.community = communityParam;
       return this.getNatHoleStatusResponse();
     }
 
-    // WebSocket 升级
     const upgrade = request.headers.get("Upgrade");
-    if (upgrade !== "websocket") {
-      return new Response("Expected WebSocket", { status: 426 });
-    }
+    if (upgrade !== "websocket") return new Response("Expected WebSocket", { status: 426 });
 
     const clientId = url.searchParams.get("cid") || crypto.randomUUID();
     this.community = url.pathname.split("/")[2] || "default";
-
-    const publicIp =
-      request.headers.get("cf-connecting-ip") ||
-      request.headers.get("x-real-ip") || "";
+    const publicIp = request.headers.get("cf-connecting-ip") || request.headers.get("x-real-ip") || "";
 
     this.closeDuplicate(clientId);
 
@@ -344,21 +261,15 @@ export class Room extends DurableObject {
     (this.ctx as any).acceptWebSocket(server);
 
     const now = Date.now();
+    try { await this.ctx.storage.put(COMMUNITY_STORAGE_KEY, this.community); } catch {}
 
-    try {
-      await this.ctx.storage.put(COMMUNITY_STORAGE_KEY, this.community);
-    } catch {}
-
-    // 带上 turnRelayAddr
     const onlinePeersForClient = Array.from(this.peers.values())
       .filter((p) => p.online && p.clientId !== clientId)
       .map((p) => ({
         id: p.clientId,
         virtualIp: p.virtualIp,
         publicIp: p._publicIp || "",
-        publicPort: p.publicEndpoint
-          ? this.extractPort(p.publicEndpoint)
-          : this.extractPort(p.p2pEndpoint),
+        publicPort: p.publicEndpoint ? this.extractPort(p.publicEndpoint) : this.extractPort(p.p2pEndpoint),
         sharePort: p.sharePort || 0,
         natType: p.natType || "unknown",
         turnRelayAddr: p.turnRelayAddr || "",
@@ -373,30 +284,14 @@ export class Room extends DurableObject {
       peer._publicIp = publicIp;
     } else {
       peer = {
-        clientId,
-        mac: clientId,
-        name: "",
+        clientId, mac: clientId, name: "",
         virtualIp: this.allocateIp(),
-        online: true,
-        connectedAt: now,
-        registeredAt: now,
-        lastSeen: now,
+        online: true, connectedAt: now, registeredAt: now, lastSeen: now,
         connections: new Map(),
-        pubSocket: "",
-        p2pEndpoint: "",
-        publicEndpoint: "",
-        sharePort: 0,
-        natType: "unknown",
-        portsDifference: 0,
-        regularPortsChange: false,
-        behavior: "BehaviorPortChanged",
-        assistedSockets: [],
-        observedRaddr: "",
-        turnRelayAddr: "",
-        relayBytesIn: 0,
-        relayBytesOut: 0,
-        relayPacketsIn: 0,
-        relayPacketsOut: 0,
+        pubSocket: "", p2pEndpoint: "", publicEndpoint: "",
+        sharePort: 0, natType: "unknown", portsDifference: 0, regularPortsChange: false,
+        behavior: "BehaviorPortChanged", assistedSockets: [], observedRaddr: "",
+        turnRelayAddr: "", relayBytesIn: 0, relayBytesOut: 0, relayPacketsIn: 0, relayPacketsOut: 0,
         _publicIp: publicIp,
       };
       this.peers.set(clientId, peer);
@@ -408,33 +303,27 @@ export class Room extends DurableObject {
     await this.setupSaveAlarm();
     await this.saveStateNow();
 
+    // ★ 修复：ready 带 yourPublicIp（STUN 失败时客户端可用它兜底）
     server.send(JSON.stringify({
-      type: "ready",
-      from: clientId,
+      type: "ready", from: clientId,
       payload: {
         id: clientId,
         virtualIp: peer.virtualIp,
+        yourPublicIp: publicIp,
         peers: onlinePeersForClient,
         shares: Array.from(this.shareAnnounces.entries())
-          .filter(([id]) => {
-            const p = this.peers.get(id);
-            return p && p.online;
-          })
+          .filter(([id]) => { const p = this.peers.get(id); return p && p.online; })
           .map(([id, p]) => ({ id, ...p })),
       },
     }));
 
-    // 广播 joined 时也带 turnRelayAddr
     this.broadcast(clientId, {
-      type: "joined",
-      from: clientId,
+      type: "joined", from: clientId,
       payload: {
         id: clientId,
         virtualIp: peer.virtualIp,
         publicIp: peer._publicIp || "",
-        publicPort: peer.publicEndpoint
-          ? this.extractPort(peer.publicEndpoint)
-          : this.extractPort(peer.p2pEndpoint),
+        publicPort: peer.publicEndpoint ? this.extractPort(peer.publicEndpoint) : this.extractPort(peer.p2pEndpoint),
         sharePort: peer.sharePort || 0,
         natType: peer.natType || "unknown",
         turnRelayAddr: peer.turnRelayAddr || "",
@@ -454,21 +343,16 @@ export class Room extends DurableObject {
     try { msg = JSON.parse(message); } catch { return; }
     const from = this.findClientId(ws);
     if (!from) return;
-
     const peer = this.peers.get(from);
     if (peer) peer.lastSeen = Date.now();
 
     switch (msg.type) {
       case "ping":
-        try {
-          ws.send(JSON.stringify({ type: "pong", from, t: msg.ts || Date.now() }));
-        } catch {}
+        try { ws.send(JSON.stringify({ type: "pong", from, t: msg.ts || Date.now() })); } catch {}
         return;
 
       case "connection_status":
-        if (peer) {
-          peer.connections = new Map(Object.entries(msg.payload?.connections || {}));
-        }
+        if (peer) peer.connections = new Map(Object.entries(msg.payload?.connections || {}));
         return;
 
       case "p2p_metadata":
@@ -479,37 +363,24 @@ export class Room extends DurableObject {
           peer.regularPortsChange = !!p.regularPortsChange;
           peer.behavior = p.behavior || peer.behavior;
           peer.assistedSockets = Array.isArray(p.assistedSockets) ? p.assistedSockets : [];
-          if (typeof p.p2pEndpoint === "string" && p.p2pEndpoint) {
-            peer.p2pEndpoint = p.p2pEndpoint;
-          }
-
+          if (typeof p.p2pEndpoint === "string" && p.p2pEndpoint) peer.p2pEndpoint = p.p2pEndpoint;
           const oldSharePort = peer.sharePort;
-          if (typeof p.sharePort === "number" && p.sharePort > 0) {
-            peer.sharePort = p.sharePort;
-          }
-
-          const publicEndpoint =
-            typeof p.publicEndpoint === "string" ? p.publicEndpoint : "";
+          if (typeof p.sharePort === "number" && p.sharePort > 0) peer.sharePort = p.sharePort;
+          const publicEndpoint = typeof p.publicEndpoint === "string" ? p.publicEndpoint : "";
           if (publicEndpoint && publicEndpoint !== "") {
             peer.publicEndpoint = publicEndpoint;
             peer.pubSocket = publicEndpoint;
           } else {
             if (!peer.publicEndpoint) peer.pubSocket = "";
           }
-
           this.saveStateThrottled();
-
           if (oldSharePort === 0 && peer.sharePort > 0) {
             this.broadcast(from, {
-              type: "joined",
-              from,
+              type: "joined", from,
               payload: {
-                id: from,
-                virtualIp: peer.virtualIp,
+                id: from, virtualIp: peer.virtualIp,
                 publicIp: peer._publicIp || "",
-                publicPort: peer.publicEndpoint
-                  ? this.extractPort(peer.publicEndpoint)
-                  : this.extractPort(peer.p2pEndpoint),
+                publicPort: peer.publicEndpoint ? this.extractPort(peer.publicEndpoint) : this.extractPort(peer.p2pEndpoint),
                 sharePort: peer.sharePort,
                 natType: peer.natType || "unknown",
                 turnRelayAddr: peer.turnRelayAddr || "",
@@ -540,9 +411,7 @@ export class Room extends DurableObject {
         this.shareAnnounces.set(from, msg.payload);
         if (peer && msg.payload && typeof msg.payload === "object") {
           const sharePayload = msg.payload as any;
-          if (typeof sharePayload.name === "string" && sharePayload.name) {
-            peer.name = sharePayload.name;
-          }
+          if (typeof sharePayload.name === "string" && sharePayload.name) peer.name = sharePayload.name;
         }
         this.broadcast(from, { ...msg, from });
         this.saveStateThrottled();
@@ -560,17 +429,10 @@ export class Room extends DurableObject {
         peer.turnRelayAddr = relayAddr;
         this.saveStateThrottled();
         for (const [id, p] of this.peers) {
-          if (id === from) continue;
-          if (!p.online) continue;
+          if (id === from || !p.online) continue;
           const targetWs = this.sessions.get(id);
           if (!targetWs) continue;
-          try {
-            targetWs.send(JSON.stringify({
-              type: "turn_peer_info",
-              edgeMac: from,
-              relayAddr,
-            }));
-          } catch {}
+          try { targetWs.send(JSON.stringify({ type: "turn_peer_info", edgeMac: from, relayAddr })); } catch {}
         }
         return;
       }
@@ -593,17 +455,13 @@ export class Room extends DurableObject {
     const data = new Uint8Array(buffer);
     if (data.length < 20) return;
     if (data[0] >> 4 !== 4) return;
-
-    // 只允许 10.64.0.0/24
     if (data[16] !== 10 || data[17] !== 64 || data[18] !== 0) return;
 
     const from = this.findClientId(ws);
     if (!from) return;
-
     const dstIp = `${data[16]}.${data[17]}.${data[18]}.${data[19]}`;
     const targetClientId = this.ipToClient.get(dstIp);
     if (!targetClientId) return;
-
     const targetWs = this.sessions.get(targetClientId);
     if (!targetWs) return;
 
@@ -611,14 +469,8 @@ export class Room extends DurableObject {
       targetWs.send(buffer);
       const fromPeer = this.peers.get(from);
       const toPeer = this.peers.get(targetClientId);
-      if (fromPeer) {
-        fromPeer.relayBytesOut += data.length;
-        fromPeer.relayPacketsOut += 1;
-      }
-      if (toPeer) {
-        toPeer.relayBytesIn += data.length;
-        toPeer.relayPacketsIn += 1;
-      }
+      if (fromPeer) { fromPeer.relayBytesOut += data.length; fromPeer.relayPacketsOut += 1; }
+      if (toPeer) { toPeer.relayBytesIn += data.length; toPeer.relayPacketsIn += 1; }
     } catch {}
   }
 
@@ -648,67 +500,43 @@ export class Room extends DurableObject {
   }
 
   private async runCoordination(): Promise<void> {
-    const community = {
-      getOnlinePeers: () => Array.from(this.peers.values()).filter((p) => p.online),
-    };
+    const community = { getOnlinePeers: () => Array.from(this.peers.values()).filter((p) => p.online) };
     const instructions = this.coordinator.coordinate(community);
     if (instructions.size === 0) return;
-
     for (const [mac, instr] of instructions) {
       const ws = this.sessions.get(mac);
       if (!ws) continue;
-      try {
-        ws.send(JSON.stringify({
-          type: "nat_hole_instruction", from: "server", payload: instr,
-        }));
-      } catch {}
+      try { ws.send(JSON.stringify({ type: "nat_hole_instruction", from: "server", payload: instr })); } catch {}
     }
   }
 
   private getStatusResponse(publicOnly = false): Response {
     const now = Date.now();
-
-    const sortedPeers = Array.from(this.peers.values())
-      .sort((a, b) => a.registeredAt - b.registeredAt);
-
+    const sortedPeers = Array.from(this.peers.values()).sort((a, b) => a.registeredAt - b.registeredAt);
     const codeMap = new Map<string, string>();
-    sortedPeers.forEach((p, idx) => {
-      codeMap.set(p.clientId, idxToCode(idx));
-    });
+    sortedPeers.forEach((p, idx) => codeMap.set(p.clientId, idxToCode(idx)));
 
-    let onlineCnt = 0;
-    let offlineCnt = 0;
-    for (const p of this.peers.values()) {
-      if (p.online) onlineCnt++;
-      else offlineCnt++;
-    }
+    let onlineCnt = 0, offlineCnt = 0;
+    for (const p of this.peers.values()) { if (p.online) onlineCnt++; else offlineCnt++; }
 
     const peers = sortedPeers.map((p) => {
       const code = codeMap.get(p.clientId)!;
-
       const connectionsByCode: Record<string, string> = {};
       for (const [cid, type] of p.connections) {
         const targetCode = codeMap.get(cid);
-        if (targetCode) {
-          connectionsByCode[targetCode] = type;
-        }
+        if (targetCode) connectionsByCode[targetCode] = type;
       }
-
       let p2pCount = 0, relayCount = 0, turnCount = 0;
       for (const t of p.connections.values()) {
         if (t === "p2p") p2pCount++;
         else if (t === "relay") relayCount++;
         else if (t === "turn") turnCount++;
       }
-
-      const relayBytesIn = p.relayBytesIn;
-      const relayBytesOut = p.relayBytesOut;
-      const relayBytesTotal = relayBytesIn + relayBytesOut;
+      const relayBytesIn = p.relayBytesIn, relayBytesOut = p.relayBytesOut;
 
       if (publicOnly) {
         return {
-          code,
-          virtualIp: p.online ? p.virtualIp : "",
+          code, virtualIp: p.online ? p.virtualIp : "",
           online: p.online,
           onlineFor: now - p.connectedAt,
           offlineFor: p.online ? 0 : (p.disconnectedAt ? now - p.disconnectedAt : 0),
@@ -717,86 +545,55 @@ export class Room extends DurableObject {
           connectionsTotal: p2pCount + relayCount + turnCount,
           connections: connectionsByCode,
           natType: p.natType || "unknown",
-          relayBytesIn, relayBytesOut, relayBytesTotal,
+          relayBytesIn, relayBytesOut, relayBytesTotal: relayBytesIn + relayBytesOut,
         };
       }
 
       return {
-        code,
-        clientId: p.clientId,
-        name: p.name,
+        code, clientId: p.clientId, name: p.name,
         virtualIp: p.online ? p.virtualIp : "",
         publicIp: p._publicIp || "",
-        pubSocket: p.pubSocket,
-        p2pEndpoint: p.p2pEndpoint,
-        publicEndpoint: p.publicEndpoint,
-        turnRelayAddr: p.turnRelayAddr,
-        sharePort: p.sharePort,
-        natType: p.natType,
-        online: p.online,
-        connectedAt: p.connectedAt,
-        lastSeen: p.lastSeen,
-        disconnectedAt: p.disconnectedAt,
+        pubSocket: p.pubSocket, p2pEndpoint: p.p2pEndpoint, publicEndpoint: p.publicEndpoint,
+        turnRelayAddr: p.turnRelayAddr, sharePort: p.sharePort, natType: p.natType,
+        online: p.online, connectedAt: p.connectedAt, lastSeen: p.lastSeen, disconnectedAt: p.disconnectedAt,
         onlineFor: now - p.connectedAt,
         offlineFor: p.online ? 0 : (p.disconnectedAt ? now - p.disconnectedAt : 0),
         idleFor: now - p.lastSeen,
         connections: connectionsByCode,
         p2pCount, relayCount, turnCount,
         relayBytesIn, relayBytesOut,
-        relayPacketsIn: p.relayPacketsIn,
-        relayPacketsOut: p.relayPacketsOut,
+        relayPacketsIn: p.relayPacketsIn, relayPacketsOut: p.relayPacketsOut,
       };
     });
 
-    return new Response(
-      JSON.stringify({
-        community: this.community,
-        peerCount: peers.length,
-        onlineCount: onlineCnt,
-        offlineCount: offlineCnt,
-        peers,
-        timestamp: now,
-        publicOnly,
-      }),
-      {
-        headers: {
-          "Content-Type": "application/json",
-          "Access-Control-Allow-Origin": "*",
-        },
-      }
-    );
+    return new Response(JSON.stringify({
+      community: this.community,
+      peerCount: peers.length,
+      onlineCount: onlineCnt,
+      offlineCount: offlineCnt,
+      peers, timestamp: now, publicOnly,
+    }), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
   }
 
-  // ★ 更新 punchState 字段结构（aState / bState）
   private getNatHoleStatusResponse(): Response {
     const c = this.coordinator as any;
     const now = Date.now();
     const backoff: any[] = [];
     for (const [k, v] of c.backoff) {
-      backoff.push({
-        pair: k,
-        signature: v.signature,
-        remainingMs: Math.max(0, v.nextAllowedAt - now),
-        staggered: !!v.staggered,
-      });
+      backoff.push({ pair: k, signature: v.signature, remainingMs: Math.max(0, v.nextAllowedAt - now), staggered: !!v.staggered });
     }
     const punch: any[] = [];
     for (const [k, v] of c.punchState) {
       punch.push({
         pair: k,
-        aState: v.aState,
-        bState: v.bState,
-        aAttempts: v.aAttempts,
-        bAttempts: v.bAttempts,
+        aState: v.aState, bState: v.bState,
+        aAttempts: v.aAttempts, bAttempts: v.bAttempts,
         behaviorIndex: v.behaviorIndex,
         ageMs: now - v.at,
       });
     }
     return new Response(JSON.stringify({ now, backoff, punch }, null, 2), {
-      headers: {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*",
-      },
+      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
   }
 
@@ -813,7 +610,6 @@ export class Room extends DurableObject {
     this.pendingStaggerAt = null;
     try {
       await this.ensureLoaded();
-
       const now = Date.now();
       let purged = 0;
       for (const [id, p] of this.peers) {
@@ -823,14 +619,9 @@ export class Room extends DurableObject {
           purged++;
         }
       }
-      if (purged > 0) {
-        console.log(`[Alarm] 清理 ${purged} 个过期离线 peer`);
-      }
-
       await this.runCoordination();
       await this.setupSaveAlarm();
       await this.saveStateNow();
-
       if (onlineCount(this.peers) > 0) {
         if (now - this.lastRegistryRefresh >= REGISTRY_REFRESH_MS) {
           this.lastRegistryRefresh = now;
@@ -839,9 +630,7 @@ export class Room extends DurableObject {
       }
     } catch (e) {
       console.error("[Alarm] failed:", e);
-      if (pending != null && this.pendingStaggerAt == null) {
-        this.pendingStaggerAt = pending;
-      }
+      if (pending != null && this.pendingStaggerAt == null) this.pendingStaggerAt = pending;
       try { await this.setupSaveAlarm(); } catch {}
     }
   }
