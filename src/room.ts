@@ -73,9 +73,6 @@ export class Room extends DurableObject {
     this.coordinator = new NatHoleCoordinator(env || {});
   }
 
-  /**
-   * ★ 从 endpoint 字符串 "ip:port" 里提取 IP
-   */
   private extractIp(endpoint: string): string {
     if (!endpoint) return "";
     const i = endpoint.lastIndexOf(":");
@@ -83,10 +80,6 @@ export class Room extends DurableObject {
     return endpoint.slice(0, i);
   }
 
-  /**
-   * ★ 从 peer 里取它"正确的"公网地址
-   *   优先级：publicEndpoint（STUN 结果） > p2pEndpoint > cf-connecting-ip（兜底）
-   */
   private peerPublicAddr(p: PeerRecord): { ip: string; port: number } {
     if (p.publicEndpoint) {
       const ip = this.extractIp(p.publicEndpoint);
@@ -98,7 +91,6 @@ export class Room extends DurableObject {
       const port = this.extractPort(p.p2pEndpoint);
       if (ip && port > 0) return { ip, port };
     }
-    // 兜底：cf-connecting-ip + 无端口（打洞不可能成功，但不崩溃）
     return { ip: p._publicIp || "", port: 0 };
   }
 
@@ -292,7 +284,6 @@ export class Room extends DurableObject {
     const now = Date.now();
     try { await this.ctx.storage.put(COMMUNITY_STORAGE_KEY, this.community); } catch {}
 
-    // ★ 修复：publicIp 从 publicEndpoint 解析，不能用 cf-connecting-ip
     const onlinePeersForClient = Array.from(this.peers.values())
       .filter((p) => p.online && p.clientId !== clientId)
       .map((p) => {
@@ -349,7 +340,6 @@ export class Room extends DurableObject {
       },
     }));
 
-    // ★ 修复：joined 里也要用 peerPublicAddr
     const peerAddr = this.peerPublicAddr(peer);
     this.broadcast(clientId, {
       type: "joined", from: clientId,
@@ -398,7 +388,6 @@ export class Room extends DurableObject {
           peer.behavior = p.behavior || peer.behavior;
           peer.assistedSockets = Array.isArray(p.assistedSockets) ? p.assistedSockets : [];
           if (typeof p.p2pEndpoint === "string" && p.p2pEndpoint) peer.p2pEndpoint = p.p2pEndpoint;
-          const oldSharePort = peer.sharePort;
           if (typeof p.sharePort === "number" && p.sharePort > 0) peer.sharePort = p.sharePort;
           const publicEndpoint = typeof p.publicEndpoint === "string" ? p.publicEndpoint : "";
           if (publicEndpoint && publicEndpoint !== "") {
@@ -408,12 +397,16 @@ export class Room extends DurableObject {
             if (!peer.publicEndpoint) peer.pubSocket = "";
           }
           this.saveStateThrottled();
-          if (oldSharePort === 0 && peer.sharePort > 0) {
-            const addr = this.peerPublicAddr(peer);
+
+          // ★ 关键：收到 p2p_metadata 后总是重广播 joined
+          const addr = this.peerPublicAddr(peer);
+          console.log(`[Room] p2p_metadata from ${from}: natType=${peer.natType} pub=${addr.ip}:${addr.port} share=${peer.sharePort}`);
+          if (addr.ip && addr.port > 0) {
             this.broadcast(from, {
               type: "joined", from,
               payload: {
-                id: from, virtualIp: peer.virtualIp,
+                id: from,
+                virtualIp: peer.virtualIp,
                 publicIp: addr.ip,
                 publicPort: addr.port,
                 sharePort: peer.sharePort,
@@ -535,13 +528,29 @@ export class Room extends DurableObject {
   }
 
   private async runCoordination(): Promise<void> {
-    const community = { getOnlinePeers: () => Array.from(this.peers.values()).filter((p) => p.online) };
+    const onlinePeers = Array.from(this.peers.values()).filter((p) => p.online);
+    console.log(`[Room] runCoordination: ${onlinePeers.length} 个在线 peer`);
+    for (const p of onlinePeers) {
+      console.log(`  - ${p.clientId}: natType=${p.natType} pubSocket="${p.pubSocket}"`);
+    }
+
+    const community = { getOnlinePeers: () => onlinePeers };
     const instructions = this.coordinator.coordinate(community);
+    console.log(`[Room] runCoordination: 生成 ${instructions.size} 条指令`);
+
     if (instructions.size === 0) return;
     for (const [mac, instr] of instructions) {
-      const ws = this.sessions.get(mac);
-      if (!ws) continue;
-      try { ws.send(JSON.stringify({ type: "nat_hole_instruction", from: "server", payload: instr })); } catch {}
+      const targetWs = this.sessions.get(mac);
+      if (!targetWs) {
+        console.warn(`[Room] 目标 ${mac} 无 WebSocket，跳过`);
+        continue;
+      }
+      try {
+        targetWs.send(JSON.stringify({ type: "nat_hole_instruction", from: "server", payload: instr }));
+        console.log(`[Room] → ${mac} 下发 nat_hole_instruction role=${instr.role} target=${instr.targetPubSocket}`);
+      } catch (e) {
+        console.error(`[Room] 发送给 ${mac} 失败:`, e);
+      }
     }
   }
 
