@@ -1,6 +1,8 @@
 export { Room } from "./room";
 export { Registry } from "./registry";
 
+import { handleOutboundStream } from "./outbound-stream";
+
 export interface Env {
   ROOM: DurableObjectNamespace;
   REGISTRY: DurableObjectNamespace;
@@ -14,7 +16,6 @@ export interface Env {
   TURN_PASSWORD?: string;
 }
 
-// ★ 保留默认值，可通过环境变量 ADMIN_TOKEN 覆盖
 const DEFAULT_ADMIN_TOKEN = "12332100";
 
 function safeEqual(a: string, b: string): boolean {
@@ -213,27 +214,15 @@ export default {
 
     // ========== TURN 凭证端点 ==========
     if (pathname === "/api/turn-credentials") {
-      // 如果配了 CONNECT_TOKEN，强制校验
       if (env.CONNECT_TOKEN && env.CONNECT_TOKEN.trim() !== "") {
         const provided = url.searchParams.get("token") || "";
         if (!safeEqual(provided, env.CONNECT_TOKEN)) {
-          return jsonResp(
-            {
-              success: false,
-              error: "Unauthorized",
-              servers: [],
-            },
-            401
-          );
+          return jsonResp({ success: false, error: "Unauthorized", servers: [] }, 401);
         }
       }
 
       if (!isTURNEnabled(env)) {
-        return jsonResp({
-          success: false,
-          error: "TURN not configured",
-          servers: [],
-        });
+        return jsonResp({ success: false, error: "TURN not configured", servers: [] });
       }
 
       const ttl = parseInt(url.searchParams.get("ttl") || "86400");
@@ -256,32 +245,13 @@ export default {
         }
 
         if (servers.length === 0) {
-          return jsonResp({
-            success: false,
-            error: "No TURN servers available",
-            servers: [],
-          });
+          return jsonResp({ success: false, error: "No TURN servers available", servers: [] });
         }
 
-        const logServers = servers.map((s) => ({
-          url: s.url,
-          username: s.username || "(无)",
-          password: s.password ? "***" : "(无)",
-        }));
-        console.log(`[TURN] 返回 ${servers.length} 个 ${source} 服务器:`, JSON.stringify(logServers));
-
-        return jsonResp({
-          success: true,
-          source,
-          servers,
-        });
+        return jsonResp({ success: true, source, servers });
       } catch (e) {
         console.error("[TURN] error:", e);
-        return jsonResp({
-          success: false,
-          error: "TURN error",
-          servers: [],
-        });
+        return jsonResp({ success: false, error: "TURN error", servers: [] });
       }
     }
 
@@ -291,17 +261,12 @@ export default {
       return reg.fetch(new Request("http://internal/rooms"));
     }
 
-    // 用 slice 替代 split("/")[4]，防止多段路径截断
     if (pathname.startsWith("/api/public/status/")) {
-      const roomId = decodeURIComponent(
-        pathname.slice("/api/public/status/".length)
-      );
+      const roomId = decodeURIComponent(pathname.slice("/api/public/status/".length));
       if (!roomId) return jsonResp({ error: "Missing roomId" }, 400);
       const id = env.ROOM.idFromName(roomId);
       return env.ROOM.get(id).fetch(
-        new Request(
-          `http://internal/_status?public=1&community=${encodeURIComponent(roomId)}`
-        )
+        new Request(`http://internal/_status?public=1&community=${encodeURIComponent(roomId)}`)
       );
     }
 
@@ -327,9 +292,7 @@ export default {
         const roomId = decodeURIComponent(statusMatch[2]);
         const id = env.ROOM.idFromName(roomId);
         return env.ROOM.get(id).fetch(
-          new Request(
-            `http://internal/_status?community=${encodeURIComponent(roomId)}`
-          )
+          new Request(`http://internal/_status?community=${encodeURIComponent(roomId)}`)
         );
       }
 
@@ -338,9 +301,7 @@ export default {
         const roomId = decodeURIComponent(natholeMatch[2]);
         const id = env.ROOM.idFromName(roomId);
         return env.ROOM.get(id).fetch(
-          new Request(
-            `http://internal/_nathole?community=${encodeURIComponent(roomId)}`
-          )
+          new Request(`http://internal/_nathole?community=${encodeURIComponent(roomId)}`)
         );
       }
 
@@ -352,9 +313,7 @@ export default {
         let clearResp: Response;
         try {
           const id = env.ROOM.idFromName(room);
-          const clearUrl = force
-            ? "http://internal/_clear?force=1"
-            : "http://internal/_clear";
+          const clearUrl = force ? "http://internal/_clear?force=1" : "http://internal/_clear";
           clearResp = await env.ROOM.get(id).fetch(new Request(clearUrl));
         } catch (e) {
           console.error(`[admin] clear room DO ${room} failed:`, e);
@@ -363,29 +322,22 @@ export default {
 
         if (clearResp.status === 409) {
           const body: any = await clearResp.json().catch(() => ({}));
-          return jsonResp(
-            {
-              error: "Room has online peers",
-              room,
-              onlineCount: body.onlineCount || 0,
-              onlinePeers: body.onlinePeers || [],
-            },
-            409
-          );
+          return jsonResp({
+            error: "Room has online peers",
+            room,
+            onlineCount: body.onlineCount || 0,
+            onlinePeers: body.onlinePeers || [],
+          }, 409);
         }
 
-        if (!clearResp.ok) {
-          return jsonResp({ error: "Clear failed" }, 500);
-        }
+        if (!clearResp.ok) return jsonResp({ error: "Clear failed" }, 500);
 
         try {
           const reg = env.REGISTRY.get(env.REGISTRY.idFromName("global"));
-          await reg.fetch(
-            new Request(
-              `http://internal/_clear-one?room=${encodeURIComponent(room)}`,
-              { method: "POST" }
-            )
-          );
+          await reg.fetch(new Request(
+            `http://internal/_clear-one?room=${encodeURIComponent(room)}`,
+            { method: "POST" }
+          ));
         } catch (e) {
           console.error(`[admin] clear registry ${room} failed:`, e);
         }
@@ -396,15 +348,11 @@ export default {
       if (pathname === "/api/admin/kick" && request.method === "POST") {
         const room = url.searchParams.get("room");
         const cid = url.searchParams.get("cid");
-        if (!room || !cid)
-          return jsonResp({ error: "Missing room or cid" }, 400);
+        if (!room || !cid) return jsonResp({ error: "Missing room or cid" }, 400);
 
         const id = env.ROOM.idFromName(room);
         return env.ROOM.get(id).fetch(
-          new Request(
-            `http://internal/_kick?cid=${encodeURIComponent(cid)}`,
-            { method: "POST" }
-          )
+          new Request(`http://internal/_kick?cid=${encodeURIComponent(cid)}`, { method: "POST" })
         );
       }
 
@@ -427,9 +375,7 @@ export default {
         for (const r of rooms) {
           try {
             const id = env.ROOM.idFromName(r.name);
-            const clearUrl = force
-              ? "http://internal/_clear?force=1"
-              : "http://internal/_clear";
+            const clearUrl = force ? "http://internal/_clear?force=1" : "http://internal/_clear";
             const resp = await env.ROOM.get(id).fetch(new Request(clearUrl));
 
             if (resp.ok) {
@@ -453,12 +399,10 @@ export default {
         for (const name of cleared) {
           try {
             const reg = env.REGISTRY.get(env.REGISTRY.idFromName("global"));
-            await reg.fetch(
-              new Request(
-                `http://internal/_clear-one?room=${encodeURIComponent(name)}`,
-                { method: "POST" }
-              )
-            );
+            await reg.fetch(new Request(
+              `http://internal/_clear-one?room=${encodeURIComponent(name)}`,
+              { method: "POST" }
+            ));
           } catch (e) {
             console.error(`[admin] clear registry ${name} failed:`, e);
           }
@@ -476,6 +420,25 @@ export default {
       }
 
       return new Response("Not found", { status: 404 });
+    }
+
+    // ========== ★ Workers 出口代理（必须在 /ws/ 之前）==========
+    // 只接受 /ws/out/stream/，其他 /ws/out/* 一律 404
+    // 防止客户端拼错 URL（如 /ws/out/ws/default-room）被当成房间名
+    if (pathname.startsWith("/ws/out/")) {
+      if (pathname !== "/ws/out/stream/") {
+        return new Response("Not found", { status: 404 });
+      }
+
+      if (env.CONNECT_TOKEN && env.CONNECT_TOKEN.trim() !== "") {
+        const provided = url.searchParams.get("token") || "";
+        if (!safeEqual(provided, env.CONNECT_TOKEN)) {
+          return new Response("Invalid token", { status: 403 });
+        }
+      }
+
+      // @ts-ignore - request.fetcher 由 Workers 注入
+      return handleOutboundStream(request, (request as any).fetcher);
     }
 
     // ========== WebSocket 信令 ==========

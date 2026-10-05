@@ -1,41 +1,26 @@
-// ============================================================
-// 轮询配置（想改间隔改这里）
-// ============================================================
-const POLL_INTERVAL_MS = 30000;         // 页面可见时：30 秒
-const POLL_INTERVAL_HIDDEN_MS = 0;      // 页面不可见时：0 = 完全停止
-const POLL_BACKOFF_BASE_MS = 5000;      // 首次失败等 5 秒
-const POLL_BACKOFF_MULTIPLIER = 2;      // 每次失败翻倍
-const POLL_BACKOFF_MAX_MS = 300000;     // 上限 5 分钟
+const POLL_INTERVAL_MS = 30000;         // ★ 5 秒 → 30 秒
+const POLL_INTERVAL_HIDDEN_MS = 0;      // ★ 页面隐藏时停止
+const POLL_BACKOFF_BASE_MS = 5000;
+const POLL_BACKOFF_MULTIPLIER = 2;
+const POLL_BACKOFF_MAX_MS = 300000;
 
-// ============================================================
-// 状态
-// ============================================================
 const state = { rooms: [], selectedRoom: null };
-
 let pollTimer = null;
 let consecutiveFailures = 0;
 
-// ============================================================
-// 数据请求
-// ============================================================
 async function fetchRooms() {
-  // 网络错误或非 2xx 时抛错，让轮询层决定是否退避
   const r = await fetch("/api/public/rooms");
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
 }
 
 async function fetchRoomStatus(name) {
-  // 详情是可选展示，失败静默返回 null（不影响轮询健康）
   try {
     const r = await fetch(`/api/public/status/${encodeURIComponent(name)}`);
     return r.ok ? await r.json() : null;
   } catch { return null; }
 }
 
-// ============================================================
-// 格式化
-// ============================================================
 function fmtBytes(b) {
   if (!b) return "0 B";
   const u = ["B", "KB", "MB", "GB", "TB"];
@@ -61,15 +46,9 @@ function esc(s) {
 }
 
 function natBadge(natType) {
-  if (!natType || natType === "unknown") {
-    return `<span class="badge unknown">未知</span>`;
-  }
-  if (natType === "EasyNAT") {
-    return `<span class="badge p2p">EasyNAT</span>`;
-  }
-  if (natType === "HardNAT") {
-    return `<span class="badge relay">HardNAT</span>`;
-  }
+  if (!natType || natType === "unknown") return `<span class="badge unknown">未知</span>`;
+  if (natType === "EasyNAT") return `<span class="badge p2p">EasyNAT</span>`;
+  if (natType === "HardNAT") return `<span class="badge relay">HardNAT</span>`;
   return `<span class="badge unknown">${esc(natType)}</span>`;
 }
 
@@ -77,39 +56,23 @@ function formatConnStatus(connections) {
   if (!connections || Object.keys(connections).length === 0) {
     return `<span style="color:#64748b">--</span>`;
   }
-  const p2pList = [];
-  const turnList = [];
-  const relayList = [];
+  const p2pList = [], turnList = [], relayList = [];
   for (const [code, type] of Object.entries(connections)) {
     if (type === "p2p") p2pList.push(code);
     else if (type === "turn") turnList.push(code);
     else if (type === "relay") relayList.push(code);
   }
-  p2pList.sort();
-  turnList.sort();
-  relayList.sort();
+  p2pList.sort(); turnList.sort(); relayList.sort();
   const parts = [];
-  if (p2pList.length > 0) {
-    parts.push(`<span class="badge p2p">p2p-${p2pList.join("")}</span>`);
-  }
-  if (turnList.length > 0) {
-    parts.push(`<span class="badge turn">TURN-${turnList.join("")}</span>`);
-  }
-  if (relayList.length > 0) {
-    parts.push(`<span class="badge relay">ws-${relayList.join("")}</span>`);
-  }
+  if (p2pList.length > 0) parts.push(`<span class="badge p2p">p2p-${p2pList.join("")}</span>`);
+  if (turnList.length > 0) parts.push(`<span class="badge turn">TURN-${turnList.join("")}</span>`);
+  if (relayList.length > 0) parts.push(`<span class="badge relay">ws-${relayList.join("")}</span>`);
   return parts.join(" ");
 }
 
-// ============================================================
-// 渲染
-// ============================================================
 function renderRooms(rooms) {
   const c = document.getElementById("roomsList");
-  if (!rooms.length) {
-    c.innerHTML = `<p class="empty">暂无活跃房间</p>`;
-    return;
-  }
+  if (!rooms.length) { c.innerHTML = `<p class="empty">暂无活跃房间</p>`; return; }
   c.innerHTML = rooms.map((r) => {
     const total = r.peerCount || 0;
     const online = r.onlineCount != null ? r.onlineCount : total;
@@ -119,10 +82,8 @@ function renderRooms(rooms) {
         <div class="name">${esc(r.name)}</div>
         <div class="stats">${total} 个设备 · 在线 ${online} · 离线 ${offline}</div>
         <div class="stats">${fmtDur(Date.now() - r.lastActive)} 前活跃</div>
-      </div>
-    `;
+      </div>`;
   }).join("");
-
   c.querySelectorAll(".room-card").forEach((el) => {
     el.addEventListener("click", () => {
       state.selectedRoom = el.dataset.room;
@@ -136,88 +97,42 @@ function renderDetail(status) {
   const sec = document.getElementById("detailSection");
   const nameEl = document.getElementById("detailRoomName");
   const content = document.getElementById("detailContent");
-
   if (!status) { sec.style.display = "none"; return; }
   sec.style.display = "block";
   nameEl.textContent = status.community;
-
-  if (!status.peers.length) {
-    content.innerHTML = `<p class="empty">房间中没有 Peer</p>`;
-    return;
-  }
-
+  if (!status.peers.length) { content.innerHTML = `<p class="empty">房间中没有 Peer</p>`; return; }
   const rows = status.peers.map((p) => {
     const codeBadge = `<span style="display:inline-block;min-width:24px;padding:2px 6px;background:#334155;color:#e2e8f0;border-radius:4px;font-weight:700;text-align:center">${esc(p.code)}</span>`;
-
-    const ipDisplay = p.online
-      ? `<span class="mono">${esc(p.virtualIp)}</span>`
-      : `<span style="color:#64748b">--</span>`;
-
+    const ipDisplay = p.online ? `<span class="mono">${esc(p.virtualIp)}</span>` : `<span style="color:#64748b">--</span>`;
     const statusBadge = p.online
       ? `<span class="badge online">🟢 在线</span> <span style="color:#94a3b8;font-size:12px">${fmtDur(p.onlineFor)}</span>`
       : `<span class="badge unknown">⚪ 离线</span> <span style="color:#94a3b8;font-size:12px">${fmtDur(p.offlineFor)}</span>`;
-
-    const connStr = p.online
-      ? formatConnStatus(p.connections)
-      : `<span style="color:#64748b">--</span>`;
-
+    const connStr = p.online ? formatConnStatus(p.connections) : `<span style="color:#64748b">--</span>`;
     const flowStr = p.relayBytesTotal > 0
-      ? `${fmtBytes(p.relayBytesTotal)}
-         <div style="color:#64748b;font-size:11px">↑${fmtBytes(p.relayBytesOut)} ↓${fmtBytes(p.relayBytesIn)}</div>`
+      ? `${fmtBytes(p.relayBytesTotal)}<div style="color:#64748b;font-size:11px">↑${fmtBytes(p.relayBytesOut)} ↓${fmtBytes(p.relayBytesIn)}</div>`
       : `<span style="color:#64748b">0 B</span>`;
-
     return `
       <tr style="${p.online ? "" : "opacity:0.6"}">
-        <td>${codeBadge}</td>
-        <td>${ipDisplay}</td>
-        <td>${statusBadge}</td>
-        <td>${natBadge(p.natType)}</td>
-        <td>${connStr}</td>
+        <td>${codeBadge}</td><td>${ipDisplay}</td><td>${statusBadge}</td>
+        <td>${natBadge(p.natType)}</td><td>${connStr}</td>
         <td class="bytes">${flowStr}</td>
         <td style="color:#94a3b8;font-size:12px">${fmtDur(p.idleFor)} 前活跃</td>
-      </tr>
-    `;
+      </tr>`;
   }).join("");
-
   content.innerHTML = `
     <table>
-      <thead>
-        <tr>
-          <th>代号</th>
-          <th>虚拟 IP</th>
-          <th>在线状态</th>
-          <th>NAT 类型</th>
-          <th>状态</th>
-          <th>中继流量</th>
-          <th>最后活跃</th>
-        </tr>
-      </thead>
+      <thead><tr><th>代号</th><th>虚拟 IP</th><th>在线状态</th><th>NAT 类型</th><th>状态</th><th>中继流量</th><th>最后活跃</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
-    <p style="margin-top:12px;color:#64748b;font-size:12px">
-      代号按设备首次上线时间分配。完整信息（设备名、Client ID、公网地址、踢人/清空）请访问
-      <a href="/admin" style="color:#60a5fa">管理面板</a>。
-    </p>
-  `;
+    <p style="margin-top:12px;color:#64748b;font-size:12px">完整信息请访问 <a href="/admin" style="color:#60a5fa">管理面板</a>。</p>`;
 }
 
-// ============================================================
-// 刷新逻辑
-// ============================================================
 async function refreshAll() {
-  const rooms = await fetchRooms();  // 失败会 throw
+  const rooms = await fetchRooms();
   state.rooms = rooms;
   renderRooms(state.rooms);
-  if (state.selectedRoom) {
-    try {
-      await refreshDetail();
-    } catch (e) {
-      // 详情失败不影响列表展示
-      console.warn("[poll] refreshDetail failed:", e);
-    }
-  }
-  document.getElementById("lastUpdate").textContent =
-    `最后更新：${new Date().toLocaleTimeString()}`;
+  if (state.selectedRoom) await refreshDetail();
+  document.getElementById("lastUpdate").textContent = `最后更新：${new Date().toLocaleTimeString()}`;
 }
 
 async function refreshDetail() {
@@ -226,90 +141,46 @@ async function refreshDetail() {
   renderDetail(status);
 }
 
-// ============================================================
-// 轮询调度（含指数退避 + 页面可见性）
-// ============================================================
 function getPollDelay() {
-  if (document.hidden) {
-    return POLL_INTERVAL_HIDDEN_MS;
-  }
+  if (document.hidden) return POLL_INTERVAL_HIDDEN_MS;
   if (consecutiveFailures > 0) {
-    const delay = POLL_BACKOFF_BASE_MS *
-      Math.pow(POLL_BACKOFF_MULTIPLIER, consecutiveFailures - 1);
+    const delay = POLL_BACKOFF_BASE_MS * Math.pow(POLL_BACKOFF_MULTIPLIER, consecutiveFailures - 1);
     return Math.min(delay, POLL_BACKOFF_MAX_MS);
   }
   return POLL_INTERVAL_MS;
 }
 
 function schedulePoll() {
-  if (pollTimer) {
-    clearTimeout(pollTimer);
-    pollTimer = null;
-  }
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
   const delay = getPollDelay();
-  if (delay <= 0) return;  // 停止调度
-
+  if (delay <= 0) return;
   pollTimer = setTimeout(async () => {
     pollTimer = null;
-    try {
-      await refreshAll();
-      consecutiveFailures = 0;
-    } catch (e) {
-      consecutiveFailures++;
-      const nextDelay = getPollDelay();
-      console.warn(
-        `[poll] 失败 ${consecutiveFailures} 次，${Math.round(nextDelay / 1000)}s 后重试:`,
-        e
-      );
-    }
+    try { await refreshAll(); consecutiveFailures = 0; }
+    catch (e) { consecutiveFailures++; }
     schedulePoll();
   }, delay);
 }
 
-// ============================================================
-// 事件绑定
-// ============================================================
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
-    // 恢复可见：立即刷一次，重置退避
     (async () => {
-      try {
-        await refreshAll();
-        consecutiveFailures = 0;
-      } catch (e) {
-        consecutiveFailures++;
-      }
+      try { await refreshAll(); consecutiveFailures = 0; }
+      catch (e) { consecutiveFailures++; }
       schedulePoll();
     })();
   } else {
-    // 隐藏：取消定时器，按配置决定是否重排
-    if (pollTimer) {
-      clearTimeout(pollTimer);
-      pollTimer = null;
-    }
+    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
     schedulePoll();
   }
 });
 
 document.getElementById("refreshBtn").addEventListener("click", async () => {
-  try {
-    await refreshAll();
-    consecutiveFailures = 0;
-  } catch (e) {
-    console.error("[manual refresh] failed:", e);
-  }
+  try { await refreshAll(); consecutiveFailures = 0; } catch (e) {}
   schedulePoll();
 });
 
-// ============================================================
-// 启动
-// ============================================================
 (async () => {
-  try {
-    await refreshAll();
-  } catch (e) {
-    console.error("[init] refreshAll failed:", e);
-    consecutiveFailures++;
-  }
+  try { await refreshAll(); } catch (e) { consecutiveFailures++; }
   schedulePoll();
 })();

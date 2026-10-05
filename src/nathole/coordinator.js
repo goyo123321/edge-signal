@@ -35,6 +35,12 @@ function parsePort(sock) {
   return i < 0 ? 0 : parseInt(sock.slice(i + 1), 10) || 0;
 }
 
+function peerKey(p) { return p && p.mac; }
+
+// 检测 IPv6 地址（形如 [::1]:port 或 2409:xxx:...:port）
+function isIPv6Sock(sock) {
+  if (!sock) return false;
+  if (sock.includes("[")) return true;
 // PeerRecord 唯一标识字段是 `mac`
 function peerKey(p) { return p && p.mac; }
 

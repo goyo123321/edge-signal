@@ -1,23 +1,13 @@
-// ============================================================
-// 轮询配置
-// ============================================================
 const POLL_INTERVAL_MS = 30000;
 const POLL_INTERVAL_HIDDEN_MS = 0;
 const POLL_BACKOFF_BASE_MS = 5000;
 const POLL_BACKOFF_MULTIPLIER = 2;
 const POLL_BACKOFF_MAX_MS = 300000;
 
-// ============================================================
-// 状态
-// ============================================================
 const state = { token: "", rooms: [], selectedRoom: null };
-
 let pollTimer = null;
 let consecutiveFailures = 0;
 
-// ============================================================
-// Token 处理
-// ============================================================
 function loadToken() {
   const params = new URLSearchParams(location.search);
   const urlToken = params.get("token");
@@ -37,9 +27,7 @@ function logout() {
   showPrompt();
 }
 
-// ============================================================
-// API 调用
-// ============================================================
+// ★ 修复：token 走 Header
 async function apiCall(path, options = {}) {
   const url = new URL(path, location.origin);
   const resp = await fetch(url.toString(), {
@@ -49,13 +37,11 @@ async function apiCall(path, options = {}) {
       "X-Admin-Token": state.token,
     },
   });
-
   if (resp.status === 401) {
     showToast("Token 无效或已过期", "error");
     logout();
     throw new Error("Unauthorized");
   }
-
   if (!resp.ok) {
     let body = {};
     try { body = await resp.json(); } catch {}
@@ -64,13 +50,9 @@ async function apiCall(path, options = {}) {
     err.body = body;
     throw err;
   }
-
   return resp.json();
 }
 
-// ============================================================
-// 数据请求
-// ============================================================
 async function fetchRooms() {
   const rooms = await apiCall("/api/admin/rooms");
   return rooms || [];
@@ -80,11 +62,8 @@ async function fetchRoomStatus(roomName) {
   return apiCall(`/api/admin/status/${encodeURIComponent(roomName)}`);
 }
 
-// ============================================================
-// 操作（不变）
-// ============================================================
 async function clearRoom(roomName) {
-  if (!confirm(`确定清空房间 "${roomName}"？\n\n⚠️ 如果房间里有设备在线，操作会被拒绝。`)) return;
+  if (!confirm(`确定清空房间 "${roomName}"？`)) return;
   try {
     await apiCall(`/api/admin/clear?room=${encodeURIComponent(roomName)}`, { method: "POST" });
     showToast(`✅ 已清空 "${roomName}"`, "success");
@@ -96,13 +75,7 @@ async function clearRoom(roomName) {
   } catch (e) {
     if (e.status === 409) {
       const n = e.body?.onlineCount || 0;
-      showToast(`❌ 房间有 ${n} 个设备在线，无法清空`, "error");
-      setTimeout(() => {
-        const peers = (e.body?.onlinePeers || [])
-          .map((p) => `  - ${p.name || p.clientId} (${p.virtualIp})`)
-          .join("\n");
-        alert(`房间 "${roomName}" 有 ${n} 个设备在线，拒绝清空。\n\n在线设备：\n${peers}\n\n如需强制清空，请先踢出所有设备。`);
-      }, 100);
+      showToast(`❌ 房间有 ${n} 个设备在线`, "error");
     } else {
       showToast(`❌ 清空失败: ${e.message}`, "error");
     }
@@ -112,73 +85,44 @@ async function clearRoom(roomName) {
 async function kickPeer(roomName, cid) {
   if (!confirm(`确定踢掉该设备？`)) return;
   try {
-    await apiCall(
-      `/api/admin/kick?room=${encodeURIComponent(roomName)}&cid=${encodeURIComponent(cid)}`,
-      { method: "POST" }
-    );
+    await apiCall(`/api/admin/kick?room=${encodeURIComponent(roomName)}&cid=${encodeURIComponent(cid)}`, { method: "POST" });
     showToast(`✅ 已踢出`, "success");
     await refreshAll();
   } catch (e) { showToast(`❌ 踢人失败: ${e.message}`, "error"); }
 }
 
 async function clearAll() {
-  if (!confirm(`确定清空所有房间？\n\n共 ${state.rooms.length} 个房间。\n⚠️ 有设备在线的房间会被自动跳过。`)) return;
+  if (!confirm(`确定清空所有房间？`)) return;
   try {
     const result = await apiCall("/api/admin/clear-all", { method: "POST" });
-
     let msg = `✅ 已清空 ${result.count} 个房间`;
     if (result.skippedCount > 0) msg += `，跳过 ${result.skippedCount} 个`;
-    if (result.failedCount > 0) msg += `，失败 ${result.failedCount} 个`;
     showToast(msg, "success");
-
-    if (result.skipped && result.skipped.length > 0) {
-      const detail = result.skipped
-        .map((s) => `  - ${s.room}（${s.onlineCount} 个设备在线）`)
-        .join("\n");
-      setTimeout(() => {
-        alert(`以下房间有设备在线，已跳过：\n${detail}\n\n如需强制清空，请先踢出所有设备。`);
-      }, 100);
-    }
-
     state.selectedRoom = null;
     document.getElementById("detailSection").style.display = "none";
     await refreshAll();
-  } catch (e) {
-    showToast(`❌ 清空失败: ${e.message}`, "error");
-  }
+  } catch (e) { showToast(`❌ 清空失败: ${e.message}`, "error"); }
 }
 
-// ============================================================
-// 渲染
-// ============================================================
 function renderRooms() {
   const c = document.getElementById("roomsList");
-  if (!state.rooms.length) {
-    c.innerHTML = '<p class="empty">暂无活跃房间</p>';
-    return;
-  }
+  if (!state.rooms.length) { c.innerHTML = '<p class="empty">暂无活跃房间</p>'; return; }
   c.innerHTML = state.rooms.map((r) => {
     const ageStr = fmtDur(Date.now() - r.lastActive);
     const online = r.onlineCount != null ? r.onlineCount : (r.peerCount || 0);
     const offline = r.offlineCount != null ? r.offlineCount : 0;
     const total = r.peerCount || (online + offline);
-
     const canClear = online === 0;
     const clearBtn = canClear
       ? `<button class="small danger" data-action="clear" data-room="${esc(r.name)}">清空</button>`
-      : `<button class="small" disabled title="有 ${online} 个设备在线，无法清空" style="opacity:0.4;cursor:not-allowed">🔒 清空</button>`;
-
+      : `<button class="small" disabled style="opacity:0.4">🔒 清空</button>`;
     return `
       <div class="room-card ${state.selectedRoom === r.name ? "active" : ""}" data-room="${esc(r.name)}">
         <div class="name">${esc(r.name)}</div>
         <div class="stats">${total} 个设备 · 在线 ${online} · 离线 ${offline} · ${ageStr} 前活跃</div>
-        <div class="row-actions" style="margin-top:12px">
-          ${clearBtn}
-        </div>
-      </div>
-    `;
+        <div class="row-actions" style="margin-top:12px">${clearBtn}</div>
+      </div>`;
   }).join("");
-
   c.querySelectorAll(".room-card").forEach((el) => {
     el.addEventListener("click", (ev) => {
       const target = ev.target;
@@ -199,48 +143,31 @@ async function refreshDetail() {
   const sec = document.getElementById("detailSection");
   const nameEl = document.getElementById("detailRoomName");
   const content = document.getElementById("detailContent");
-
   try {
     const status = await fetchRoomStatus(state.selectedRoom);
     sec.style.display = "block";
     nameEl.textContent = status.community;
-
-    if (!status.peers.length) {
-      content.innerHTML = `<p class="empty">房间中没有 Peer</p>`;
-      return;
-    }
-
+    if (!status.peers.length) { content.innerHTML = `<p class="empty">房间中没有 Peer</p>`; return; }
     const rows = status.peers.map((p) => {
       const codeNameCell = `
         <div style="display:flex;align-items:center;gap:8px">
           <span style="display:inline-block;min-width:24px;padding:2px 6px;background:#334155;color:#e2e8f0;border-radius:4px;font-weight:700;text-align:center">${esc(p.code)}</span>
           <span>${esc(p.name || "(未命名)")}</span>
-        </div>
-      `;
-
+        </div>`;
       const ipCell = p.online
-        ? `
-          <div class="mono" style="color:#94a3b8;font-size:11px">${esc(p.publicIp || "-")}</div>
-          <div class="mono" style="color:#e2e8f0">${esc(p.virtualIp)}</div>
-        `
+        ? `<div class="mono" style="color:#94a3b8;font-size:11px">${esc(p.publicIp || "-")}</div><div class="mono" style="color:#e2e8f0">${esc(p.virtualIp)}</div>`
         : `<span style="color:#64748b">--</span>`;
-
       const statusBadge = p.online
         ? `<span class="badge online">🟢 在线</span> <span style="color:#94a3b8;font-size:12px">${fmtDur(p.onlineFor)}</span>`
         : `<span class="badge unknown">⚪ 离线</span> <span style="color:#94a3b8;font-size:12px">${fmtDur(p.offlineFor)}</span>`;
-
       const connStr = p.online ? formatConnStatus(p.connections) : `<span style="color:#64748b">--</span>`;
-
       const total = (p.relayBytesIn || 0) + (p.relayBytesOut || 0);
       const flowStr = total > 0
-        ? `${fmtBytes(total)}
-           <div style="color:#64748b;font-size:11px">↑${fmtBytes(p.relayBytesOut || 0)} ↓${fmtBytes(p.relayBytesIn || 0)}</div>`
+        ? `${fmtBytes(total)}<div style="color:#64748b;font-size:11px">↑${fmtBytes(p.relayBytesOut || 0)} ↓${fmtBytes(p.relayBytesIn || 0)}</div>`
         : `<span style="color:#64748b">0 B</span>`;
-
       const actionCell = p.online
         ? `<button class="small danger" data-action="kick" data-cid="${esc(p.clientId)}">踢出</button>`
         : `<span style="color:#64748b;font-size:11px">--</span>`;
-
       return `
         <tr style="${p.online ? "" : "opacity:0.6"}">
           <td>${codeNameCell}</td>
@@ -251,84 +178,37 @@ async function refreshDetail() {
           <td>${connStr}</td>
           <td class="bytes">${flowStr}</td>
           <td>${actionCell}</td>
-        </tr>
-      `;
+        </tr>`;
     }).join("");
-
     content.innerHTML = `
       <div style="margin-bottom:12px;color:#94a3b8;font-size:13px">
         共 ${status.peerCount} 个设备 · 在线 ${status.onlineCount} · 离线 ${status.offlineCount}
       </div>
       <table>
-        <thead>
-          <tr>
-            <th>代号/设备名</th>
-            <th>Client ID</th>
-            <th>公网IP / 虚拟IP</th>
-            <th>NAT 类型</th>
-            <th>状态</th>
-            <th>连接状态</th>
-            <th>中继流量</th>
-            <th>操作</th>
-          </tr>
-        </thead>
+        <thead><tr><th>代号/设备名</th><th>Client ID</th><th>公网IP / 虚拟IP</th><th>NAT 类型</th><th>状态</th><th>连接状态</th><th>中继流量</th><th>操作</th></tr></thead>
         <tbody>${rows}</tbody>
-      </table>
-    `;
-
+      </table>`;
     content.querySelectorAll('button[data-action="kick"]').forEach((btn) => {
-      btn.addEventListener("click", () => {
-        kickPeer(state.selectedRoom, btn.dataset.cid);
-      });
+      btn.addEventListener("click", () => kickPeer(state.selectedRoom, btn.dataset.cid));
     });
   } catch (e) {
     content.innerHTML = `<p class="empty">加载失败: ${esc(e.message)}</p>`;
   }
 }
 
-// ============================================================
-// 刷新逻辑
-// ============================================================
-async function refreshAll() {
-  const rooms = await fetchRooms();
-  state.rooms = rooms;
-  renderRooms();
-  document.getElementById("roomCount").textContent = state.rooms.length;
-  document.getElementById("status").textContent =
-    `更新于 ${new Date().toLocaleTimeString()}`;
-  if (state.selectedRoom) {
-    await refreshDetail();
-  }
-}
-
-// ============================================================
-// 格式化（不变）
-// ============================================================
 function formatConnStatus(connections) {
-  if (!connections || Object.keys(connections).length === 0) {
-    return `<span style="color:#64748b">--</span>`;
-  }
-  const p2pList = [];
-  const turnList = [];
-  const relayList = [];
+  if (!connections || Object.keys(connections).length === 0) return `<span style="color:#64748b">--</span>`;
+  const p2pList = [], turnList = [], relayList = [];
   for (const [code, type] of Object.entries(connections)) {
     if (type === "p2p") p2pList.push(code);
     else if (type === "turn") turnList.push(code);
     else if (type === "relay") relayList.push(code);
   }
-  p2pList.sort();
-  turnList.sort();
-  relayList.sort();
+  p2pList.sort(); turnList.sort(); relayList.sort();
   const parts = [];
-  if (p2pList.length > 0) {
-    parts.push(`<span class="badge p2p">p2p-${p2pList.join("")}</span>`);
-  }
-  if (turnList.length > 0) {
-    parts.push(`<span class="badge turn">TURN-${turnList.join("")}</span>`);
-  }
-  if (relayList.length > 0) {
-    parts.push(`<span class="badge relay">ws-${relayList.join("")}</span>`);
-  }
+  if (p2pList.length > 0) parts.push(`<span class="badge p2p">p2p-${p2pList.join("")}</span>`);
+  if (turnList.length > 0) parts.push(`<span class="badge turn">TURN-${turnList.join("")}</span>`);
+  if (relayList.length > 0) parts.push(`<span class="badge relay">ws-${relayList.join("")}</span>`);
   return parts.join(" ");
 }
 
@@ -373,78 +253,58 @@ function showPrompt() {
   document.getElementById("detailSection").style.display = "none";
   document.getElementById("tokenInput").value = "";
   document.getElementById("tokenInput").focus();
-  // 停止轮询
   if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
 }
 function showContent() {
   document.getElementById("tokenPrompt").style.display = "none";
   document.getElementById("content").style.display = "block";
   (async () => {
-    try {
-      await refreshAll();
-      consecutiveFailures = 0;
-    } catch (e) {
-      console.error("[admin] init refreshAll failed:", e);
-      consecutiveFailures++;
-    }
+    try { await refreshAll(); consecutiveFailures = 0; }
+    catch (e) { consecutiveFailures++; }
     schedulePoll();
   })();
 }
 
-// ============================================================
-// 轮询调度（与 app.js 同构）
-// ============================================================
+async function refreshAll() {
+  const rooms = await fetchRooms();
+  state.rooms = rooms;
+  renderRooms();
+  document.getElementById("roomCount").textContent = state.rooms.length;
+  document.getElementById("status").textContent = `更新于 ${new Date().toLocaleTimeString()}`;
+  if (state.selectedRoom) await refreshDetail();
+}
+
 function getPollDelay() {
   if (document.hidden) return POLL_INTERVAL_HIDDEN_MS;
   if (consecutiveFailures > 0) {
-    const delay = POLL_BACKOFF_BASE_MS *
-      Math.pow(POLL_BACKOFF_MULTIPLIER, consecutiveFailures - 1);
+    const delay = POLL_BACKOFF_BASE_MS * Math.pow(POLL_BACKOFF_MULTIPLIER, consecutiveFailures - 1);
     return Math.min(delay, POLL_BACKOFF_MAX_MS);
   }
   return POLL_INTERVAL_MS;
 }
 
 function schedulePoll() {
-  if (pollTimer) {
-    clearTimeout(pollTimer);
-    pollTimer = null;
-  }
-  if (!state.token) return;  // 未登录不轮询
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  if (!state.token) return;
   const delay = getPollDelay();
   if (delay <= 0) return;
-
   pollTimer = setTimeout(async () => {
     pollTimer = null;
-    try {
-      await refreshAll();
-      consecutiveFailures = 0;
-    } catch (e) {
+    try { await refreshAll(); consecutiveFailures = 0; }
+    catch (e) {
       consecutiveFailures++;
-      // 401 已经 logout，不必继续轮询
       if (e.message === "Unauthorized") return;
-      const nextDelay = getPollDelay();
-      console.warn(
-        `[admin poll] 失败 ${consecutiveFailures} 次，${Math.round(nextDelay / 1000)}s 后重试:`,
-        e
-      );
     }
     schedulePoll();
   }, delay);
 }
 
-// ============================================================
-// 事件绑定
-// ============================================================
 document.addEventListener("visibilitychange", () => {
   if (!state.token) return;
   if (!document.hidden) {
     (async () => {
-      try {
-        await refreshAll();
-        consecutiveFailures = 0;
-      } catch (e) {
-        consecutiveFailures++;
-      }
+      try { await refreshAll(); consecutiveFailures = 0; }
+      catch (e) { consecutiveFailures++; }
       schedulePoll();
     })();
   } else {
@@ -464,20 +324,12 @@ document.getElementById("tokenInput").addEventListener("keydown", (e) => {
   if (e.key === "Enter") document.getElementById("tokenSubmit").click();
 });
 document.getElementById("refreshBtn").addEventListener("click", async () => {
-  try {
-    await refreshAll();
-    consecutiveFailures = 0;
-  } catch (e) {
-    console.error("[manual refresh] failed:", e);
-  }
+  try { await refreshAll(); consecutiveFailures = 0; } catch (e) {}
   schedulePoll();
 });
 document.getElementById("clearAllBtn").addEventListener("click", clearAll);
 document.getElementById("logoutBtn").addEventListener("click", logout);
 
-// ============================================================
-// 启动
-// ============================================================
 state.token = loadToken();
 if (state.token) showContent();
 else showPrompt();
