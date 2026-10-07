@@ -1,10 +1,12 @@
-const DEFAULT_TURN_URL = 'turn://test:test@111.171.194.230:3478';
 const DEFAULT_UUID = '2523c510-9ff0-415b-9582-93949bfae7e3';
 
 const MUX_OPEN  = 0x01;
 const MUX_DATA  = 0x02;
 const MUX_CLOSE = 0x03;
 const MUX_FAIL  = 0x04;
+
+// ★ 帧长度上限：与 Go 客户端对齐（16 位长度字段）
+const MAX_FRAME_PAYLOAD = 0xFFFF;
 
 export async function handleOutboundStream(
   request: Request,
@@ -16,18 +18,14 @@ export async function handleOutboundStream(
     return new Response("Expected WebSocket", { status: 426 });
   }
 
-  // UUID 校验用
   const uuidStr = env?.UUID || DEFAULT_UUID;
   const uuidBytes = parseUUID(uuidStr);
   if (!uuidBytes) {
     return new Response("Server UUID invalid", { status: 500 });
   }
 
-  // TURN 配置
-  const turn =
-    getTurn(request.url) ||
-    getTurn(env?.TURN_URL) ||
-    getTurn(DEFAULT_TURN_URL);
+  // ★ 只读 TURN_URL 一个变量，支持多服务器
+  const turns = parseTurnUrls(env?.TURN_URL);
 
   const connectFn = fetcher.connect.bind(fetcher);
 
@@ -45,6 +43,20 @@ export async function handleOutboundStream(
 
   const sendFrame = (type: number, id: number, payload: Uint8Array | null) => {
     const p = payload ?? new Uint8Array(0);
+    if (p.length > MAX_FRAME_PAYLOAD) {
+      // 分片发送
+      let offset = 0;
+      while (offset < p.length) {
+        const chunk = p.subarray(offset, Math.min(offset + MAX_FRAME_PAYLOAD, p.length));
+        sendFrameRaw(type, id, chunk);
+        offset += chunk.length;
+      }
+      return;
+    }
+    sendFrameRaw(type, id, p);
+  };
+
+  const sendFrameRaw = (type: number, id: number, p: Uint8Array) => {
     const buf = new Uint8Array(5 + p.length);
     buf[0] = (id >> 8) & 0xff;
     buf[1] = id & 0xff;
@@ -80,9 +92,14 @@ export async function handleOutboundStream(
       tcp = connectFn({ hostname: ip, port });
       await tcp.opened;
     } catch (e) {
-      // TURN 回退
-      if (turn) {
-        try { tcp = await turnConn(turn, ip, port, connectFn); } catch {}
+      if (turns.length > 0) {
+        // 依次尝试每个 TURN 服务器
+        for (const t of turns) {
+          try {
+            tcp = await turnConn(t, ip, port, connectFn);
+            if (tcp) break;
+          } catch {}
+        }
       }
     }
 
@@ -210,7 +227,11 @@ function parseUUID(s: string): Uint8Array | null {
   const hex = s.replace(/-/g, '');
   if (hex.length !== 32) return null;
   const b = new Uint8Array(16);
-  for (let i = 0; i < 16; i++) b[i] = parseInt(hex.substr(i * 2, 2), 16);
+  for (let i = 0; i < 16; i++) {
+    const v = parseInt(hex.substr(i * 2, 2), 16);
+    if (isNaN(v)) return null;
+    b[i] = v;
+  }
   return b;
 }
 
@@ -221,6 +242,88 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 }
 
 // ============================================================
+// TURN URL 解析
+// ============================================================
+
+interface TurnServer {
+  scheme: 'turn' | 'turns';
+  host: string;
+  port: number;
+  user: string;
+  pass: string;
+  secure: boolean;
+}
+
+function parseTurnUrls(input: string | null | undefined): TurnServer[] {
+  if (!input) return [];
+  let raw = input.trim();
+  try { raw = decodeURIComponent(raw); } catch {}
+
+  const parts = raw.split(',').map(s => s.trim()).filter(Boolean);
+  const out: TurnServer[] = [];
+  for (const part of parts) {
+    const srv = parseOneTurn(part);
+    if (srv) out.push(srv);
+  }
+  return out;
+}
+
+function parseOneTurn(s: string): TurnServer | null {
+  const m = s.match(/^(turns?):\/\/(.+)$/i);
+  if (!m) return null;
+  const scheme = m[1].toLowerCase() as 'turn' | 'turns';
+  let rest = m[2].split(/[?#]/)[0];
+  if (!rest) return null;
+
+  let user = '';
+  let pass = '';
+  let hostPort = rest;
+  const at = rest.lastIndexOf('@');
+  if (at >= 0) {
+    const cred = rest.slice(0, at);
+    hostPort = rest.slice(at + 1);
+    const ci = cred.indexOf(':');
+    if (ci >= 0) {
+      user = cred.slice(0, ci);
+      pass = cred.slice(ci + 1);
+    } else {
+      user = cred;
+    }
+  }
+
+  if (!hostPort) return null;
+  let host = '';
+  let port = 0;
+
+  if (hostPort.startsWith('[')) {
+    const end = hostPort.indexOf(']');
+    if (end < 0) return null;
+    host = hostPort.slice(1, end);
+    const after = hostPort.slice(end + 1);
+    if (after.startsWith(':')) {
+      const p = Number(after.slice(1));
+      if (!Number.isInteger(p) || p <= 0 || p > 65535) return null;
+      port = p;
+    }
+  } else {
+    const colon = hostPort.lastIndexOf(':');
+    if (colon >= 0) {
+      host = hostPort.slice(0, colon);
+      const p = Number(hostPort.slice(colon + 1));
+      if (!Number.isInteger(p) || p <= 0 || p > 65535) return null;
+      port = p;
+    } else {
+      host = hostPort;
+    }
+  }
+
+  if (!host) return null;
+  if (!port) port = scheme === 'turns' ? 5349 : 3478;
+
+  return { scheme, host, port, user, pass, secure: scheme === 'turns' };
+}
+
+// ============================================================
 // STUN / TURN
 // ============================================================
 
@@ -228,6 +331,7 @@ const MAGIC = new Uint8Array([0x21, 0x12, 0xA4, 0x42]);
 
 const MT = {
   AQ: 0x003, AO: 0x103, AE: 0x113,
+  RQ: 0x004, RO: 0x104, RE: 0x114,   // ★ Refresh
   PQ: 0x008, PO: 0x108,
   CQ: 0x00A, CO: 0x10A,
   BQ: 0x00B, BO: 0x10B,
@@ -238,6 +342,7 @@ const AT = {
   PEER: 0x012, DATA: 0x013, REALM: 0x014, NONCE: 0x015,
   XOR_RELAYED: 0x016,
   TRANSPORT: 0x019, CONNID: 0x02A,
+  LIFETIME: 0x00D,
 };
 
 const tid = () => crypto.getRandomValues(new Uint8Array(12));
@@ -262,6 +367,12 @@ const stunMsg = (t: number, id: Uint8Array, a: Uint8Array[]): Uint8Array => {
   return cat(h, bd);
 };
 
+const u32 = (n: number) => {
+  const b = new Uint8Array(4);
+  new DataView(b.buffer).setUint32(0, n);
+  return b;
+};
+
 const xorPeer = (ip: string, port: number): Uint8Array => {
   const clean = ip.replace(/^\[|\]$/g, '');
   if (!clean.includes(':')) {
@@ -273,7 +384,7 @@ const xorPeer = (ip: string, port: number): Uint8Array => {
     for (let i = 0; i < 4; i++) b[4 + i] = (+parts[i] || 0) ^ MAGIC[i];
     return b;
   }
-  return new Uint8Array(8); // 本项目暂不支持 IPv6
+  return new Uint8Array(8);
 };
 
 const parseStun = (d: Uint8Array): any => {
@@ -315,7 +426,10 @@ const addIntegrity = async (m: Uint8Array, key: Uint8Array): Promise<Uint8Array>
   return cat(c, stunAttr(AT.MI, new Uint8Array(await crypto.subtle.sign('HMAC', k, c))));
 };
 
-const readStun = async (rd: ReadableStreamDefaultReader<Uint8Array>, buf?: Uint8Array | null): Promise<[any, Uint8Array | null]> => {
+const readStun = async (
+  rd: ReadableStreamDefaultReader<Uint8Array>,
+  buf?: Uint8Array | null
+): Promise<[any, Uint8Array | null]> => {
   let b = buf ?? new Uint8Array(0);
   const pull = async () => {
     const { done, value } = await rd.read();
@@ -334,57 +448,33 @@ const readStun = async (rd: ReadableStreamDefaultReader<Uint8Array>, buf?: Uint8
 
 const md5 = async (s: string) => new Uint8Array(await crypto.subtle.digest('MD5', enc(s)));
 
-const getTurn = (url: string): { host: string; port: number; user: string; pass: string } | null => {
-  if (!url) return null;
-  try {
-    let raw = decodeURIComponent(url);
-    const match = raw.match(/(?:\/)?turn:\/\/([^?&#\s]*)/i);
-    if (!match) return null;
-    const t = match[1];
-    const at = t.lastIndexOf('@');
-    const cred = at >= 0 ? t.slice(0, at) : '';
-    const hp = at >= 0 ? t.slice(at + 1) : t;
-
-    let host = '', p = '';
-    if (hp.startsWith('[')) {
-      const x = hp.indexOf(']');
-      if (x < 0) return null;
-      host = hp.slice(1, x);
-      p = hp.slice(x + 1).replace(/^:/, '');
-    } else {
-      const x = hp.lastIndexOf(':');
-      if (x < 0) return null;
-      host = hp.slice(0, x);
-      p = hp.slice(x + 1);
-    }
-    const ci = cred.indexOf(':');
-    return {
-      host,
-      port: +p || 3478,
-      user: ci >= 0 ? cred.slice(0, ci) : '',
-      pass: ci >= 0 ? cred.slice(ci + 1) : '',
-    };
-  } catch { return null; }
-};
-
 // ============================================================
-// TURN TCP (RFC 6062)
+// TURN TCP (RFC 6062) + Refresh 心跳
 // ============================================================
 
 const turnConn = async (
-  turn: { host: string; port: number; user: string; pass: string },
+  turn: TurnServer,
   targetIp: string,
   targetPort: number,
   connectFn: any,
 ): Promise<{ readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array>; close: () => void } | null> => {
-  const { host, port, user, pass } = turn;
+  const { host, port, user, pass, secure } = turn;
+
   let ctrl: any = null;
   let data: any = null;
-  const close = () => safeClose(ctrl, data);
+  let stopped = false;
+  let refreshTimer: any = null;
+
+  const close = () => {
+    if (stopped) return;
+    stopped = true;
+    if (refreshTimer) clearInterval(refreshTimer);
+    safeClose(ctrl, data);
+  };
 
   try {
-    // 1. control 连接 3478
-    ctrl = connectFn({ hostname: host, port });
+    // 1. control 连接
+    ctrl = connectFn({ hostname: host, port, secureTransport: secure ? 'on' : 'off' });
     await ctrl.opened;
     const cw = ctrl.writable.getWriter();
     const cr = ctrl.readable.getReader();
@@ -397,12 +487,14 @@ const turnConn = async (
     if (!msg) { close(); return null; }
 
     let key: Uint8Array | null = null;
+    let realm = '';
+    let nonce = new Uint8Array(0);
     let aa: Uint8Array[] = [];
     const sign = (m: Uint8Array) => key ? addIntegrity(m, key) : Promise.resolve(m);
 
     if (msg.type === MT.AE && user && parseErr(msg.attrs[AT.ERR]) === 401) {
-      const realm = dec.decode(msg.attrs[AT.REALM] ?? new Uint8Array(0));
-      const nonce = msg.attrs[AT.NONCE] ?? new Uint8Array(0);
+      realm = dec.decode(msg.attrs[AT.REALM] ?? new Uint8Array(0));
+      nonce = msg.attrs[AT.NONCE] ?? new Uint8Array(0);
       key = await md5(`${user}:${realm}:${pass}`);
       aa = [stunAttr(AT.USER, enc(user)), stunAttr(AT.REALM, enc(realm)), stunAttr(AT.NONCE, nonce)];
 
@@ -415,29 +507,38 @@ const turnConn = async (
 
     if (msg.type !== MT.AO) { close(); return null; }
 
-    // 3. 从 Allocate 响应提取 relay 地址
+    // 3. 提取 relay 地址
     const relayData = msg.attrs[AT.XOR_RELAYED];
     if (!relayData) { close(); return null; }
     const [relayIP, relayPort] = parseXorPeer(relayData);
     if (!relayIP || !relayPort) { close(); return null; }
     console.log(`[TURN] relay=${relayIP}:${relayPort}`);
 
-    // 4. Connect + CreatePermission
+    // ★ 从 Allocate 响应里提取 Lifetime（默认 600）
+    let lifetime = 600;
+    const ltAttr = msg.attrs[AT.LIFETIME];
+    if (ltAttr && ltAttr.length >= 4) {
+      const dv = new DataView(ltAttr.buffer, ltAttr.byteOffset, ltAttr.byteLength);
+      lifetime = dv.getUint32(0);
+      if (lifetime < 60) lifetime = 600;
+    }
+
+    // 4. Connect
     const peer = stunAttr(AT.PEER, xorPeer(targetIp, targetPort));
     const connMsg = await sign(stunMsg(MT.CQ, tid(), [peer, ...aa]));
-    const permMsg = await sign(stunMsg(MT.PQ, tid(), [peer, ...aa]));
-    await cw.write(cat(connMsg, permMsg));
+    await cw.write(connMsg);
 
     let r: any;
     [r, ex] = await readStun(cr, ex);
-    if (r?.type !== MT.CO || !r.attrs[AT.CONNID]) { close(); return null; }
+    if (r?.type !== MT.CO || !r.attrs[AT.CONNID]) {
+      console.error('[TURN] Connect 失败:', r?.type);
+      close();
+      return null;
+    }
     const connID = r.attrs[AT.CONNID];
 
-    [r, ex] = await readStun(cr, ex);
-    if (r?.type !== MT.PO) { close(); return null; }
-
-    // 5. data 连接 relay 地址
-    data = connectFn({ hostname: relayIP, port: relayPort });
+    // 5. data 连接
+    data = connectFn({ hostname: relayIP, port: relayPort, secureTransport: secure ? 'on' : 'off' });
     await data.opened;
 
     const dw = data.writable.getWriter();
@@ -448,10 +549,44 @@ const turnConn = async (
 
     let extra: Uint8Array | null = null;
     [r, extra] = await readStun(dr);
-    if (r?.type !== MT.BO) { close(); return null; }
+    if (r?.type !== MT.BO) {
+      console.error('[TURN] ConnectionBind 失败:', r?.type);
+      close();
+      return null;
+    }
 
-    cr.releaseLock();
-    cw.releaseLock();
+    // ★ 启动 Refresh 心跳：lifetime/2 发一次
+    const refreshIntervalMs = Math.max(60_000, Math.floor(lifetime / 2) * 1000);
+    refreshTimer = setInterval(async () => {
+      if (stopped) return;
+      try {
+        const refreshMsg = await sign(stunMsg(MT.RQ, tid(), [
+          stunAttr(AT.LIFETIME, u32(lifetime)),
+          ...aa,
+        ]));
+        await cw.write(refreshMsg);
+        const [rr] = await readStun(cr);
+        if (!rr) { close(); return; }
+        if (rr.type === MT.RE) {
+          const code = parseErr(rr.attrs[AT.ERR]);
+          if (code === 438) {
+            // ★ nonce 过期：用新 nonce 更新
+            nonce = rr.attrs[AT.NONCE] ?? nonce;
+            aa = [
+              stunAttr(AT.USER, enc(user)),
+              stunAttr(AT.REALM, enc(realm)),
+              stunAttr(AT.NONCE, nonce),
+            ];
+            console.log('[TURN] 438 刷新 nonce');
+          } else {
+            console.warn('[TURN] Refresh 失败 code=', code);
+          }
+        }
+      } catch (e) {
+        console.error('[TURN] refresh error:', e);
+      }
+    }, refreshIntervalMs);
+
     dw.releaseLock();
 
     const readable = new ReadableStream<Uint8Array>({
@@ -467,6 +602,7 @@ const turnConn = async (
     });
 
     return { readable, writable: data.writable, close };
+
   } catch (e) {
     console.error('[TURN] turnConn error:', e);
     close();
