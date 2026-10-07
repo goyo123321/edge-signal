@@ -30,7 +30,6 @@ interface PeerRecord {
   relayPacketsIn: number;
   relayPacketsOut: number;
   _publicIp?: string;
-  // ★ 同 WiFi 检测字段
   lanIp?: string;
   gatewayIp?: string;
   udpPort?: number;
@@ -42,6 +41,7 @@ const PEERS_STORAGE_KEY = "peers";
 const COMMUNITY_STORAGE_KEY = "community";
 const OFFLINE_TTL_MS = 30 * 60 * 1000;
 const SAVE_THROTTLE_MS = 3 * 1000;
+const REGISTRY_REPORT_THROTTLE_MS = 5 * 1000;
 
 function idxToCode(i: number): string {
   if (i < 26) return String.fromCharCode(65 + i);
@@ -66,12 +66,10 @@ export class Room extends DurableObject {
   private lastRegistryRefresh = 0;
   private shareAnnounces: Map<string, any> = new Map();
   private coordinator: NatHoleCoordinator;
-  private pendingStaggerAt: number | null = null;
   private saveAlarmScheduled = false;
   private loadedFromStorage = false;
   private lastSaveAt = 0;
   private pendingSaveTimer: ReturnType<typeof setTimeout> | null = null;
-  // ★ 同 WiFi 已通知集合
   private sameWiFiNotified: Set<string> = new Set();
 
   constructor(state: DurableObjectState, env: any) {
@@ -98,6 +96,15 @@ export class Room extends DurableObject {
       if (ip && port > 0) return { ip, port };
     }
     return { ip: p._publicIp || "", port: 0 };
+  }
+
+  // ★ 从 sameWiFiNotified 里清理指定 clientId 参与的所有 stateKey
+  private removeSameWiFiEntries(clientId: string): void {
+    for (const key of [...this.sameWiFiNotified]) {
+      if (key.split("|").includes(clientId)) {
+        this.sameWiFiNotified.delete(key);
+      }
+    }
   }
 
   private async ensureLoaded(): Promise<void> {
@@ -188,25 +195,28 @@ export class Room extends DurableObject {
       }
       await this.ctx.storage.put(PEERS_STORAGE_KEY, peersData);
       if (this.community) await this.ctx.storage.put(COMMUNITY_STORAGE_KEY, this.community);
-      this.lastSaveAt = Date.now();
     } catch (e) {
       console.error("[Room] saveStateNow failed:", e);
+      throw e;  // ★ 让调用方知道失败，以便正确更新 lastSaveAt
     }
   }
 
+  // ★ lastSaveAt 只在保存成功后更新，避免失败后进入节流窗口丢状态
   private saveStateThrottled(): void {
     const now = Date.now();
     if (now - this.lastSaveAt >= SAVE_THROTTLE_MS) {
-      this.lastSaveAt = now;
-      this.saveStateNow().catch(() => {});
+      this.saveStateNow()
+        .then(() => { this.lastSaveAt = Date.now(); })
+        .catch(() => {});
       return;
     }
     if (this.pendingSaveTimer) return;
     const delay = SAVE_THROTTLE_MS - (now - this.lastSaveAt);
     this.pendingSaveTimer = setTimeout(() => {
       this.pendingSaveTimer = null;
-      this.lastSaveAt = Date.now();
-      this.saveStateNow().catch(() => {});
+      this.saveStateNow()
+        .then(() => { this.lastSaveAt = Date.now(); })
+        .catch(() => {});
     }, delay);
   }
 
@@ -231,9 +241,8 @@ export class Room extends DurableObject {
       this.ipToClient.clear();
       this.shareAnnounces.clear();
       this.sameWiFiNotified.clear();
-      try {
-        this.coordinator = new (this.coordinator as any).constructor(this.env || {});
-      } catch (e) {}
+      // ★ 直接 new，不用 constructor 反射
+      this.coordinator = new NatHoleCoordinator(this.env || {});
       try { await this.ctx.storage.deleteAll(); } catch (e) {}
       this.ipCounter = 2;
       this.lastSaveAt = 0;
@@ -261,9 +270,11 @@ export class Room extends DurableObject {
       this.sessions.delete(cid);
       if (peer?.virtualIp) this.ipToClient.delete(peer.virtualIp);
       this.coordinator.clearPairStateFor(cid);
+      this.removeSameWiFiEntries(cid);  // ★ 清理 LAN 直连缓存
       this.broadcast(cid, { type: "left", from: cid });
-      await this.reportToRegistry(true);
+      await this.reportToRegistry();
       await this.saveStateNow();
+      this.lastSaveAt = Date.now();
       return new Response(JSON.stringify({ ok: true, kicked: cid }), { headers: { "Content-Type": "application/json" } });
     }
 
@@ -335,9 +346,10 @@ export class Room extends DurableObject {
     this.ipToClient.set(peer.virtualIp, clientId);
     this.sessions.set(clientId, server);
 
-    await this.reportToRegistry(true);
+    await this.reportToRegistry();
     await this.setupSaveAlarm();
     await this.saveStateNow();
+    this.lastSaveAt = Date.now();
 
     server.send(JSON.stringify({
       type: "ready", from: clientId,
@@ -408,7 +420,6 @@ export class Room extends DurableObject {
           } else {
             if (!peer.publicEndpoint) peer.pubSocket = "";
           }
-          // ★ 同 WiFi 字段
           if (typeof p.lanIp === "string") peer.lanIp = p.lanIp;
           if (typeof p.gatewayIp === "string") peer.gatewayIp = p.gatewayIp;
           if (typeof p.udpPort === "number") peer.udpPort = p.udpPort;
@@ -432,7 +443,6 @@ export class Room extends DurableObject {
           }
         }
         await this.runCoordination();
-        // ★ 检查同 WiFi
         this.checkSameWiFi();
         return;
 
@@ -534,9 +544,11 @@ export class Room extends DurableObject {
       this.sessions.delete(clientId);
       if (peer?.virtualIp) this.ipToClient.delete(peer.virtualIp);
       this.coordinator.clearPairStateFor(clientId);
+      this.removeSameWiFiEntries(clientId);  // ★ 清理 LAN 直连缓存
       this.broadcast(clientId, { type: "left", from: clientId });
-      await this.reportToRegistry(true);
+      await this.reportToRegistry();
       await this.saveStateNow();
+      this.lastSaveAt = Date.now();
     }
   }
 
@@ -544,7 +556,6 @@ export class Room extends DurableObject {
     await this.webSocketClose(ws);
   }
 
-  // ★ 同 WiFi 检测
   private checkSameWiFi(): void {
     const onlinePeers = Array.from(this.peers.values()).filter(p => p.online);
     for (let i = 0; i < onlinePeers.length; i++) {
@@ -705,8 +716,6 @@ export class Room extends DurableObject {
   }
 
   async alarm(): Promise<void> {
-    const pending = this.pendingStaggerAt;
-    this.pendingStaggerAt = null;
     try {
       await this.ensureLoaded();
       const now = Date.now();
@@ -721,15 +730,15 @@ export class Room extends DurableObject {
       await this.runCoordination();
       await this.setupSaveAlarm();
       await this.saveStateNow();
+      this.lastSaveAt = Date.now();
       if (onlineCount(this.peers) > 0) {
         if (now - this.lastRegistryRefresh >= REGISTRY_REFRESH_MS) {
           this.lastRegistryRefresh = now;
-          await this.reportToRegistry(true);
+          await this.reportToRegistry();
         }
       }
     } catch (e) {
       console.error("[Alarm] failed:", e);
-      if (pending != null && this.pendingStaggerAt == null) this.pendingStaggerAt = pending;
       try { await this.setupSaveAlarm(); } catch {}
     }
   }
@@ -773,9 +782,10 @@ export class Room extends DurableObject {
     throw new Error("IP pool exhausted");
   }
 
-  private async reportToRegistry(force = false): Promise<void> {
+  // ★ 去掉 force 参数，用统一节流；调用点不再传 true
+  private async reportToRegistry(): Promise<void> {
     const now = Date.now();
-    if (!force && now - this.lastReport < 5000) return;
+    if (now - this.lastReport < REGISTRY_REPORT_THROTTLE_MS) return;
     this.lastReport = now;
     try {
       const env = this.env as any;
