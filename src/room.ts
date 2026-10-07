@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { NatHoleCoordinator } from "./nathole/coordinator.js";
+import { NatHoleCoordinator } from "./nathole/coordinator.mjs";
 
 type ConnType = "p2p" | "turn" | "relay" | "unknown";
 
