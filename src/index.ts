@@ -8,17 +8,18 @@ export interface Env {
   REGISTRY: DurableObjectNamespace;
   ASSETS: Fetcher;
   ADMIN_TOKEN?: string;
-  CONNECT_TOKEN?: string;
+  // ★ 组网密钥：所有认证入口都用它
+  UUID?: string;
+  // ★ TURN 配置
   TURN_KEY_ID?: string;
   TURN_KEY_API_TOKEN?: string;
-  TURN_SERVERS?: string;
+  TURN_URL?: string;
   TURN_USERNAME?: string;
   TURN_PASSWORD?: string;
-  UUID?: string;
-  TURN_URL?: string;
 }
 
 const DEFAULT_ADMIN_TOKEN = "12332100";
+const DEFAULT_UUID = "2523c510-9ff0-415b-9582-93949bfae7e3";
 
 function safeEqual(a: string, b: string): boolean {
   if (!a || !b) return false;
@@ -37,6 +38,14 @@ function getAdminToken(env: Env): string {
   return DEFAULT_ADMIN_TOKEN;
 }
 
+// ★ 组网密钥（UUID）：未配置时使用默认值
+function getUUID(env: Env): string {
+  if (env.UUID && env.UUID.trim() !== "") {
+    return env.UUID.trim();
+  }
+  return DEFAULT_UUID;
+}
+
 function checkAdmin(request: Request, env: Env): boolean {
   const url = new URL(request.url);
   const provided =
@@ -44,6 +53,16 @@ function checkAdmin(request: Request, env: Env): boolean {
     request.headers.get("X-Admin-Token") ||
     "";
   return safeEqual(provided, getAdminToken(env));
+}
+
+// ★ 校验 UUID（从 URL query "token" 或 header "X-N2N-UUID" 读取）
+function checkUUID(request: Request, env: Env): boolean {
+  const url = new URL(request.url);
+  const provided =
+    url.searchParams.get("token") ||
+    request.headers.get("X-N2N-UUID") ||
+    "";
+  return safeEqual(provided, getUUID(env));
 }
 
 function jsonResp(obj: any, status = 200): Response {
@@ -65,7 +84,7 @@ function hasCloudflareTURN(env: Env): boolean {
 }
 
 function hasCustomTURN(env: Env): boolean {
-  return !!(env.TURN_SERVERS && env.TURN_SERVERS.trim() !== "");
+  return !!(env.TURN_URL && env.TURN_URL.trim() !== "");
 }
 
 function isTURNEnabled(env: Env): boolean {
@@ -139,7 +158,7 @@ function generateCustomTURN(
   env: Env,
   ttl: number
 ): Array<{ url: string; username: string; password: string; ttl: number }> {
-  const serversStr = env.TURN_SERVERS || "";
+  const serversStr = env.TURN_URL || "";
   const defaultUsername = env.TURN_USERNAME || "";
   const defaultPassword = env.TURN_PASSWORD || "";
 
@@ -184,7 +203,6 @@ async function generateCloudflareTURN(
   for (const ice of data.iceServers || []) {
     for (const u of ice.urls || []) {
       if (u.startsWith("turn:") || u.startsWith("turns:")) {
-        // ★ 剥离 ?transport= 后缀（客户端 net.ResolveUDPAddr / pion 不认 query）
         const cleanUrl = u.split("?")[0];
         servers.push({
           url: cleanUrl,
@@ -216,13 +234,10 @@ export default {
       return env.ASSETS.fetch(new Request(new URL("/admin.html", request.url)));
     }
 
-    // ========== TURN 凭证端点 ==========
+    // ========== TURN 凭证端点（UUID 校验） ==========
     if (pathname === "/api/turn-credentials") {
-      if (env.CONNECT_TOKEN && env.CONNECT_TOKEN.trim() !== "") {
-        const provided = url.searchParams.get("token") || "";
-        if (!safeEqual(provided, env.CONNECT_TOKEN)) {
-          return jsonResp({ success: false, error: "Unauthorized", servers: [] }, 401);
-        }
+      if (!checkUUID(request, env)) {
+        return jsonResp({ success: false, error: "Unauthorized", servers: [] }, 401);
       }
 
       if (!isTURNEnabled(env)) {
@@ -426,7 +441,7 @@ export default {
       return new Response("Not found", { status: 404 });
     }
 
-    // ========== ★ Workers 出口代理（Mux 版，认证在内部做）==========
+    // ========== Workers 出口代理（UUID 在 outbound-stream.ts 内部校验） ==========
     if (pathname.startsWith("/ws/out/")) {
       if (pathname !== "/ws/out/stream/") {
         return new Response("Not found", { status: 404 });
@@ -435,13 +450,10 @@ export default {
       return handleOutboundStream(request, (request as any).fetcher, env);
     }
 
-    // ========== WebSocket 信令 ==========
+    // ========== WebSocket 信令（UUID 校验） ==========
     if (pathname.startsWith("/ws/")) {
-      if (env.CONNECT_TOKEN && env.CONNECT_TOKEN.trim() !== "") {
-        const provided = url.searchParams.get("token") || "";
-        if (!safeEqual(provided, env.CONNECT_TOKEN)) {
-          return new Response("Invalid token", { status: 403 });
-        }
+      if (!checkUUID(request, env)) {
+        return new Response("Invalid token", { status: 403 });
       }
 
       const roomId = pathname.split("/")[2];
