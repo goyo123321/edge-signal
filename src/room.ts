@@ -30,6 +30,10 @@ interface PeerRecord {
   relayPacketsIn: number;
   relayPacketsOut: number;
   _publicIp?: string;
+  // ★ 同 WiFi 检测字段
+  lanIp?: string;
+  gatewayIp?: string;
+  udpPort?: number;
 }
 
 const STAGGER_FALLBACK_SAVE_MS = 300 * 1000;
@@ -67,6 +71,8 @@ export class Room extends DurableObject {
   private loadedFromStorage = false;
   private lastSaveAt = 0;
   private pendingSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  // ★ 同 WiFi 已通知集合
+  private sameWiFiNotified: Set<string> = new Set();
 
   constructor(state: DurableObjectState, env: any) {
     super(state, env);
@@ -139,6 +145,9 @@ export class Room extends DurableObject {
             relayPacketsIn: p.relayPacketsIn || 0,
             relayPacketsOut: p.relayPacketsOut || 0,
             _publicIp: p._publicIp || "",
+            lanIp: p.lanIp || "",
+            gatewayIp: p.gatewayIp || "",
+            udpPort: p.udpPort || 0,
           });
 
           if (p.virtualIp && p.online) {
@@ -174,6 +183,7 @@ export class Room extends DurableObject {
           turnRelayAddr: p.turnRelayAddr, relayBytesIn: p.relayBytesIn,
           relayBytesOut: p.relayBytesOut, relayPacketsIn: p.relayPacketsIn,
           relayPacketsOut: p.relayPacketsOut, _publicIp: p._publicIp,
+          lanIp: p.lanIp, gatewayIp: p.gatewayIp, udpPort: p.udpPort,
         };
       }
       await this.ctx.storage.put(PEERS_STORAGE_KEY, peersData);
@@ -220,12 +230,14 @@ export class Room extends DurableObject {
       this.peers.clear();
       this.ipToClient.clear();
       this.shareAnnounces.clear();
+      this.sameWiFiNotified.clear();
       try {
         this.coordinator = new (this.coordinator as any).constructor(this.env || {});
       } catch (e) {}
       try { await this.ctx.storage.deleteAll(); } catch (e) {}
       this.ipCounter = 2;
       this.lastSaveAt = 0;
+      this.community = "";
       return new Response(JSON.stringify({ ok: true, room: this.community }), {
         headers: { "Content-Type": "application/json" },
       });
@@ -396,11 +408,14 @@ export class Room extends DurableObject {
           } else {
             if (!peer.publicEndpoint) peer.pubSocket = "";
           }
+          // ★ 同 WiFi 字段
+          if (typeof p.lanIp === "string") peer.lanIp = p.lanIp;
+          if (typeof p.gatewayIp === "string") peer.gatewayIp = p.gatewayIp;
+          if (typeof p.udpPort === "number") peer.udpPort = p.udpPort;
           this.saveStateThrottled();
 
-          // ★ 关键：收到 p2p_metadata 后总是重广播 joined
           const addr = this.peerPublicAddr(peer);
-          console.log(`[Room] p2p_metadata from ${from}: natType=${peer.natType} pub=${addr.ip}:${addr.port} share=${peer.sharePort}`);
+          console.log(`[Room] p2p_metadata from ${from}: natType=${peer.natType} pub=${addr.ip}:${addr.port} lan=${peer.lanIp} gw=${peer.gatewayIp}`);
           if (addr.ip && addr.port > 0) {
             this.broadcast(from, {
               type: "joined", from,
@@ -417,6 +432,8 @@ export class Room extends DurableObject {
           }
         }
         await this.runCoordination();
+        // ★ 检查同 WiFi
+        this.checkSameWiFi();
         return;
 
       case "p2p_state_info":
@@ -527,12 +544,50 @@ export class Room extends DurableObject {
     await this.webSocketClose(ws);
   }
 
+  // ★ 同 WiFi 检测
+  private checkSameWiFi(): void {
+    const onlinePeers = Array.from(this.peers.values()).filter(p => p.online);
+    for (let i = 0; i < onlinePeers.length; i++) {
+      for (let j = i + 1; j < onlinePeers.length; j++) {
+        const a = onlinePeers[i];
+        const b = onlinePeers[j];
+        if (!a.gatewayIp || !b.gatewayIp) continue;
+        if (a.gatewayIp !== b.gatewayIp) continue;
+        if (a.lanIp === b.lanIp) continue;
+        if (!a.udpPort || !b.udpPort) continue;
+
+        const stateKey = [a.clientId, b.clientId].sort().join("|");
+        if (this.sameWiFiNotified.has(stateKey)) continue;
+
+        const instrToA = {
+          type: "lan_direct",
+          targetMac: b.clientId,
+          targetVirtualIp: b.virtualIp,
+          targetLanIp: b.lanIp,
+          targetUdpPort: b.udpPort,
+        };
+        const instrToB = {
+          type: "lan_direct",
+          targetMac: a.clientId,
+          targetVirtualIp: a.virtualIp,
+          targetLanIp: a.lanIp,
+          targetUdpPort: a.udpPort,
+        };
+
+        const wsA = this.sessions.get(a.clientId);
+        if (wsA) try { wsA.send(JSON.stringify(instrToA)); } catch {}
+        const wsB = this.sessions.get(b.clientId);
+        if (wsB) try { wsB.send(JSON.stringify(instrToB)); } catch {}
+
+        this.sameWiFiNotified.add(stateKey);
+        console.log(`[Room] 同 WiFi 直连: ${a.clientId} ↔ ${b.clientId} (gw=${a.gatewayIp})`);
+      }
+    }
+  }
+
   private async runCoordination(): Promise<void> {
     const onlinePeers = Array.from(this.peers.values()).filter((p) => p.online);
     console.log(`[Room] runCoordination: ${onlinePeers.length} 个在线 peer`);
-    for (const p of onlinePeers) {
-      console.log(`  - ${p.clientId}: natType=${p.natType} pubSocket="${p.pubSocket}"`);
-    }
 
     const community = { getOnlinePeers: () => onlinePeers };
     const instructions = this.coordinator.coordinate(community);
@@ -547,7 +602,6 @@ export class Room extends DurableObject {
       }
       try {
         targetWs.send(JSON.stringify({ type: "nat_hole_instruction", from: "server", payload: instr }));
-        console.log(`[Room] → ${mac} 下发 nat_hole_instruction role=${instr.role} target=${instr.targetPubSocket}`);
       } catch (e) {
         console.error(`[Room] 发送给 ${mac} 失败:`, e);
       }
@@ -599,6 +653,7 @@ export class Room extends DurableObject {
         publicIp: p._publicIp || "",
         pubSocket: p.pubSocket, p2pEndpoint: p.p2pEndpoint, publicEndpoint: p.publicEndpoint,
         turnRelayAddr: p.turnRelayAddr, sharePort: p.sharePort, natType: p.natType,
+        lanIp: p.lanIp, gatewayIp: p.gatewayIp, udpPort: p.udpPort,
         online: p.online, connectedAt: p.connectedAt, lastSeen: p.lastSeen, disconnectedAt: p.disconnectedAt,
         onlineFor: now - p.connectedAt,
         offlineFor: p.online ? 0 : (p.disconnectedAt ? now - p.disconnectedAt : 0),
