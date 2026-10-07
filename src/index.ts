@@ -14,6 +14,8 @@ export interface Env {
   TURN_SERVERS?: string;
   TURN_USERNAME?: string;
   TURN_PASSWORD?: string;
+  UUID?: string;
+  TURN_URL?: string;
 }
 
 const DEFAULT_ADMIN_TOKEN = "12332100";
@@ -182,9 +184,7 @@ async function generateCloudflareTURN(
   for (const ice of data.iceServers || []) {
     for (const u of ice.urls || []) {
       if (u.startsWith("turn:") || u.startsWith("turns:")) {
-        // ★ 修复：剥离 ?transport=udp|tcp 后缀
-        // Cloudflare 返回形如 "turn:turn.cloudflare.com:3478?transport=udp"
-        // 客户端 net.ResolveUDPAddr / pion/turn 不认 query，会解析失败
+        // ★ 剥离 ?transport= 后缀（客户端 net.ResolveUDPAddr / pion 不认 query）
         const cleanUrl = u.split("?")[0];
         servers.push({
           url: cleanUrl,
@@ -426,21 +426,13 @@ export default {
       return new Response("Not found", { status: 404 });
     }
 
-    // ========== ★ Workers 出口代理（必须在 /ws/ 之前）==========
+    // ========== ★ Workers 出口代理（Mux 版，认证在内部做）==========
     if (pathname.startsWith("/ws/out/")) {
       if (pathname !== "/ws/out/stream/") {
         return new Response("Not found", { status: 404 });
       }
-
-      if (env.CONNECT_TOKEN && env.CONNECT_TOKEN.trim() !== "") {
-        const provided = url.searchParams.get("token") || "";
-        if (!safeEqual(provided, env.CONNECT_TOKEN)) {
-          return new Response("Invalid token", { status: 403 });
-        }
-      }
-
-      // @ts-ignore - request.fetcher 由 Workers 注入
-      return handleOutboundStream(request, (request as any).fetcher);
+      // @ts-ignore
+      return handleOutboundStream(request, (request as any).fetcher, env);
     }
 
     // ========== WebSocket 信令 ==========
