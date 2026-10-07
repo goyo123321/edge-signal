@@ -20,5 +20,18 @@ binding = "ASSETS"
 [vars]
 NAT_PUNCH_STAGGER_MS = "1000"
 NAT_SENDER_DISPATCH_DELAY_MS = "1000"
-UUID = "2523c510-9ff0-415b-9582-93949bfae7e3"
-TURN_URL = "turn://test:test@111.171.194.230:3478"
+
+# 组网密钥（UUID）——留空或不填则用代码内置默认值
+# 若需自定义，取消注释并修改，同时客户端也要填同样的值：
+# UUID = "2523c510-9ff0-415b-9582-93949bfae7e3"
+
+# TURN 服务器（可选）——支持内嵌凭证、多服务器逗号分隔
+# 示例：
+# TURN_URL = "turn://test:test@111.171.194.230:3478"
+# TURN_URL = "turn://a:1@1.2.3.4:3478,turn://b:2@5.6.7.8:3478"
+# TURN_URL = "turns://user:pass@secure.example.com:5349"
+# TURN_URL = "turn://47.76.28.111"     # 无端口，自动补 3478
+
+# 可选：TURN 默认凭证（当 TURN_URL 未内嵌凭证时使用）
+# TURN_USERNAME = "default_user"
+# TURN_PASSWORD = "default_pass"
