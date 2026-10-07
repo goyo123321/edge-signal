@@ -9,7 +9,6 @@ import { NatHoleAnalyzer, pairKeyFor } from "./analyzer.mjs";
 
 const PORTS_RANGE_NUMBER = 10;
 const PUNCH_STAGGER_MS_DEFAULT = 1000;
-const SENDER_DISPATCH_DELAY_MS_DEFAULT = 1000;
 const FAIL_BACKOFF_BASE_MS = 15000;
 const FAIL_BACKOFF_CAP_MS = 300000;
 
@@ -53,7 +52,6 @@ export class NatHoleCoordinator {
     this.lastDispatchedRung = new Map();
 
     this.staggerMs = parseInt(env.NAT_PUNCH_STAGGER_MS ?? PUNCH_STAGGER_MS_DEFAULT, 10);
-    this.senderDelayMs = parseInt(env.NAT_SENDER_DISPATCH_DELAY_MS ?? SENDER_DISPATCH_DELAY_MS_DEFAULT, 10);
   }
 
   clearPairStateFor(mac) {
@@ -114,43 +112,44 @@ export class NatHoleCoordinator {
     return earliest;
   }
 
+  // ★ 收集所有候选对，用最大匹配算法选出本轮要处理的 pair
+  //
+  // 关键修复：
+  //   - 原实现按 node 级去重，A↔B 配对后 A 和 B 都无法再与 C 配对，
+  //     导致 3+ 节点 mesh 组网永远打不通
+  //   - 改为：收集所有候选对 → 优先未尝试 → 每轮选节点不重复的最大匹配
+  //   - 3 个节点：第 1 轮 A↔B，第 2 轮 A↔C 或 B↔C，第 3 轮剩下的
   coordinate(community) {
     const instructions = new Map();
     const online = community.getOnlinePeers();
     if (online.length < 2) return instructions;
 
     const now = Date.now();
-    const paired = new Set();
+
+    // ── 1. 收集候选对 ───────────────────────────────
+    const candidates = [];
 
     for (let i = 0; i < online.length; i++) {
       const a = online[i];
       const aKey = peerKey(a);
-      if (!aKey || paired.has(aKey)) continue;
+      if (!aKey) continue;
 
       for (let j = i + 1; j < online.length; j++) {
         const b = online[j];
         const bKey = peerKey(b);
-        if (!bKey || paired.has(bKey)) continue;
+        if (!bKey) continue;
 
         const fa = classifyNat(a), fb = classifyNat(b);
         if (fa.natType === "unknown" || fb.natType === "unknown") continue;
 
         const key = pairKeyFor(aKey, bKey);
 
+        // 已经成功的对跳过
         const prev = this.punchState.get(key);
-        if (prev && prev.aState === 3 && prev.bState === 3) {
-          paired.add(aKey);
-          paired.add(bKey);
-          continue;
-        }
+        if (prev && prev.aState === 3 && prev.bState === 3) continue;
 
         if (!a.pubSocket || !b.pubSocket) continue;
-
-        if (isIPv6Sock(a.pubSocket) || isIPv6Sock(b.pubSocket)) {
-          paired.add(aKey);
-          paired.add(bKey);
-          continue;
-        }
+        if (isIPv6Sock(a.pubSocket) || isIPv6Sock(b.pubSocket)) continue;
 
         const portA = parsePort(a.pubSocket);
         const portB = parsePort(b.pubSocket);
@@ -227,21 +226,14 @@ export class NatHoleCoordinator {
           ...shared,
         };
 
+        // ── 2. 过滤：backoff / 错峰 ─────────────────
         const signature = `${senderKey}->${receiverKey}`;
         const prevBackoff = this.backoff.get(key);
-
         if (prevBackoff && prevBackoff.signature === signature && now < prevBackoff.nextAllowedAt) {
-          paired.add(senderKey);
-          paired.add(receiverKey);
           continue;
         }
 
-        let backoffMs = FAIL_BACKOFF_BASE_MS;
         const fc = this.failCounts.get(key) || 0;
-        if (fc > 0) {
-          backoffMs = Math.min(FAIL_BACKOFF_BASE_MS * Math.pow(2, fc), FAIL_BACKOFF_CAP_MS);
-        }
-
         const regA = a.registeredAt || a.connectedAt || 0;
         const regB = b.registeredAt || b.connectedAt || 0;
         const newestReg = Math.max(regA, regB);
@@ -253,24 +245,50 @@ export class NatHoleCoordinator {
             signature,
             staggered: true,
           });
-          paired.add(senderKey);
-          paired.add(receiverKey);
           continue;
         }
 
-        this.backoff.set(key, {
-          nextAllowedAt: now + backoffMs,
-          backoffMs,
-          signature,
+        candidates.push({
+          key,
+          aKey,
+          bKey,
+          senderKey,
+          receiverKey,
+          senderInstr,
+          receiverInstr,
+          alreadyTried: this.punchState.has(key),
         });
-        this.lastDispatchedRung.set(key, rung);
-
-        instructions.set(senderKey, senderInstr);
-        instructions.set(receiverKey, receiverInstr);
-        paired.add(senderKey);
-        paired.add(receiverKey);
-        break;
       }
+    }
+
+    // ── 3. 优先未尝试的对 ──────────────────────────
+    candidates.sort((x, y) => {
+      if (x.alreadyTried !== y.alreadyTried) return x.alreadyTried ? 1 : -1;
+      return 0;
+    });
+
+    // ── 4. 贪心最大匹配：每轮节点不重复 ───────────
+    const usedNodes = new Set();
+    for (const c of candidates) {
+      if (usedNodes.has(c.aKey) || usedNodes.has(c.bKey)) continue;
+      usedNodes.add(c.aKey);
+      usedNodes.add(c.bKey);
+
+      const fc = this.failCounts.get(c.key) || 0;
+      let backoffMs = FAIL_BACKOFF_BASE_MS;
+      if (fc > 0) {
+        backoffMs = Math.min(FAIL_BACKOFF_BASE_MS * Math.pow(2, fc), FAIL_BACKOFF_CAP_MS);
+      }
+
+      this.backoff.set(c.key, {
+        nextAllowedAt: now + backoffMs,
+        backoffMs,
+        signature: `${c.senderKey}->${c.receiverKey}`,
+      });
+      this.lastDispatchedRung.set(c.key, c.senderInstr.behaviorIndex);
+
+      instructions.set(c.senderKey, c.senderInstr);
+      instructions.set(c.receiverKey, c.receiverInstr);
     }
 
     return instructions;
