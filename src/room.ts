@@ -29,9 +29,6 @@ interface PeerRecord {
   relayPacketsIn: number;
   relayPacketsOut: number;
   _publicIp?: string;
-  // ★ LAN 直连
-  lanIp?: string;
-  lanPort?: number;
 }
 
 const STAGGER_FALLBACK_SAVE_MS = 300 * 1000;
@@ -146,8 +143,6 @@ export class Room extends DurableObject {
             relayPacketsIn: p.relayPacketsIn || 0,
             relayPacketsOut: p.relayPacketsOut || 0,
             _publicIp: p._publicIp || "",
-            lanIp: p.lanIp || "",
-            lanPort: p.lanPort || 0,
           });
 
           if (p.virtualIp && p.online) {
@@ -183,7 +178,6 @@ export class Room extends DurableObject {
           turnRelayAddr: p.turnRelayAddr, relayBytesIn: p.relayBytesIn,
           relayBytesOut: p.relayBytesOut, relayPacketsIn: p.relayPacketsIn,
           relayPacketsOut: p.relayPacketsOut, _publicIp: p._publicIp,
-          lanIp: p.lanIp, lanPort: p.lanPort,
         };
       }
       await this.ctx.storage.put(PEERS_STORAGE_KEY, peersData);
@@ -304,9 +298,7 @@ export class Room extends DurableObject {
           publicPort: addr.port,
           natType: p.natType || "unknown",
           turnRelayAddr: p.turnRelayAddr || "",
-          // ★ LAN 直连字段
-          lanIp: p.lanIp || "",
-          lanPort: p.lanPort || 0,
+          assistedSockets: Array.isArray(p.assistedSockets) ? p.assistedSockets : [],
         };
       });
 
@@ -329,7 +321,6 @@ export class Room extends DurableObject {
         behavior: "BehaviorPortChanged", assistedSockets: [], observedRaddr: "",
         turnRelayAddr: "", relayBytesIn: 0, relayBytesOut: 0, relayPacketsIn: 0, relayPacketsOut: 0,
         _publicIp: publicIp,
-        lanIp: "", lanPort: 0,
       };
       this.peers.set(clientId, peer);
     }
@@ -360,9 +351,7 @@ export class Room extends DurableObject {
         publicPort: peerAddr.port,
         natType: peer.natType || "unknown",
         turnRelayAddr: peer.turnRelayAddr || "",
-        // ★ LAN 直连字段
-        lanIp: peer.lanIp || "",
-        lanPort: peer.lanPort || 0,
+        assistedSockets: Array.isArray(peer.assistedSockets) ? peer.assistedSockets : [],
       },
     });
 
@@ -408,13 +397,10 @@ export class Room extends DurableObject {
           } else {
             if (!peer.publicEndpoint) peer.pubSocket = "";
           }
-          // ★ LAN 直连字段
-          if (typeof p.lanIp === "string" && p.lanIp) peer.lanIp = p.lanIp;
-          if (typeof p.udpPort === "number" && p.udpPort > 0) peer.lanPort = p.udpPort;
           this.saveStateThrottled();
 
           const addr = this.peerPublicAddr(peer);
-          console.log(`[Room] p2p_metadata from ${from}: natType=${peer.natType} pub=${addr.ip}:${addr.port} lan=${peer.lanIp || "-"}:${peer.lanPort || 0}`);
+          console.log(`[Room] p2p_metadata from ${from}: natType=${peer.natType} pub=${addr.ip}:${addr.port} assisted=${peer.assistedSockets.length}`);
           if (addr.ip && addr.port > 0) {
             this.broadcast(from, {
               type: "joined", from,
@@ -425,9 +411,7 @@ export class Room extends DurableObject {
                 publicPort: addr.port,
                 natType: peer.natType || "unknown",
                 turnRelayAddr: peer.turnRelayAddr || "",
-                // ★ LAN 直连字段
-                lanIp: peer.lanIp || "",
-                lanPort: peer.lanPort || 0,
+                assistedSockets: Array.isArray(peer.assistedSockets) ? peer.assistedSockets : [],
               },
             });
           }
@@ -605,7 +589,7 @@ export class Room extends DurableObject {
         publicIp: p._publicIp || "",
         pubSocket: p.pubSocket, p2pEndpoint: p.p2pEndpoint, publicEndpoint: p.publicEndpoint,
         turnRelayAddr: p.turnRelayAddr, natType: p.natType,
-        lanIp: p.lanIp || "", lanPort: p.lanPort || 0,
+        assistedSockets: Array.isArray(p.assistedSockets) ? p.assistedSockets : [],
         online: p.online, connectedAt: p.connectedAt, lastSeen: p.lastSeen, disconnectedAt: p.disconnectedAt,
         onlineFor: now - p.connectedAt,
         offlineFor: p.online ? 0 : (p.disconnectedAt ? now - p.disconnectedAt : 0),
