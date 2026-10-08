@@ -7,6 +7,7 @@ const POLL_BACKOFF_MAX_MS = 300000;
 const state = { token: "", rooms: [], selectedRoom: null };
 let pollTimer = null;
 let consecutiveFailures = 0;
+let turnInfoLoaded = false;
 
 function loadToken() {
   const params = new URLSearchParams(location.search);
@@ -27,7 +28,44 @@ function logout() {
   showPrompt();
 }
 
-// ★ 修复：token 走 Header
+// ★ 新增：拉取 TURN 配置并渲染
+async function loadTURNInfo() {
+  const el = document.getElementById("turnInfo");
+  if (!el) return;
+  try {
+    const resp = await fetch("/api/public/turn-config");
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const info = await resp.json();
+
+    if (!info.enabled) {
+      el.className = "turn-info disabled";
+      el.innerHTML = `<span class="label">TURN</span> 未配置`;
+      return;
+    }
+
+    if (info.source === "cloudflare") {
+      el.className = "turn-info cloudflare";
+      const extra = info.servers.length > 0
+        ? ` <span class="label">+</span> ${esc(info.servers.map(s => s.url).join(", "))}`
+        : "";
+      el.innerHTML = `<span class="label">TURN</span> Cloudflare (动态)${extra}`;
+      el.title = "Cloudflare TURN：凭证动态生成，此处不显示地址\n" +
+        (info.servers.length > 0 ? "自定义 TURN 作为 fallback：" + info.servers.map(s => s.url).join(", ") : "");
+      return;
+    }
+
+    // custom
+    const urls = info.servers.map(s => s.url).join(", ");
+    el.className = "turn-info custom";
+    el.innerHTML = `<span class="label">TURN</span> ${esc(urls)}`;
+    el.title = urls;
+  } catch (e) {
+    el.className = "turn-info disabled";
+    el.innerHTML = `<span class="label">TURN</span> 加载失败`;
+  }
+}
+
+// token 走 Header
 async function apiCall(path, options = {}) {
   const url = new URL(path, location.origin);
   const resp = await fetch(url.toString(), {
@@ -148,19 +186,30 @@ async function refreshDetail() {
     sec.style.display = "block";
     nameEl.textContent = status.community;
     if (!status.peers.length) { content.innerHTML = `<p class="empty">房间中没有 Peer</p>`; return; }
+
     const rows = status.peers.map((p) => {
       const codeNameCell = `
         <div style="display:flex;align-items:center;gap:8px">
           <span style="display:inline-block;min-width:24px;padding:2px 6px;background:#334155;color:#e2e8f0;border-radius:4px;font-weight:700;text-align:center">${esc(p.code)}</span>
           <span>${esc(p.name || "(未命名)")}</span>
         </div>`;
+
+      const udpAddr = p.pubSocket || p.publicEndpoint || "";
       const ipCell = p.online
-        ? `<div class="mono" style="color:#94a3b8;font-size:11px">${esc(p.publicIp || "-")}</div><div class="mono" style="color:#e2e8f0">${esc(p.virtualIp)}</div>`
+        ? `<div class="mono" style="color:#94a3b8;font-size:11px" title="HTTP 连接源 IP">HTTP ${esc(p.publicIp || "-")}</div>`
+          + `<div class="mono" style="color:#a5b4fc;font-size:11px" title="UDP 打洞目标（NAT 公网映射）">UDP ${esc(udpAddr || "-")}</div>`
+          + `<div class="mono" style="color:#e2e8f0" title="虚拟 IP">VIP ${esc(p.virtualIp || "-")}</div>`
         : `<span style="color:#64748b">--</span>`;
+
       const statusBadge = p.online
         ? `<span class="badge online">🟢 在线</span> <span style="color:#94a3b8;font-size:12px">${fmtDur(p.onlineFor)}</span>`
         : `<span class="badge unknown">⚪ 离线</span> <span style="color:#94a3b8;font-size:12px">${fmtDur(p.offlineFor)}</span>`;
       const connStr = p.online ? formatConnStatus(p.connections) : `<span style="color:#64748b">--</span>`;
+
+      const turnCell = p.turnRelayAddr
+        ? `<span class="mono" style="color:#93c5fd;font-size:11px">${esc(p.turnRelayAddr)}</span>`
+        : `<span style="color:#64748b;font-size:11px">--</span>`;
+
       const total = (p.relayBytesIn || 0) + (p.relayBytesOut || 0);
       const flowStr = total > 0
         ? `${fmtBytes(total)}<div style="color:#64748b;font-size:11px">↑${fmtBytes(p.relayBytesOut || 0)} ↓${fmtBytes(p.relayBytesIn || 0)}</div>`
@@ -176,18 +225,33 @@ async function refreshDetail() {
           <td>${natBadge(p.natType)}</td>
           <td>${statusBadge}</td>
           <td>${connStr}</td>
+          <td>${turnCell}</td>
           <td class="bytes">${flowStr}</td>
           <td>${actionCell}</td>
         </tr>`;
     }).join("");
+
     content.innerHTML = `
       <div style="margin-bottom:12px;color:#94a3b8;font-size:13px">
         共 ${status.peerCount} 个设备 · 在线 ${status.onlineCount} · 离线 ${status.offlineCount}
       </div>
       <table>
-        <thead><tr><th>代号/设备名</th><th>Client ID</th><th>公网IP / 虚拟IP</th><th>NAT 类型</th><th>状态</th><th>连接状态</th><th>中继流量</th><th>操作</th></tr></thead>
+        <thead>
+          <tr>
+            <th>代号/设备名</th>
+            <th>Client ID</th>
+            <th>HTTP / UDP / 虚拟IP</th>
+            <th>NAT 类型</th>
+            <th>状态</th>
+            <th>连接状态</th>
+            <th>TURN 中继</th>
+            <th>中继流量</th>
+            <th>操作</th>
+          </tr>
+        </thead>
         <tbody>${rows}</tbody>
       </table>`;
+
     content.querySelectorAll('button[data-action="kick"]').forEach((btn) => {
       btn.addEventListener("click", () => kickPeer(state.selectedRoom, btn.dataset.cid));
     });
@@ -259,6 +323,10 @@ function showContent() {
   document.getElementById("tokenPrompt").style.display = "none";
   document.getElementById("content").style.display = "block";
   (async () => {
+    if (!turnInfoLoaded) {
+      turnInfoLoaded = true;
+      loadTURNInfo();
+    }
     try { await refreshAll(); consecutiveFailures = 0; }
     catch (e) { consecutiveFailures++; }
     schedulePoll();
