@@ -76,10 +76,9 @@ export class NatHoleAnalyzer {
    * 记录一次结果。
    *
    * 惩罚从 -1 改为 -2，与成功 +2 对称。原因：-1 会让一个曾经成功的
-   * 梯级掉回 neutral 需要 6 次失败。结合指数退避，实际上 rung 0 会
-   * 被反复选中——每次都恰好比未尝试的梯级高一点分。
-   * -2 让惩罚对称，一个 rung 掉出 neutral 只需要 3 次失败，在退避的
-   * 早期、便宜的几步之内就能完成。
+   * 梯级掉回 neutral 需要 6 次失败。结合指数退避，rung 0 会被反复
+   * 选中——每次都恰好比未尝试的梯级高一点分。-2 让惩罚对称，掉出
+   * neutral 只需要 3 次失败。
    */
   report(key, index, succeeded) {
     return this._rec(key).table.add(index, succeeded ? 2 : -2);
