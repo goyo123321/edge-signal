@@ -303,10 +303,10 @@ export class Room extends DurableObject {
 
     let peer = this.peers.get(clientId);
     if (peer) {
-      // ★ P0-6：重连时清 pair state
+      // 重连时清 pair state：
       // 重连的 edge 有新的 NAT 映射和新的 STUN 端口，旧的成功记录、退避
       // 窗口、分析器信用全部作废。不清掉会让重连后的 pair 等待一个为
-      // 上一个 session 计算的退避窗口（观测到 ~5 分钟沉默）。
+      // 上一个 session 计算的退避窗口。
       this.coordinator.clearPairStateFor(clientId);
       peer.online = true;
       peer.connectedAt = now;
@@ -385,7 +385,7 @@ export class Room extends DurableObject {
       case "p2p_metadata":
         if (peer) {
           const p = msg.payload || {};
-          // ★ name 从 share_announce 迁移到这里
+          // name 从 share_announce 迁移到这里
           if (typeof p.name === "string" && p.name) peer.name = p.name;
           peer.natType = p.natType || peer.natType;
           peer.portsDifference = p.portsDifference || 0;
@@ -419,8 +419,7 @@ export class Room extends DurableObject {
           }
         }
         await this.runCoordination();
-        // ★ P0-9：coordinate() 内部可能写入新的 staggered/backoff，
-        // 主动重新排 alarm，保证错峰窗口和 in-flight 超时都会被唤醒
+        // coordinate() 内部可能写入新的 staggered/backoff，主动重排 alarm
         await this.setupSaveAlarm();
         return;
 
@@ -433,7 +432,15 @@ export class Room extends DurableObject {
               if (target) target.observedRaddr = t.observedRaddr;
             }
             if (t.punchResult && t.punchResultPeerMac) {
-              this.coordinator.recordPunchResult(from, t.punchResultPeerMac, t.punchResult);
+              // 把客户端自报的 p2pStatus 一并传给协调器，
+              // 用于首次成功的交叉校验
+              const selfStatus = typeof t.p2pStatus === "number" ? t.p2pStatus : 0;
+              this.coordinator.recordPunchResult(
+                from,
+                t.punchResultPeerMac,
+                t.punchResult,
+                selfStatus
+              );
             }
           }
         }
@@ -523,7 +530,6 @@ export class Room extends DurableObject {
     if (onlinePeers.length < 2) return;
 
     const community = { getOnlinePeers: () => onlinePeers };
-    // ★ 新的返回值：{ instructions, wakeAt }
     const { instructions } = this.coordinator.coordinate(community);
 
     if (instructions.size === 0) return;
@@ -621,6 +627,9 @@ export class Room extends DurableObject {
         pair: k,
         aState: v.aState, bState: v.bState,
         aAttempts: v.aAttempts, bAttempts: v.bAttempts,
+        aP2PStatus: v.aP2PStatus,           // 新增
+        bP2PStatus: v.bP2PStatus,           // 新增
+        everValidated: !!v.everValidated,   // 新增
         behaviorIndex: v.behaviorIndex,
         ageMs: now - v.at,
       });
@@ -639,7 +648,7 @@ export class Room extends DurableObject {
 
   private async setupSaveAlarm(): Promise<void> {
     let wakeAt = Date.now() + STAGGER_FALLBACK_SAVE_MS;
-    // ★ 使用 coordinator 新的 nextWakeDeadline()，涵盖 staggered / backoff /
+    // 使用 coordinator 的 nextWakeDeadline()，涵盖 staggered / backoff /
     // in-flight 超时三类唤醒点
     const coordAt = this.coordinator.nextWakeDeadline();
     if (coordAt != null && coordAt < wakeAt) wakeAt = coordAt;
