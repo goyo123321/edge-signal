@@ -29,15 +29,9 @@ interface PeerRecord {
   relayPacketsIn: number;
   relayPacketsOut: number;
   _publicIp?: string;
-}
-
-interface NetworkConfig {
-  base: number;     // 网络地址（整数）
-  mask: number;     // 子网掩码（整数）
-  start: number;    // 可用起始（network + 1）
-  end: number;      // 可用结束（broadcast - 1）
-  prefix: number;   // 前缀长度
-  cidr: string;     // 原始 CIDR 字符串
+  // ★ LAN 直连
+  lanIp?: string;
+  lanPort?: number;
 }
 
 const STAGGER_FALLBACK_SAVE_MS = 300 * 1000;
@@ -46,8 +40,6 @@ const PEERS_STORAGE_KEY = "peers";
 const COMMUNITY_STORAGE_KEY = "community";
 const OFFLINE_TTL_MS = 30 * 60 * 1000;
 const SAVE_THROTTLE_MS = 3 * 1000;
-
-const DEFAULT_CIDR = "10.64.0.0/24";
 
 function idxToCode(i: number): string {
   if (i < 26) return String.fromCharCode(65 + i);
@@ -62,44 +54,11 @@ function onlineCount(peers: Map<string, PeerRecord>): number {
   return n;
 }
 
-/**
- * 解析 IPv4 CIDR。
- * 支持 /16 ~ /30。返回 null 表示非法输入。
- */
-function parseCIDR(cidr: string): NetworkConfig | null {
-  const trimmed = (cidr || "").trim();
-  if (!trimmed) return null;
-  const slash = trimmed.indexOf("/");
-  if (slash < 0) return null;
-  const ipPart = trimmed.slice(0, slash);
-  const prefixPart = trimmed.slice(slash + 1);
-
-  const ipParts = ipPart.split(".").map((s) => parseInt(s, 10));
-  if (ipParts.length !== 4) return null;
-  for (const p of ipParts) {
-    if (isNaN(p) || p < 0 || p > 255) return null;
-  }
-  const prefix = parseInt(prefixPart, 10);
-  if (isNaN(prefix) || prefix < 16 || prefix > 30) return null;
-
-  const base =
-    ((ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3]) >>> 0;
-  const mask = prefix === 0 ? 0 : (0xFFFFFFFF << (32 - prefix)) >>> 0;
-  const network = (base & mask) >>> 0;
-  const broadcast = (network | (~mask & 0xFFFFFFFF)) >>> 0;
-  const start = (network + 1) >>> 0;
-  const end = (broadcast - 1) >>> 0;
-
-  return { base: network, mask, start, end, prefix, cidr: trimmed };
-}
-
 export class Room extends DurableObject {
   private sessions: Map<string, WebSocket> = new Map();
   private peers: Map<string, PeerRecord> = new Map();
   private ipToClient: Map<string, string> = new Map();
-  // 相对于 network.start 的偏移，从 1 开始（start 通常留给网关）
-  private ipCounter = 1;
-  private network: NetworkConfig;
+  private ipCounter = 2;
   private community = "";
   private lastReport = 0;
   private lastRegistryRefresh = 0;
@@ -112,56 +71,7 @@ export class Room extends DurableObject {
 
   constructor(state: DurableObjectState, env: any) {
     super(state, env);
-
-    // ★ 从环境变量解析网段，失败时回退到默认
-    const configured = env && env.VIRTUAL_NETWORK;
-    let parsed = configured ? parseCIDR(configured) : null;
-    if (!parsed) {
-      if (configured) {
-        console.error(
-          `[Room] VIRTUAL_NETWORK 无效: "${configured}"，回退到 ${DEFAULT_CIDR}`
-        );
-      }
-      parsed = parseCIDR(DEFAULT_CIDR)!;
-    }
-    this.network = parsed;
-    console.log(
-      `[Room] 虚拟网段: ${this.network.cidr}（可用 ${this.network.end - this.network.start} 个）`
-    );
-
     this.coordinator = new NatHoleCoordinator(env || {});
-  }
-
-  private numberToIp(n: number): string {
-    return `${(n >>> 24) & 255}.${(n >>> 16) & 255}.${(n >>> 8) & 255}.${n & 255}`;
-  }
-
-  private ipToNumber(ip: string): number {
-    const p = ip.split(".").map(Number);
-    return ((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]) >>> 0;
-  }
-
-  /**
-   * ★ 从配置的网段里分配 IP。
-   *
-   * 从 `network.start + 1` 开始（network.start 通常留给网关），
-   * 循环回绕，遇到已分配的就跳过。
-   */
-  private allocateIp(): string {
-    const { start, end } = this.network;
-    const size = (end - start) >>> 0; // 可用的偏移数（不含 start 本身）
-    if (size < 1) throw new Error("IP pool too small");
-
-    for (let i = 0; i < size; i++) {
-      const offset = ((this.ipCounter - 1 + i) % size) + 1;
-      const ipNum = (start + offset) >>> 0;
-      const ip = this.numberToIp(ipNum);
-      if (!this.ipToClient.has(ip)) {
-        this.ipCounter = (offset % size) + 1;
-        return ip;
-      }
-    }
-    throw new Error("IP pool exhausted");
   }
 
   private extractIp(endpoint: string): string {
@@ -236,10 +146,17 @@ export class Room extends DurableObject {
             relayPacketsIn: p.relayPacketsIn || 0,
             relayPacketsOut: p.relayPacketsOut || 0,
             _publicIp: p._publicIp || "",
+            lanIp: p.lanIp || "",
+            lanPort: p.lanPort || 0,
           });
 
           if (p.virtualIp && p.online) {
             this.ipToClient.set(p.virtualIp, id);
+            const parts = String(p.virtualIp).split(".");
+            if (parts.length === 4) {
+              const last = parseInt(parts[3], 10);
+              if (!isNaN(last) && last >= this.ipCounter) this.ipCounter = last + 1;
+            }
           }
           restored++;
         }
@@ -266,6 +183,7 @@ export class Room extends DurableObject {
           turnRelayAddr: p.turnRelayAddr, relayBytesIn: p.relayBytesIn,
           relayBytesOut: p.relayBytesOut, relayPacketsIn: p.relayPacketsIn,
           relayPacketsOut: p.relayPacketsOut, _publicIp: p._publicIp,
+          lanIp: p.lanIp, lanPort: p.lanPort,
         };
       }
       await this.ctx.storage.put(PEERS_STORAGE_KEY, peersData);
@@ -315,7 +233,7 @@ export class Room extends DurableObject {
         this.coordinator = new (this.coordinator as any).constructor(this.env || {});
       } catch (e) {}
       try { await this.ctx.storage.deleteAll(); } catch (e) {}
-      this.ipCounter = 1;
+      this.ipCounter = 2;
       this.lastSaveAt = 0;
       return new Response(JSON.stringify({ ok: true, room: this.community }), {
         headers: { "Content-Type": "application/json" },
@@ -386,12 +304,14 @@ export class Room extends DurableObject {
           publicPort: addr.port,
           natType: p.natType || "unknown",
           turnRelayAddr: p.turnRelayAddr || "",
+          // ★ LAN 直连字段
+          lanIp: p.lanIp || "",
+          lanPort: p.lanPort || 0,
         };
       });
 
     let peer = this.peers.get(clientId);
     if (peer) {
-      // 重连时清 pair state
       this.coordinator.clearPairStateFor(clientId);
       peer.online = true;
       peer.connectedAt = now;
@@ -409,6 +329,7 @@ export class Room extends DurableObject {
         behavior: "BehaviorPortChanged", assistedSockets: [], observedRaddr: "",
         turnRelayAddr: "", relayBytesIn: 0, relayBytesOut: 0, relayPacketsIn: 0, relayPacketsOut: 0,
         _publicIp: publicIp,
+        lanIp: "", lanPort: 0,
       };
       this.peers.set(clientId, peer);
     }
@@ -419,14 +340,12 @@ export class Room extends DurableObject {
     await this.setupSaveAlarm();
     await this.saveStateNow();
 
-    // ★ ready 消息里下发网段，客户端据此配置 TUN 路由
     server.send(JSON.stringify({
       type: "ready", from: clientId,
       payload: {
         id: clientId,
         virtualIp: peer.virtualIp,
         yourPublicIp: publicIp,
-        virtualNetwork: this.network.cidr,
         peers: onlinePeersForClient,
       },
     }));
@@ -441,6 +360,9 @@ export class Room extends DurableObject {
         publicPort: peerAddr.port,
         natType: peer.natType || "unknown",
         turnRelayAddr: peer.turnRelayAddr || "",
+        // ★ LAN 直连字段
+        lanIp: peer.lanIp || "",
+        lanPort: peer.lanPort || 0,
       },
     });
 
@@ -486,10 +408,13 @@ export class Room extends DurableObject {
           } else {
             if (!peer.publicEndpoint) peer.pubSocket = "";
           }
+          // ★ LAN 直连字段
+          if (typeof p.lanIp === "string" && p.lanIp) peer.lanIp = p.lanIp;
+          if (typeof p.udpPort === "number" && p.udpPort > 0) peer.lanPort = p.udpPort;
           this.saveStateThrottled();
 
           const addr = this.peerPublicAddr(peer);
-          console.log(`[Room] p2p_metadata from ${from}: natType=${peer.natType} pub=${addr.ip}:${addr.port}`);
+          console.log(`[Room] p2p_metadata from ${from}: natType=${peer.natType} pub=${addr.ip}:${addr.port} lan=${peer.lanIp || "-"}:${peer.lanPort || 0}`);
           if (addr.ip && addr.port > 0) {
             this.broadcast(from, {
               type: "joined", from,
@@ -500,6 +425,9 @@ export class Room extends DurableObject {
                 publicPort: addr.port,
                 natType: peer.natType || "unknown",
                 turnRelayAddr: peer.turnRelayAddr || "",
+                // ★ LAN 直连字段
+                lanIp: peer.lanIp || "",
+                lanPort: peer.lanPort || 0,
               },
             });
           }
@@ -564,15 +492,11 @@ export class Room extends DurableObject {
     const data = new Uint8Array(buffer);
     if (data.length < 20) return;
     if (data[0] >> 4 !== 4) return;
-
-    // ★ 目标 IP 是否在配置的网段里
-    const dstIpNum =
-      ((data[16] << 24) | (data[17] << 16) | (data[18] << 8) | data[19]) >>> 0;
-    if (((dstIpNum & this.network.mask) >>> 0) !== this.network.base) return;
+    if (data[16] !== 10 || data[17] !== 64 || data[18] !== 0) return;
 
     const from = this.findClientId(ws);
     if (!from) return;
-    const dstIp = this.numberToIp(dstIpNum);
+    const dstIp = `${data[16]}.${data[17]}.${data[18]}.${data[19]}`;
     const targetClientId = this.ipToClient.get(dstIp);
     if (!targetClientId) return;
     const targetWs = this.sessions.get(targetClientId);
@@ -681,6 +605,7 @@ export class Room extends DurableObject {
         publicIp: p._publicIp || "",
         pubSocket: p.pubSocket, p2pEndpoint: p.p2pEndpoint, publicEndpoint: p.publicEndpoint,
         turnRelayAddr: p.turnRelayAddr, natType: p.natType,
+        lanIp: p.lanIp || "", lanPort: p.lanPort || 0,
         online: p.online, connectedAt: p.connectedAt, lastSeen: p.lastSeen, disconnectedAt: p.disconnectedAt,
         onlineFor: now - p.connectedAt,
         offlineFor: p.online ? 0 : (p.disconnectedAt ? now - p.disconnectedAt : 0),
@@ -694,7 +619,6 @@ export class Room extends DurableObject {
 
     return new Response(JSON.stringify({
       community: this.community,
-      virtualNetwork: this.network.cidr,
       peerCount: peers.length,
       onlineCount: onlineCnt,
       offlineCount: offlineCnt,
@@ -729,7 +653,7 @@ export class Room extends DurableObject {
         ageMs: now - v.at,
       });
     }
-    return new Response(JSON.stringify({ now, network: this.network.cidr, backoff, punch, inflight }, null, 2), {
+    return new Response(JSON.stringify({ now, backoff, punch, inflight }, null, 2), {
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
   }
@@ -792,6 +716,16 @@ export class Room extends DurableObject {
         try { socket.send(data); } catch {}
       }
     }
+  }
+
+  private allocateIp(): string {
+    for (let i = 0; i < 254; i++) {
+      const ip = `10.64.0.${this.ipCounter}`;
+      this.ipCounter++;
+      if (this.ipCounter > 254) this.ipCounter = 2;
+      if (!this.ipToClient.has(ip)) return ip;
+    }
+    throw new Error("IP pool exhausted");
   }
 
   private async reportToRegistry(force = false): Promise<void> {
