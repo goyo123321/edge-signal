@@ -11,21 +11,19 @@ const PORTS_RANGE_NUMBER = 10;
 const PUNCH_STAGGER_MS_DEFAULT = 1000;
 const SENDER_DISPATCH_DELAY_MS_DEFAULT = 1000;
 
-// 退避上限从 300s 降到 60s。
-// 300s 只让一个不可能成功的 pair 空转——每轮打洞都是相同地址、相同
-// NAT 映射，等更久不会提高成功率，只会推迟那一次本来就会成功的尝试。
+// 退避上限 60s。300s 只让一个不可能成功的 pair 空转——每轮打洞都是
+// 相同地址、相同 NAT 映射，等更久不会提高成功率。
 const FAIL_BACKOFF_BASE_MS = 15000;
 const FAIL_BACKOFF_CAP_MS = 60000;
 
-// 派发后等待终态报告的窗口。
-// 对端每 2s 上报一次状态，报告到达并写回 punchState 需要一次完整
-// 往返。这个常量必须比往返时间长、比 InProgress 窗口短。
+// in-flight 窗口。覆盖"派发到收到终态报告"这段往返延迟。
 const INFLIGHT_TIMEOUT_MS = 10000;
 
 // 成功记录退役的宽限期。
 const SUCCESS_GRACE_MS = 30000;
 
 const CONN_P2P = "p2p";
+const P2P_FULLDUPLEX = 3;
 
 function classifyNat(peer) {
   if (!peer || !peer.natType) {
@@ -73,8 +71,8 @@ function isIPv6Sock(sock) {
 /**
  * 判断一个已记录的成功是否还能代表当前隧道。
  *
- * 判据是双向的：双方当前都不在 P2P（客户端 connection_status 表里
- * 没有 "p2p"），且成功记录已存在超过 SUCCESS_GRACE_MS。
+ * 双方当前都不在 P2P（客户端 connection_status 表里没有 "p2p"），
+ * 且成功记录已存在超过 SUCCESS_GRACE_MS。
  */
 function shouldRetireSuccess(prev, a, b, now) {
   if (!prev) return false;
@@ -155,70 +153,125 @@ export class NatHoleCoordinator {
   /**
    * 记录一次打洞结果。
    *
+   * 参数：
+   *   reporterMAC   上报者
+   *   peerMAC       报告中的对端
+   *   result        { state, attempts, detail, behaviorIndex }
+   *   selfP2PStatus 上报者自己报的当前连接状态（3=P2P，2=relay/turn，0=unknown）
+   *
    * 单侧 state===3 即视为 pair 已建立——客户端在 executeNatHole 里
    * 只有在 hasRealTrafficFromAny() 确认收到对端"真实数据帧"后才上报 3。
-   * 要求双方都报 3 会让单向可达的 pair 卡死。
    *
    * InProgress（state===1）不走终态路径：客户端在收到指令后立即上报，
    * 比首个探测包早 sendDelayMs（最长 10s）。这里只刷新 in-flight 的
-   * 时间戳，让窗口从此刻重新计时，覆盖 sendDelayMs 期间。不更新
-   * punchState、不动 failCounts、不给 analyzer 记分。
+   * 时间戳，让窗口从此刻重新计时。
+   *
+   * state===3 时做一次交叉校验（仅首次）。首次建立 P2P 时，客户端
+   * 自报的 p2pStatus 或对侧之前上报过的 p2pStatus 必须至少有一个是
+   * 3（任一侧认为 P2P 已通，因为打洞是双向独立的，一端先于另一端
+   * 完成是正常时序）。通过后 everValidated=true，后续成功直接 bank。
+   * 因为客户端的 hasRealTrafficFromAny 每次都跑，物理证据始终在，
+   * 服务端不再重复交叉验证。everValidated 随 punchState 生灭，连接
+   * 断开或成功记录退役时会被清空。
    */
-  recordPunchResult(reporterMAC, peerMAC, result) {
+  recordPunchResult(reporterMAC, peerMAC, result, selfP2PStatus = 0) {
     if (!reporterMAC || !peerMAC || !result) return;
     const key = pairKeyFor(reporterMAC, peerMAC);
-    const state = typeof result.state === "number" ? result.state : 0;
+    let state = typeof result.state === "number" ? result.state : 0;
     if (state === 0) return;
 
     // === InProgress：刷新 in-flight，提前返回 ===
-    //
-    // 客户端在 executeNatHole 开头就上报 state=1。这比首个探测包早
-    // sendDelayMs（最长 10s）。服务端的 in-flight 窗口默认也是 10s，
-    // 不刷新的话会在客户端开始打洞前就误判为"没有回应"并重新派发。
-    //
-    // 无条件删除 in-flight 也不行——下一个 coordinate() 会立即重新
-    // 派发，回到"同一策略重复派发"的老问题。正确做法是刷新时间戳。
     if (state === 1) {
       const flight = this.inFlight.get(key);
       if (flight) {
         flight.at = Date.now();
         console.log(
-          `[NAT] ${key} InProgress：刷新 in-flight 窗口 ` +
-          `(rung ${flight.rung})`
+          `[NAT] ${key} InProgress：刷新 in-flight 窗口 (rung ${flight.rung})`
         );
       }
       return;
     }
 
-    // === 终态报告（2 或 3）：清 in-flight，进入状态机 ===
+    // === 终态报告：清 in-flight ===
     this.inFlight.delete(key);
-
-    const behaviorIndex =
-      typeof result.behaviorIndex === "number"
-        ? result.behaviorIndex
-        : this.lastDispatchedRung.get(key) ?? null;
 
     let entry = this.punchState.get(key);
     if (!entry) {
       entry = {
         aState: 0, bState: 0,
         aAttempts: 0, bAttempts: 0,
-        behaviorIndex,
+        aP2PStatus: 0, bP2PStatus: 0,
+        behaviorIndex: null,
         at: 0,
+        everValidated: false,
       };
       this.punchState.set(key, entry);
     }
+
     const [a, b] = key.split("|");
     const reporter = String(reporterMAC).toLowerCase();
-    if (reporter === a) {
+    const isA = reporter === a;
+    if (!isA && reporter !== b) return;
+
+    // 记录 reporter 自己报的 p2pStatus
+    if (isA) {
+      entry.aP2PStatus = selfP2PStatus;
+    } else {
+      entry.bP2PStatus = selfP2PStatus;
+    }
+
+    // === 首次成功时的交叉校验 ===
+    //
+    // 任一条件满足即通过：
+    //   1. 上报者自报 p2pStatus=3（自己认为 P2P 已通）
+    //   2. 对侧之前上报过 p2pStatus=3
+    //
+    // 都不满足时降级为失败。客户端状态机可能与打洞结果不一致，
+    // 宁可重打一轮也不 bank 一个可疑的成功。
+    if (state === 3) {
+      if (!entry.everValidated) {
+        const otherP2PStatus = isA ? entry.bP2PStatus : entry.aP2PStatus;
+        const corroborated =
+          selfP2PStatus === P2P_FULLDUPLEX ||
+          otherP2PStatus === P2P_FULLDUPLEX;
+
+        if (!corroborated) {
+          console.log(
+            `[NAT] ${key} 拒绝未证实的首次成功：` +
+            `self=${selfP2PStatus} other=${otherP2PStatus}（降级为失败）`
+          );
+          state = 2;
+          result = {
+            ...result,
+            detail: `uncorroborated-first(self=${selfP2PStatus} other=${otherP2PStatus}): ${result.detail || ""}`.trim(),
+          };
+        } else {
+          entry.everValidated = true;
+          console.log(
+            `[NAT] ${key} 首次成功通过交叉校验 ` +
+            `(self=${selfP2PStatus} other=${otherP2PStatus})，后续不再重复校验`
+          );
+        }
+      } else {
+        console.log(
+          `[NAT] ${key} 再次成功（已通过首次校验），跳过交叉校验`
+        );
+      }
+    }
+
+    // === 写入 reporter 的 state/attempts ===
+    if (isA) {
       entry.aState = state;
       entry.aAttempts = result.attempts || 0;
-    } else if (reporter === b) {
+    } else {
       entry.bState = state;
       entry.bAttempts = result.attempts || 0;
-    } else {
-      return;
     }
+
+    const behaviorIndex =
+      typeof result.behaviorIndex === "number"
+        ? result.behaviorIndex
+        : this.lastDispatchedRung.get(key) ?? null;
     if (behaviorIndex != null) entry.behaviorIndex = behaviorIndex;
     entry.at = Date.now();
 
@@ -315,7 +368,7 @@ export class NatHoleCoordinator {
           continue;
         }
 
-        // === 角色分配 ===
+        // === 角色分配：pubSocket 端口小的一方是 sender ===
         const portA = parsePort(a.pubSocket);
         const portB = parsePort(b.pubSocket);
         const sender = portA <= portB ? a : b;
