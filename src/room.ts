@@ -31,12 +31,23 @@ interface PeerRecord {
   _publicIp?: string;
 }
 
+interface NetworkConfig {
+  base: number;     // 网络地址（整数）
+  mask: number;     // 子网掩码（整数）
+  start: number;    // 可用起始（network + 1）
+  end: number;      // 可用结束（broadcast - 1）
+  prefix: number;   // 前缀长度
+  cidr: string;     // 原始 CIDR 字符串
+}
+
 const STAGGER_FALLBACK_SAVE_MS = 300 * 1000;
 const REGISTRY_REFRESH_MS = 5 * 60 * 1000;
 const PEERS_STORAGE_KEY = "peers";
 const COMMUNITY_STORAGE_KEY = "community";
 const OFFLINE_TTL_MS = 30 * 60 * 1000;
 const SAVE_THROTTLE_MS = 3 * 1000;
+
+const DEFAULT_CIDR = "10.64.0.0/24";
 
 function idxToCode(i: number): string {
   if (i < 26) return String.fromCharCode(65 + i);
@@ -51,11 +62,44 @@ function onlineCount(peers: Map<string, PeerRecord>): number {
   return n;
 }
 
+/**
+ * 解析 IPv4 CIDR。
+ * 支持 /16 ~ /30。返回 null 表示非法输入。
+ */
+function parseCIDR(cidr: string): NetworkConfig | null {
+  const trimmed = (cidr || "").trim();
+  if (!trimmed) return null;
+  const slash = trimmed.indexOf("/");
+  if (slash < 0) return null;
+  const ipPart = trimmed.slice(0, slash);
+  const prefixPart = trimmed.slice(slash + 1);
+
+  const ipParts = ipPart.split(".").map((s) => parseInt(s, 10));
+  if (ipParts.length !== 4) return null;
+  for (const p of ipParts) {
+    if (isNaN(p) || p < 0 || p > 255) return null;
+  }
+  const prefix = parseInt(prefixPart, 10);
+  if (isNaN(prefix) || prefix < 16 || prefix > 30) return null;
+
+  const base =
+    ((ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3]) >>> 0;
+  const mask = prefix === 0 ? 0 : (0xFFFFFFFF << (32 - prefix)) >>> 0;
+  const network = (base & mask) >>> 0;
+  const broadcast = (network | (~mask & 0xFFFFFFFF)) >>> 0;
+  const start = (network + 1) >>> 0;
+  const end = (broadcast - 1) >>> 0;
+
+  return { base: network, mask, start, end, prefix, cidr: trimmed };
+}
+
 export class Room extends DurableObject {
   private sessions: Map<string, WebSocket> = new Map();
   private peers: Map<string, PeerRecord> = new Map();
   private ipToClient: Map<string, string> = new Map();
-  private ipCounter = 2;
+  // 相对于 network.start 的偏移，从 1 开始（start 通常留给网关）
+  private ipCounter = 1;
+  private network: NetworkConfig;
   private community = "";
   private lastReport = 0;
   private lastRegistryRefresh = 0;
@@ -68,7 +112,56 @@ export class Room extends DurableObject {
 
   constructor(state: DurableObjectState, env: any) {
     super(state, env);
+
+    // ★ 从环境变量解析网段，失败时回退到默认
+    const configured = env && env.VIRTUAL_NETWORK;
+    let parsed = configured ? parseCIDR(configured) : null;
+    if (!parsed) {
+      if (configured) {
+        console.error(
+          `[Room] VIRTUAL_NETWORK 无效: "${configured}"，回退到 ${DEFAULT_CIDR}`
+        );
+      }
+      parsed = parseCIDR(DEFAULT_CIDR)!;
+    }
+    this.network = parsed;
+    console.log(
+      `[Room] 虚拟网段: ${this.network.cidr}（可用 ${this.network.end - this.network.start} 个）`
+    );
+
     this.coordinator = new NatHoleCoordinator(env || {});
+  }
+
+  private numberToIp(n: number): string {
+    return `${(n >>> 24) & 255}.${(n >>> 16) & 255}.${(n >>> 8) & 255}.${n & 255}`;
+  }
+
+  private ipToNumber(ip: string): number {
+    const p = ip.split(".").map(Number);
+    return ((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]) >>> 0;
+  }
+
+  /**
+   * ★ 从配置的网段里分配 IP。
+   *
+   * 从 `network.start + 1` 开始（network.start 通常留给网关），
+   * 循环回绕，遇到已分配的就跳过。
+   */
+  private allocateIp(): string {
+    const { start, end } = this.network;
+    const size = (end - start) >>> 0; // 可用的偏移数（不含 start 本身）
+    if (size < 1) throw new Error("IP pool too small");
+
+    for (let i = 0; i < size; i++) {
+      const offset = ((this.ipCounter - 1 + i) % size) + 1;
+      const ipNum = (start + offset) >>> 0;
+      const ip = this.numberToIp(ipNum);
+      if (!this.ipToClient.has(ip)) {
+        this.ipCounter = (offset % size) + 1;
+        return ip;
+      }
+    }
+    throw new Error("IP pool exhausted");
   }
 
   private extractIp(endpoint: string): string {
@@ -147,11 +240,6 @@ export class Room extends DurableObject {
 
           if (p.virtualIp && p.online) {
             this.ipToClient.set(p.virtualIp, id);
-            const parts = String(p.virtualIp).split(".");
-            if (parts.length === 4) {
-              const last = parseInt(parts[3], 10);
-              if (!isNaN(last) && last >= this.ipCounter) this.ipCounter = last + 1;
-            }
           }
           restored++;
         }
@@ -227,7 +315,7 @@ export class Room extends DurableObject {
         this.coordinator = new (this.coordinator as any).constructor(this.env || {});
       } catch (e) {}
       try { await this.ctx.storage.deleteAll(); } catch (e) {}
-      this.ipCounter = 2;
+      this.ipCounter = 1;
       this.lastSaveAt = 0;
       return new Response(JSON.stringify({ ok: true, room: this.community }), {
         headers: { "Content-Type": "application/json" },
@@ -303,10 +391,7 @@ export class Room extends DurableObject {
 
     let peer = this.peers.get(clientId);
     if (peer) {
-      // 重连时清 pair state：
-      // 重连的 edge 有新的 NAT 映射和新的 STUN 端口，旧的成功记录、退避
-      // 窗口、分析器信用全部作废。不清掉会让重连后的 pair 等待一个为
-      // 上一个 session 计算的退避窗口。
+      // 重连时清 pair state
       this.coordinator.clearPairStateFor(clientId);
       peer.online = true;
       peer.connectedAt = now;
@@ -334,12 +419,14 @@ export class Room extends DurableObject {
     await this.setupSaveAlarm();
     await this.saveStateNow();
 
+    // ★ ready 消息里下发网段，客户端据此配置 TUN 路由
     server.send(JSON.stringify({
       type: "ready", from: clientId,
       payload: {
         id: clientId,
         virtualIp: peer.virtualIp,
         yourPublicIp: publicIp,
+        virtualNetwork: this.network.cidr,
         peers: onlinePeersForClient,
       },
     }));
@@ -385,7 +472,6 @@ export class Room extends DurableObject {
       case "p2p_metadata":
         if (peer) {
           const p = msg.payload || {};
-          // name 从 share_announce 迁移到这里
           if (typeof p.name === "string" && p.name) peer.name = p.name;
           peer.natType = p.natType || peer.natType;
           peer.portsDifference = p.portsDifference || 0;
@@ -419,7 +505,6 @@ export class Room extends DurableObject {
           }
         }
         await this.runCoordination();
-        // coordinate() 内部可能写入新的 staggered/backoff，主动重排 alarm
         await this.setupSaveAlarm();
         return;
 
@@ -432,8 +517,6 @@ export class Room extends DurableObject {
               if (target) target.observedRaddr = t.observedRaddr;
             }
             if (t.punchResult && t.punchResultPeerMac) {
-              // 把客户端自报的 p2pStatus 一并传给协调器，
-              // 用于首次成功的交叉校验
               const selfStatus = typeof t.p2pStatus === "number" ? t.p2pStatus : 0;
               this.coordinator.recordPunchResult(
                 from,
@@ -481,11 +564,15 @@ export class Room extends DurableObject {
     const data = new Uint8Array(buffer);
     if (data.length < 20) return;
     if (data[0] >> 4 !== 4) return;
-    if (data[16] !== 10 || data[17] !== 64 || data[18] !== 0) return;
+
+    // ★ 目标 IP 是否在配置的网段里
+    const dstIpNum =
+      ((data[16] << 24) | (data[17] << 16) | (data[18] << 8) | data[19]) >>> 0;
+    if (((dstIpNum & this.network.mask) >>> 0) !== this.network.base) return;
 
     const from = this.findClientId(ws);
     if (!from) return;
-    const dstIp = `${data[16]}.${data[17]}.${data[18]}.${data[19]}`;
+    const dstIp = this.numberToIp(dstIpNum);
     const targetClientId = this.ipToClient.get(dstIp);
     if (!targetClientId) return;
     const targetWs = this.sessions.get(targetClientId);
@@ -607,6 +694,7 @@ export class Room extends DurableObject {
 
     return new Response(JSON.stringify({
       community: this.community,
+      virtualNetwork: this.network.cidr,
       peerCount: peers.length,
       onlineCount: onlineCnt,
       offlineCount: offlineCnt,
@@ -627,9 +715,9 @@ export class Room extends DurableObject {
         pair: k,
         aState: v.aState, bState: v.bState,
         aAttempts: v.aAttempts, bAttempts: v.bAttempts,
-        aP2PStatus: v.aP2PStatus,           // 新增
-        bP2PStatus: v.bP2PStatus,           // 新增
-        everValidated: !!v.everValidated,   // 新增
+        aP2PStatus: v.aP2PStatus,
+        bP2PStatus: v.bP2PStatus,
+        everValidated: !!v.everValidated,
         behaviorIndex: v.behaviorIndex,
         ageMs: now - v.at,
       });
@@ -641,15 +729,13 @@ export class Room extends DurableObject {
         ageMs: now - v.at,
       });
     }
-    return new Response(JSON.stringify({ now, backoff, punch, inflight }, null, 2), {
+    return new Response(JSON.stringify({ now, network: this.network.cidr, backoff, punch, inflight }, null, 2), {
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
   }
 
   private async setupSaveAlarm(): Promise<void> {
     let wakeAt = Date.now() + STAGGER_FALLBACK_SAVE_MS;
-    // 使用 coordinator 的 nextWakeDeadline()，涵盖 staggered / backoff /
-    // in-flight 超时三类唤醒点
     const coordAt = this.coordinator.nextWakeDeadline();
     if (coordAt != null && coordAt < wakeAt) wakeAt = coordAt;
     await this.ctx.storage.setAlarm(wakeAt);
@@ -706,16 +792,6 @@ export class Room extends DurableObject {
         try { socket.send(data); } catch {}
       }
     }
-  }
-
-  private allocateIp(): string {
-    for (let i = 0; i < 254; i++) {
-      const ip = `10.64.0.${this.ipCounter}`;
-      this.ipCounter++;
-      if (this.ipCounter > 254) this.ipCounter = 2;
-      if (!this.ipToClient.has(ip)) return ip;
-    }
-    throw new Error("IP pool exhausted");
   }
 
   private async reportToRegistry(force = false): Promise<void> {
