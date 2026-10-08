@@ -20,3 +20,14 @@ binding = "ASSETS"
 [vars]
 NAT_PUNCH_STAGGER_MS = "1000"
 NAT_SENDER_DISPATCH_DELAY_MS = "1000"
+
+# ★ 虚拟网段。支持 /16 ~ /30。
+# 默认 10.64.0.0/24，可改成任意 IPv4 CIDR。
+# 客户端会从 ready 消息里收到这个网段，自动配置 TUN 路由。
+#
+# 示例：
+#   VIRTUAL_NETWORK = "10.64.0.0/24"      # 254 个设备（默认）
+#   VIRTUAL_NETWORK = "100.64.0.0/16"     # 6.5 万个设备（CGNAT）
+#   VIRTUAL_NETWORK = "172.16.0.0/20"     # 4094 个设备（私有）
+#   VIRTUAL_NETWORK = "192.168.88.0/24"   # 家宽常用网段
+VIRTUAL_NETWORK = "10.64.0.0/24"
