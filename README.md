@@ -1,8 +1,8 @@
 # edge-signal
 
-基于 Cloudflare Workers + Durable Objects 实现的 n2n-go 控制平面，**替代传统 Supernode 服务器**。
+基于 Cloudflare Workers + Durable Objects 实现的 n2n 控制平面，**替代传统 Supernode 服务器**。
 
-通过 Cloudflare 全球边缘网络提供 WebSocket 信令服务，支持 NAT 打洞协调、P2P 直连、TURN 中继和 WebSocket 中继回退，实现**零运维**的异地组网。
+通过 Cloudflare 全球边缘网络提供 WebSocket 信令服务，支持 NAT 打洞协调、TURN 中继和 WebSocket 中继回退，实现**零运维**的异地组网。
 
 ## ✨ 特性
 
@@ -15,9 +15,9 @@
 - **设备代号** — 按上线顺序自动分配 A/B/C/D
 - **在线/离线统计** — 区分当前在线和断线的设备
 - **状态可视化** — `p2p-BD TURN-C ws-D` 格式直观展示连接方式
+- **虚拟网段可配** — 通过 `VIRTUAL_NETWORK` 配置任意 IPv4 CIDR
 - **状态持久化** — peers 写入 DO Storage，抗 evict
 - **自动清理** — 离线设备保留 30 分钟后清理，房间 1 小时无活动清理
-- **多端口支持** — 各节点共享盘端口可独立配置
 
 ## 🏗️ 架构
 
@@ -75,6 +75,8 @@ SIGNALING_URL="wss://edge-signal.<你的子域>.workers.dev" \
   ./n2n-client-linux-amd64 ...
 ```
 
+客户端参见 [n2n-go-client](https://github.com/goyo123321/n2n-go-client)。
+
 ## 🚀 通过 GitHub Actions 部署（推荐）
 
 不用本地装 Wrangler，用 GitHub Actions 自动部署。
@@ -105,8 +107,8 @@ https://github.com/<你的用户名>/edge-signal/settings/secrets/actions
 
 | Name | Value | 必填 |
 |:---|:---|:---|
-| `CLOUDFLARE_API_TOKEN` | 步骤1的Token=您的API 牌 | ✅ |
-| `CLOUDFLARE_ACCOUNT_ID` | 步骤2的 Account ID=帐户 ID | ✅ |
+| `CLOUDFLARE_API_TOKEN` | 步骤1的 Token | ✅ |
+| `CLOUDFLARE_ACCOUNT_ID` | 步骤2的 Account ID | ✅ |
 
 ### 4. 创建 workflow 文件
 
@@ -282,6 +284,12 @@ curl -s "https://edge-signal.xxx.workers.dev/api/turn-credentials" | jq
 }
 ```
 
+**查看部署级 TURN 配置（脱敏，面板用）**：
+
+```bash
+curl -s "https://edge-signal.xxx.workers.dev/api/public/turn-config" | jq
+```
+
 ## 📊 面板
 
 ### 公开面板
@@ -308,7 +316,8 @@ https://edge-signal.<子域>.workers.dev/admin?token=<ADMIN_TOKEN>
 显示：
 - 代号 + **设备名**
 - **Client ID**
-- **公网 IP**（上）+ 虚拟 IP（下）
+- **HTTP 源 IP / UDP 打洞地址 / 虚拟 IP**（三行）
+- **TURN 中继地址**
 - 完整连接对端列表
 - 中继流量明细
 
@@ -323,9 +332,11 @@ https://edge-signal.<子域>.workers.dev/admin?token=<ADMIN_TOKEN>
 |:---|:---|:---|
 | `/api/public/rooms` | 公开房间列表 | ❌ |
 | `/api/public/status/<room>` | 公开房间详情（脱敏） | ❌ |
+| `/api/public/turn-config` | TURN 配置（脱敏） | ❌ |
 | `/api/turn-credentials` | 生成 TURN 凭证 | ❌ |
 | `/api/admin/rooms` | 管理房间列表 | ✅ |
 | `/api/admin/status/<room>` | 完整房间详情 | ✅ |
+| `/api/admin/nathole/<room>` | 打洞协调器状态 | ✅ |
 | `/api/admin/kick?room=X&cid=Y` | 踢出设备 | ✅ |
 | `/api/admin/clear?room=X` | 清空房间 | ✅ |
 | `/api/admin/clear-all` | 清空全部 | ✅ |
@@ -338,6 +349,22 @@ https://edge-signal.<子域>.workers.dev/admin?token=<ADMIN_TOKEN>
 |:---|:---|:---|
 | `NAT_PUNCH_STAGGER_MS` | `1000` | 错峰窗口（毫秒） |
 | `NAT_SENDER_DISPATCH_DELAY_MS` | `1000` | sender 指令延迟（毫秒） |
+| `VIRTUAL_NETWORK` | `10.64.0.0/24` | 虚拟网段（IPv4 CIDR） |
+
+### 虚拟网段配置
+
+支持 `/16` ~ `/30` 的任意 IPv4 CIDR：
+
+| 网段 | 可用设备数 | 适用场景 |
+|:---|:---|:---|
+| `10.64.0.0/24` | 253 | 小规模（默认） |
+| `100.64.0.0/16` | 65533 | 大规模（CGNAT 段） |
+| `172.16.0.0/20` | 4093 | 私有段 |
+| `192.168.88.0/24` | 253 | 家宽常用段 |
+
+**修改 `VIRTUAL_NETWORK` 后需要**：
+1. 重新部署 Worker
+2. **重启所有客户端**——旧的 IP 和路由会被新网段覆盖
 
 ### Cloudflare Dashboard 里的变量
 
@@ -348,8 +375,8 @@ https://edge-signal.<子域>.workers.dev/admin?token=<ADMIN_TOKEN>
 ```
 edge-signal/
 ├── src/
-│   ├── index.ts              # Worker 入口 + TURN 凭证端点
-│   ├── room.ts               # Durable Object: 房间状态 + turn_request 处理
+│   ├── index.ts              # Worker 入口 + TURN 凭证端点 + 公开 API
+│   ├── room.ts               # Durable Object: 房间状态 + 打洞协调
 │   ├── registry.ts           # Durable Object: 房间注册表
 │   └── nathole/
 │       ├── ladder.js         # FRP 行为阶梯
@@ -375,7 +402,47 @@ edge-signal/
 | 30 分钟无活动 | 从 storage 中清理 |
 | 房间 1 小时无活动 | 从 registry 中清理 |
 | DO 被 evict | peers 从 storage 恢复，代号不变 |
-| 客户端重连 | 复用旧记录，虚拟 IP 不变 |
+| 客户端重连 | 复用旧记录，虚拟 IP 不变，清空该 peer 的打洞状态 |
+
+## 🧠 NAT 打洞协调
+
+打洞协调器移植自 FRP 的 `nathole` 模块，并修复了若干实战中发现的问题。
+
+### 行为阶梯
+
+每个梯级（rung）对应一组"探测策略"：
+
+| rung | 策略 | 说明 |
+|:---|:---|:---|
+| 0 | TTL 7，仅 receiver 探测 | 最便宜，对短路径最正确 |
+| 1 | TTL 7，双端探测 | 稍强 |
+| 2-3 | TTL 4 | 更短的 TTL |
+| 4-5 | **无 TTL** | 全路径，长路径唯一能用的 |
+| 6-9 | 加 sendDelayMs | 对称 NAT 场景 |
+
+### 关键机制
+
+| 机制 | 说明 |
+|:---|:---|
+| **梯级签名** | backoff 签名含梯级：`sender->receiver@rung`。梯级变化时立即重试，不受旧退避抑制 |
+| **in-flight 去重** | 派发后写入 in-flight 表，10s 内不重复派发 |
+| **InProgress 刷新** | 客户端收到指令立即上报 InProgress，服务端刷新 in-flight 窗口，覆盖 `sendDelayMs` 期间 |
+| **首次交叉校验** | 首次成功时校验客户端自报的 `p2pStatus`；通过后 `everValidated=true`，后续成功不再校验 |
+| **成功退役** | 双方都不在 P2P 且超过 30s 宽限期时，清空成功记录，重新协调 |
+| **退避上限** | 60s（不是 300s，避免无意义的等待） |
+| **失败惩罚** | -2（与成功 +2 对称） |
+| **tie-break** | rung 0 > rung 4/5 > 其他 |
+
+### 调试端点
+
+```
+GET /api/admin/nathole/<room>?token=<ADMIN_TOKEN>
+```
+
+返回：
+- `backoff`：所有 pair 的退避窗口
+- `punch`：所有 pair 的打洞状态（含 `aState` / `bState` / `aP2PStatus` / `bP2PStatus` / `everValidated`）
+- `inflight`：所有 in-flight 条目
 
 ## 🚨 限制
 
@@ -383,7 +450,7 @@ edge-signal/
 
 | 指标 | 上限 |
 |:---|:---|
-| 单房间设备数 | 253（受虚拟 IP 池限制） |
+| 单房间设备数 | 取决于 `VIRTUAL_NETWORK`（默认 253） |
 | 推荐规模 | 10 台以内 |
 | 打洞协调复杂度 | O(N²) |
 
@@ -404,10 +471,10 @@ edge-signal/
 - TURN 凭证含密码时，**必须**用 Secret 类型存储
 - 定期轮换 token
 
-## 📄 License
-
-MIT
-
 ## 🔗 相关项目
 
 - [n2n-go-client](https://github.com/goyo123321/n2n-go-client) — 跨平台客户端
+
+## 📄 License
+
+MIT
