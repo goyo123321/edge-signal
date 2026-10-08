@@ -17,7 +17,6 @@ interface PeerRecord {
   pubSocket: string;
   p2pEndpoint: string;
   publicEndpoint: string;
-  sharePort: number;
   natType: string;
   portsDifference: number;
   regularPortsChange: boolean;
@@ -60,7 +59,6 @@ export class Room extends DurableObject {
   private community = "";
   private lastReport = 0;
   private lastRegistryRefresh = 0;
-  private shareAnnounces: Map<string, any> = new Map();
   private coordinator: NatHoleCoordinator;
   private pendingStaggerAt: number | null = null;
   private saveAlarmScheduled = false;
@@ -78,6 +76,13 @@ export class Room extends DurableObject {
     const i = endpoint.lastIndexOf(":");
     if (i < 0) return endpoint;
     return endpoint.slice(0, i);
+  }
+
+  private extractPort(endpoint: string): number {
+    if (!endpoint) return 0;
+    const i = endpoint.lastIndexOf(":");
+    if (i < 0) return 0;
+    return parseInt(endpoint.slice(i + 1), 10) || 0;
   }
 
   private peerPublicAddr(p: PeerRecord): { ip: string; port: number } {
@@ -126,7 +131,6 @@ export class Room extends DurableObject {
             pubSocket: p.pubSocket || "",
             p2pEndpoint: p.p2pEndpoint || "",
             publicEndpoint: p.publicEndpoint || "",
-            sharePort: p.sharePort || 0,
             natType: p.natType || "unknown",
             portsDifference: p.portsDifference || 0,
             regularPortsChange: !!p.regularPortsChange,
@@ -168,7 +172,7 @@ export class Room extends DurableObject {
           lastSeen: p.lastSeen, disconnectedAt: p.disconnectedAt,
           connections: Object.fromEntries(p.connections),
           pubSocket: p.pubSocket, p2pEndpoint: p.p2pEndpoint, publicEndpoint: p.publicEndpoint,
-          sharePort: p.sharePort, natType: p.natType, portsDifference: p.portsDifference,
+          natType: p.natType, portsDifference: p.portsDifference,
           regularPortsChange: p.regularPortsChange, behavior: p.behavior,
           assistedSockets: p.assistedSockets, observedRaddr: p.observedRaddr,
           turnRelayAddr: p.turnRelayAddr, relayBytesIn: p.relayBytesIn,
@@ -219,7 +223,6 @@ export class Room extends DurableObject {
       this.sessions.clear();
       this.peers.clear();
       this.ipToClient.clear();
-      this.shareAnnounces.clear();
       try {
         this.coordinator = new (this.coordinator as any).constructor(this.env || {});
       } catch (e) {}
@@ -293,7 +296,6 @@ export class Room extends DurableObject {
           virtualIp: p.virtualIp,
           publicIp: addr.ip,
           publicPort: addr.port,
-          sharePort: p.sharePort || 0,
           natType: p.natType || "unknown",
           turnRelayAddr: p.turnRelayAddr || "",
         };
@@ -301,6 +303,11 @@ export class Room extends DurableObject {
 
     let peer = this.peers.get(clientId);
     if (peer) {
+      // ★ P0-6：重连时清 pair state
+      // 重连的 edge 有新的 NAT 映射和新的 STUN 端口，旧的成功记录、退避
+      // 窗口、分析器信用全部作废。不清掉会让重连后的 pair 等待一个为
+      // 上一个 session 计算的退避窗口（观测到 ~5 分钟沉默）。
+      this.coordinator.clearPairStateFor(clientId);
       peer.online = true;
       peer.connectedAt = now;
       peer.lastSeen = now;
@@ -313,7 +320,7 @@ export class Room extends DurableObject {
         online: true, connectedAt: now, registeredAt: now, lastSeen: now,
         connections: new Map(),
         pubSocket: "", p2pEndpoint: "", publicEndpoint: "",
-        sharePort: 0, natType: "unknown", portsDifference: 0, regularPortsChange: false,
+        natType: "unknown", portsDifference: 0, regularPortsChange: false,
         behavior: "BehaviorPortChanged", assistedSockets: [], observedRaddr: "",
         turnRelayAddr: "", relayBytesIn: 0, relayBytesOut: 0, relayPacketsIn: 0, relayPacketsOut: 0,
         _publicIp: publicIp,
@@ -334,9 +341,6 @@ export class Room extends DurableObject {
         virtualIp: peer.virtualIp,
         yourPublicIp: publicIp,
         peers: onlinePeersForClient,
-        shares: Array.from(this.shareAnnounces.entries())
-          .filter(([id]) => { const p = this.peers.get(id); return p && p.online; })
-          .map(([id, p]) => ({ id, ...p })),
       },
     }));
 
@@ -348,7 +352,6 @@ export class Room extends DurableObject {
         virtualIp: peer.virtualIp,
         publicIp: peerAddr.ip,
         publicPort: peerAddr.port,
-        sharePort: peer.sharePort || 0,
         natType: peer.natType || "unknown",
         turnRelayAddr: peer.turnRelayAddr || "",
       },
@@ -382,13 +385,14 @@ export class Room extends DurableObject {
       case "p2p_metadata":
         if (peer) {
           const p = msg.payload || {};
+          // ★ name 从 share_announce 迁移到这里
+          if (typeof p.name === "string" && p.name) peer.name = p.name;
           peer.natType = p.natType || peer.natType;
           peer.portsDifference = p.portsDifference || 0;
           peer.regularPortsChange = !!p.regularPortsChange;
           peer.behavior = p.behavior || peer.behavior;
           peer.assistedSockets = Array.isArray(p.assistedSockets) ? p.assistedSockets : [];
           if (typeof p.p2pEndpoint === "string" && p.p2pEndpoint) peer.p2pEndpoint = p.p2pEndpoint;
-          if (typeof p.sharePort === "number" && p.sharePort > 0) peer.sharePort = p.sharePort;
           const publicEndpoint = typeof p.publicEndpoint === "string" ? p.publicEndpoint : "";
           if (publicEndpoint && publicEndpoint !== "") {
             peer.publicEndpoint = publicEndpoint;
@@ -398,9 +402,8 @@ export class Room extends DurableObject {
           }
           this.saveStateThrottled();
 
-          // ★ 关键：收到 p2p_metadata 后总是重广播 joined
           const addr = this.peerPublicAddr(peer);
-          console.log(`[Room] p2p_metadata from ${from}: natType=${peer.natType} pub=${addr.ip}:${addr.port} share=${peer.sharePort}`);
+          console.log(`[Room] p2p_metadata from ${from}: natType=${peer.natType} pub=${addr.ip}:${addr.port}`);
           if (addr.ip && addr.port > 0) {
             this.broadcast(from, {
               type: "joined", from,
@@ -409,7 +412,6 @@ export class Room extends DurableObject {
                 virtualIp: peer.virtualIp,
                 publicIp: addr.ip,
                 publicPort: addr.port,
-                sharePort: peer.sharePort,
                 natType: peer.natType || "unknown",
                 turnRelayAddr: peer.turnRelayAddr || "",
               },
@@ -417,6 +419,9 @@ export class Room extends DurableObject {
           }
         }
         await this.runCoordination();
+        // ★ P0-9：coordinate() 内部可能写入新的 staggered/backoff，
+        // 主动重新排 alarm，保证错峰窗口和 in-flight 超时都会被唤醒
+        await this.setupSaveAlarm();
         return;
 
       case "p2p_state_info":
@@ -433,21 +438,7 @@ export class Room extends DurableObject {
           }
         }
         await this.runCoordination();
-        return;
-
-      case "share_announce":
-        this.shareAnnounces.set(from, msg.payload);
-        if (peer && msg.payload && typeof msg.payload === "object") {
-          const sharePayload = msg.payload as any;
-          if (typeof sharePayload.name === "string" && sharePayload.name) peer.name = sharePayload.name;
-        }
-        this.broadcast(from, { ...msg, from });
-        this.saveStateThrottled();
-        return;
-
-      case "share_withdraw":
-        this.shareAnnounces.delete(from);
-        this.broadcast(from, { ...msg, from });
+        await this.setupSaveAlarm();
         return;
 
       case "turn_relay_info": {
@@ -529,24 +520,22 @@ export class Room extends DurableObject {
 
   private async runCoordination(): Promise<void> {
     const onlinePeers = Array.from(this.peers.values()).filter((p) => p.online);
-    console.log(`[Room] runCoordination: ${onlinePeers.length} 个在线 peer`);
-    for (const p of onlinePeers) {
-      console.log(`  - ${p.clientId}: natType=${p.natType} pubSocket="${p.pubSocket}"`);
-    }
+    if (onlinePeers.length < 2) return;
 
     const community = { getOnlinePeers: () => onlinePeers };
-    const instructions = this.coordinator.coordinate(community);
-    console.log(`[Room] runCoordination: 生成 ${instructions.size} 条指令`);
+    // ★ 新的返回值：{ instructions, wakeAt }
+    const { instructions } = this.coordinator.coordinate(community);
 
     if (instructions.size === 0) return;
     for (const [mac, instr] of instructions) {
       const targetWs = this.sessions.get(mac);
-      if (!targetWs) {
-        console.warn(`[Room] 目标 ${mac} 无 WebSocket，跳过`);
-        continue;
-      }
+      if (!targetWs) continue;
       try {
-        targetWs.send(JSON.stringify({ type: "nat_hole_instruction", from: "server", payload: instr }));
+        targetWs.send(JSON.stringify({
+          type: "nat_hole_instruction",
+          from: "server",
+          payload: instr,
+        }));
         console.log(`[Room] → ${mac} 下发 nat_hole_instruction role=${instr.role} target=${instr.targetPubSocket}`);
       } catch (e) {
         console.error(`[Room] 发送给 ${mac} 失败:`, e);
@@ -598,7 +587,7 @@ export class Room extends DurableObject {
         virtualIp: p.online ? p.virtualIp : "",
         publicIp: p._publicIp || "",
         pubSocket: p.pubSocket, p2pEndpoint: p.p2pEndpoint, publicEndpoint: p.publicEndpoint,
-        turnRelayAddr: p.turnRelayAddr, sharePort: p.sharePort, natType: p.natType,
+        turnRelayAddr: p.turnRelayAddr, natType: p.natType,
         online: p.online, connectedAt: p.connectedAt, lastSeen: p.lastSeen, disconnectedAt: p.disconnectedAt,
         onlineFor: now - p.connectedAt,
         offlineFor: p.online ? 0 : (p.disconnectedAt ? now - p.disconnectedAt : 0),
@@ -636,15 +625,24 @@ export class Room extends DurableObject {
         ageMs: now - v.at,
       });
     }
-    return new Response(JSON.stringify({ now, backoff, punch }, null, 2), {
+    const inflight: any[] = [];
+    for (const [k, v] of c.inFlight) {
+      inflight.push({
+        pair: k, rung: v.rung, signature: v.signature,
+        ageMs: now - v.at,
+      });
+    }
+    return new Response(JSON.stringify({ now, backoff, punch, inflight }, null, 2), {
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
   }
 
   private async setupSaveAlarm(): Promise<void> {
     let wakeAt = Date.now() + STAGGER_FALLBACK_SAVE_MS;
-    const staggerAt = this.coordinator.nextStaggerDeadline();
-    if (staggerAt != null && staggerAt < wakeAt) wakeAt = staggerAt;
+    // ★ 使用 coordinator 新的 nextWakeDeadline()，涵盖 staggered / backoff /
+    // in-flight 超时三类唤醒点
+    const coordAt = this.coordinator.nextWakeDeadline();
+    if (coordAt != null && coordAt < wakeAt) wakeAt = coordAt;
     await this.ctx.storage.setAlarm(wakeAt);
     this.saveAlarmScheduled = true;
   }
@@ -677,13 +675,6 @@ export class Room extends DurableObject {
       if (pending != null && this.pendingStaggerAt == null) this.pendingStaggerAt = pending;
       try { await this.setupSaveAlarm(); } catch {}
     }
-  }
-
-  private extractPort(endpoint: string): number {
-    if (!endpoint) return 0;
-    const i = endpoint.lastIndexOf(":");
-    if (i < 0) return 0;
-    return parseInt(endpoint.slice(i + 1), 10) || 0;
   }
 
   private findClientId(ws: WebSocket): string | undefined {
