@@ -11,18 +11,18 @@ const PORTS_RANGE_NUMBER = 10;
 const PUNCH_STAGGER_MS_DEFAULT = 1000;
 const SENDER_DISPATCH_DELAY_MS_DEFAULT = 1000;
 
-// ★ P0-5：退避上限从 300s 降到 60s。
+// 退避上限从 300s 降到 60s。
 // 300s 只让一个不可能成功的 pair 空转——每轮打洞都是相同地址、相同
 // NAT 映射，等更久不会提高成功率，只会推迟那一次本来就会成功的尝试。
 const FAIL_BACKOFF_BASE_MS = 15000;
 const FAIL_BACKOFF_CAP_MS = 60000;
 
-// ★ P0-2：派发后等待终态报告的窗口。
+// 派发后等待终态报告的窗口。
 // 对端每 2s 上报一次状态，报告到达并写回 punchState 需要一次完整
 // 往返。这个常量必须比往返时间长、比 InProgress 窗口短。
 const INFLIGHT_TIMEOUT_MS = 10000;
 
-// ★ P0-4：成功记录退役的宽限期。
+// 成功记录退役的宽限期。
 const SUCCESS_GRACE_MS = 30000;
 
 const CONN_P2P = "p2p";
@@ -71,13 +71,10 @@ function isIPv6Sock(sock) {
 }
 
 /**
- * ★ P0-4：判断一个已记录的成功是否还能代表当前隧道。
+ * 判断一个已记录的成功是否还能代表当前隧道。
  *
  * 判据是双向的：双方当前都不在 P2P（客户端 connection_status 表里
  * 没有 "p2p"），且成功记录已存在超过 SUCCESS_GRACE_MS。
- *
- * 参考 n2ngo-ws-relay 的 shouldRetireSuccess()。它是 2026-09-30 E1<->E2
- * "成功记录永驻、pair 永远被 continue 跳过"bug 的修复。
  */
 function shouldRetireSuccess(prev, a, b, now) {
   if (!prev) return false;
@@ -98,7 +95,7 @@ function shouldRetireSuccess(prev, a, b, now) {
 }
 
 /**
- * ★ P0-2：判断一条已派发但未收到终态报告的指令是否仍在飞行中。
+ * 判断一条已派发但未收到终态报告的指令是否仍在飞行中。
  *
  * 梯级和签名都是判定的一部分：任一变化都意味着该指令已不适用，
  * 必须放行。
@@ -129,7 +126,7 @@ export class NatHoleCoordinator {
     this.punchState = new Map();
     this.failCounts = new Map();
     this.lastDispatchedRung = new Map();
-    // ★ P0-2：已派发但未收到终态报告的指令
+    // 已派发但未收到终态报告的指令
     this.inFlight = new Map();
 
     this.staggerMs = parseInt(
@@ -156,11 +153,16 @@ export class NatHoleCoordinator {
   }
 
   /**
-   * ★ P0-3：单侧 state===3 即视为 pair 已建立。
+   * 记录一次打洞结果。
    *
-   * 客户端在 executeNatHole 里只有在 hasRealTrafficFromAny() 确认收到
-   * 对端"真实数据帧"后才上报 3。要求双方都报 3 会让单向可达的 pair
-   * 卡死，而单向可达本身不是可修复的状态。
+   * 单侧 state===3 即视为 pair 已建立——客户端在 executeNatHole 里
+   * 只有在 hasRealTrafficFromAny() 确认收到对端"真实数据帧"后才上报 3。
+   * 要求双方都报 3 会让单向可达的 pair 卡死。
+   *
+   * InProgress（state===1）不走终态路径：客户端在收到指令后立即上报，
+   * 比首个探测包早 sendDelayMs（最长 10s）。这里只刷新 in-flight 的
+   * 时间戳，让窗口从此刻重新计时，覆盖 sendDelayMs 期间。不更新
+   * punchState、不动 failCounts、不给 analyzer 记分。
    */
   recordPunchResult(reporterMAC, peerMAC, result) {
     if (!reporterMAC || !peerMAC || !result) return;
@@ -168,7 +170,27 @@ export class NatHoleCoordinator {
     const state = typeof result.state === "number" ? result.state : 0;
     if (state === 0) return;
 
-    // 终态报告到达，清 in-flight
+    // === InProgress：刷新 in-flight，提前返回 ===
+    //
+    // 客户端在 executeNatHole 开头就上报 state=1。这比首个探测包早
+    // sendDelayMs（最长 10s）。服务端的 in-flight 窗口默认也是 10s，
+    // 不刷新的话会在客户端开始打洞前就误判为"没有回应"并重新派发。
+    //
+    // 无条件删除 in-flight 也不行——下一个 coordinate() 会立即重新
+    // 派发，回到"同一策略重复派发"的老问题。正确做法是刷新时间戳。
+    if (state === 1) {
+      const flight = this.inFlight.get(key);
+      if (flight) {
+        flight.at = Date.now();
+        console.log(
+          `[NAT] ${key} InProgress：刷新 in-flight 窗口 ` +
+          `(rung ${flight.rung})`
+        );
+      }
+      return;
+    }
+
+    // === 终态报告（2 或 3）：清 in-flight，进入状态机 ===
     this.inFlight.delete(key);
 
     const behaviorIndex =
@@ -214,7 +236,7 @@ export class NatHoleCoordinator {
   }
 
   /**
-   * ★ P0-9：返回一个绝对时间戳，表示下一个需要被唤醒的时刻。
+   * 返回一个绝对时间戳，表示下一个需要被唤醒的时刻。
    * 涵盖 staggered 错峰窗口、退避窗口、in-flight 超时。
    */
   nextWakeDeadline() {
@@ -267,7 +289,7 @@ export class NatHoleCoordinator {
 
         const key = pairKeyFor(aKey, bKey);
 
-        // === ★ P0-4：已成功，检查是否应该退役 ===
+        // === 已成功：检查是否应该退役 ===
         const prevPunch = this.punchState.get(key);
         if (prevPunch && (prevPunch.aState === 3 || prevPunch.bState === 3)) {
           if (shouldRetireSuccess(prevPunch, a, b, now)) {
@@ -312,11 +334,11 @@ export class NatHoleCoordinator {
         const behavior =
           ladder[Math.min(rung, ladder.length - 1)] || ladder[0];
 
-        // === ★ P0-1：签名包含梯级 ===
+        // === 签名包含梯级 ===
         const signature = `${senderKey}->${receiverKey}@${rung}`;
         const candidate = { rung, signature };
 
-        // === ★ P0-2：in-flight 和解 ===
+        // === in-flight 和解 ===
         const flightEntry = this.inFlight.get(key);
         if (
           flightEntry &&
