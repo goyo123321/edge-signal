@@ -193,6 +193,68 @@ async function generateCloudflareTURN(
   return servers;
 }
 
+// ============ ★ 新增：只暴露 TURN 服务器 URL（剥离凭证）============
+
+/**
+ * 返回部署级 TURN 配置的脱敏视图。
+ *
+ * - 自定义 TURN：从 TURN_SERVERS 解析出每个服务器的 URL，去掉 user:pass
+ * - Cloudflare TURN：凭证是每次动态生成的，无法静态暴露，只报 source
+ *
+ * 这个端点给面板显示用，不返回任何密码/token，所以放在 /api/public/ 下
+ * 无鉴权即可。
+ */
+function publicTURNInfo(env: Env): {
+  enabled: boolean;
+  source: "cloudflare" | "custom" | "none";
+  servers: Array<{ url: string }>;
+  priority: Array<"cloudflare" | "custom">;
+} {
+  // 优先级：Cloudflare TURN > 自定义 TURN，和 /api/turn-credentials 一致
+  if (hasCloudflareTURN(env)) {
+    const priority: Array<"cloudflare" | "custom"> = ["cloudflare"];
+    if (hasCustomTURN(env)) priority.push("custom");
+
+    const servers: Array<{ url: string }> = [];
+    if (hasCustomTURN(env)) {
+      const serversStr = env.TURN_SERVERS || "";
+      for (const raw of serversStr.split(",")) {
+        const parsed = parseTURNUrl(raw, "", "");
+        if (parsed) servers.push({ url: parsed.url });
+      }
+    }
+
+    return {
+      enabled: true,
+      source: "cloudflare",
+      servers,        // 自定义 TURN 作为 fallback，一并列出
+      priority,
+    };
+  }
+
+  if (hasCustomTURN(env)) {
+    const serversStr = env.TURN_SERVERS || "";
+    const servers: Array<{ url: string }> = [];
+    for (const raw of serversStr.split(",")) {
+      const parsed = parseTURNUrl(raw, "", "");
+      if (parsed) servers.push({ url: parsed.url });
+    }
+    return {
+      enabled: true,
+      source: "custom",
+      servers,
+      priority: ["custom"],
+    };
+  }
+
+  return {
+    enabled: false,
+    source: "none",
+    servers: [],
+    priority: [],
+  };
+}
+
 // ============ 主入口 ============
 
 export default {
@@ -254,6 +316,12 @@ export default {
     }
 
     // ========== 公开 API ==========
+
+    // ★ 新增：TURN 配置脱敏视图（面板显示用）
+    if (pathname === "/api/public/turn-config") {
+      return jsonResp(publicTURNInfo(env));
+    }
+
     if (pathname === "/api/public/rooms") {
       const reg = env.REGISTRY.get(env.REGISTRY.idFromName("global"));
       return reg.fetch(new Request("http://internal/rooms"));
