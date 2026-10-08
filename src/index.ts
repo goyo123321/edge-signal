@@ -1,8 +1,6 @@
 export { Room } from "./room";
 export { Registry } from "./registry";
 
-import { handleOutboundStream } from "./outbound-stream";
-
 export interface Env {
   ROOM: DurableObjectNamespace;
   REGISTRY: DurableObjectNamespace;
@@ -420,25 +418,6 @@ export default {
       }
 
       return new Response("Not found", { status: 404 });
-    }
-
-    // ========== ★ Workers 出口代理（必须在 /ws/ 之前）==========
-    // 只接受 /ws/out/stream/，其他 /ws/out/* 一律 404
-    // 防止客户端拼错 URL（如 /ws/out/ws/default-room）被当成房间名
-    if (pathname.startsWith("/ws/out/")) {
-      if (pathname !== "/ws/out/stream/") {
-        return new Response("Not found", { status: 404 });
-      }
-
-      if (env.CONNECT_TOKEN && env.CONNECT_TOKEN.trim() !== "") {
-        const provided = url.searchParams.get("token") || "";
-        if (!safeEqual(provided, env.CONNECT_TOKEN)) {
-          return new Response("Invalid token", { status: 403 });
-        }
-      }
-
-      // @ts-ignore - request.fetcher 由 Workers 注入
-      return handleOutboundStream(request, (request as any).fetcher);
     }
 
     // ========== WebSocket 信令 ==========
