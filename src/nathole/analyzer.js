@@ -19,12 +19,32 @@ class ScoreTable {
     this.scores.set(i, next);
     return next;
   }
+
+  /**
+   * 最高分优先，平局按梯级偏好排序。
+   *
+   * 平局策略是关键。未尝试过的梯级都是 0 分，纯粹的"最高分"会让
+   * pair 从 rung 0 一路爬到 9——rungs 4/5（no-TTL，长路径唯一能用的）
+   * 永远赢不了平局，永远到不了。
+   *
+   * 偏好顺序：
+   *   3 — rung 0：最便宜，对短路径最正确，保持现状不变
+   *   2 — rungs 4/5：no-TTL，长路径唯一能用的
+   *   1 — 其余 TTL 梯级：只在短路径上有用
+   *
+   * 这个偏好只重排未尝试过的梯级。已失败的梯级分数低于 0，无论
+   * rank 都不会被选中。
+   */
   recommend() {
+    const rank = (i) => (i === 0 ? 3 : i === 4 || i === 5 ? 2 : 1);
     let best = 0;
     let bestScore = -Infinity;
+    let bestRank = -Infinity;
     for (const [i, s] of this.scores) {
-      if (s > bestScore) {
+      const r = rank(i);
+      if (s > bestScore || (s === bestScore && r > bestRank)) {
         bestScore = s;
+        bestRank = r;
         best = i;
       }
     }
@@ -52,8 +72,17 @@ export class NatHoleAnalyzer {
     return this._rec(key).table.recommend();
   }
 
+  /**
+   * 记录一次结果。
+   *
+   * 惩罚从 -1 改为 -2，与成功 +2 对称。原因：-1 会让一个曾经成功的
+   * 梯级掉回 neutral 需要 6 次失败。结合指数退避，实际上 rung 0 会
+   * 被反复选中——每次都恰好比未尝试的梯级高一点分。
+   * -2 让惩罚对称，一个 rung 掉出 neutral 只需要 3 次失败，在退避的
+   * 早期、便宜的几步之内就能完成。
+   */
   report(key, index, succeeded) {
-    return this._rec(key).table.add(index, succeeded ? 2 : -1);
+    return this._rec(key).table.add(index, succeeded ? 2 : -2);
   }
 
   forgetMAC(mac) {
