@@ -67,6 +67,31 @@ function isIPv6Sock(sock) {
   return colonCount > 1;
 }
 
+// ============ LAN 相关 ============
+
+// isSameSubnet24 判断两个 IPv4 是否在同一 /24 网段。
+function isSameSubnet24(ipA, ipB) {
+  if (!ipA || !ipB) return false;
+  const a = String(ipA).split(".");
+  const b = String(ipB).split(".");
+  if (a.length !== 4 || b.length !== 4) return false;
+  return a[0] === b[0] && a[1] === b[1] && a[2] === b[2];
+}
+
+// checkLanOverlap 两端 LAN IP 是否有任意一对同 /24 网段。
+// 返回命中的 pair { aIp, bIp } 或 null。
+function checkLanOverlap(a, b) {
+  const aLanIPs = Array.isArray(a.lanIps) ? a.lanIps : [];
+  const bLanIPs = Array.isArray(b.lanIps) ? b.lanIps : [];
+  if (aLanIPs.length === 0 || bLanIPs.length === 0) return null;
+  for (const aIp of aLanIPs) {
+    for (const bIp of bLanIPs) {
+      if (isSameSubnet24(aIp, bIp)) return { aIp, bIp };
+    }
+  }
+  return null;
+}
+
 function buildLanEndpoints(peer) {
   if (!peer || !Array.isArray(peer.lanIps) || peer.lanIps.length === 0) {
     return [];
@@ -77,6 +102,8 @@ function buildLanEndpoints(peer) {
     .filter((ip) => typeof ip === "string" && ip)
     .map((ip) => `${ip}:${port}`);
 }
+
+// ============ 其他辅助 ============
 
 function shouldRetireSuccess(prev, a, b, now) {
   if (!prev) return false;
@@ -314,8 +341,10 @@ export class NatHoleCoordinator {
 
         // 端口为 0 视为无效
         if (parsePort(a.pubSocket) <= 0 || parsePort(b.pubSocket) <= 0) {
-          console.log(`[NAT] ${key} 跳过：pubSocket 端口无效 ` +
-            `a=${a.pubSocket} b=${b.pubSocket}`);
+          console.log(
+            `[NAT] ${key} 跳过：pubSocket 端口无效 ` +
+            `a=${a.pubSocket} b=${b.pubSocket}`
+          );
           paired.add(aKey);
           paired.add(bKey);
           continue;
@@ -327,31 +356,48 @@ export class NatHoleCoordinator {
           continue;
         }
 
-        // ★ 同 STUN 出口 IP → 同 CGNAT，hairpin 必失败
+        // ★ 同 STUN 出口 IP 的处理：
+        //   - LAN 无交集 → hairpin 必失败，强制降级
+        //   - LAN 有交集 → 走 LAN 直连（正常下发指令）
         const aIP = extractIP(a.pubSocket);
         const bIP = extractIP(b.pubSocket);
-        if (aIP && bIP && aIP === bIP) {
-          console.log(`[NAT] ${key} 跳过：同 STUN 出口 IP (${aIP})，标记强制降级`);
-          // 用 failCounts 去重，只标记一次
-          const fc = this.failCounts.get(key) || 0;
-          if (fc === 0) {
-            this.failCounts.set(key, 1);
-            this.punchState.set(key, {
-              aState: 2, bState: 2,
-              aAttempts: 0, bAttempts: 0,
-              aP2PStatus: 0, bP2PStatus: 0,
-              behaviorIndex: null,
-              at: now,
-              everValidated: false,
-            });
-            if (!forceFallbacks.has(aKey)) forceFallbacks.set(aKey, new Set());
-            if (!forceFallbacks.has(bKey)) forceFallbacks.set(bKey, new Set());
-            forceFallbacks.get(aKey).add(bKey);
-            forceFallbacks.get(bKey).add(aKey);
+        const sameStunIP = aIP && bIP && aIP === bIP;
+
+        if (sameStunIP) {
+          const lanOverlap = checkLanOverlap(a, b);
+
+          if (!lanOverlap) {
+            // 同 STUN IP 且 LAN 无交集 → hairpin 必失败，强制降级
+            console.log(
+              `[NAT] ${key} 跳过：同 STUN 出口 IP (${aIP}) 且 LAN 无交集，标记强制降级`
+            );
+            const fc = this.failCounts.get(key) || 0;
+            if (fc === 0) {
+              this.failCounts.set(key, 1);
+              this.punchState.set(key, {
+                aState: 2, bState: 2,
+                aAttempts: 0, bAttempts: 0,
+                aP2PStatus: 0, bP2PStatus: 0,
+                behaviorIndex: null,
+                at: now,
+                everValidated: false,
+              });
+              if (!forceFallbacks.has(aKey)) forceFallbacks.set(aKey, new Set());
+              if (!forceFallbacks.has(bKey)) forceFallbacks.set(bKey, new Set());
+              forceFallbacks.get(aKey).add(bKey);
+              forceFallbacks.get(bKey).add(aKey);
+            }
+            paired.add(aKey);
+            paired.add(bKey);
+            continue;
           }
-          paired.add(aKey);
-          paired.add(bKey);
-          continue;
+
+          // ★ 同 STUN IP 但 LAN 同网段 → 走 LAN 直连
+          console.log(
+            `[NAT] ${key} 同 STUN IP (${aIP}) 但 LAN 同网段 ` +
+            `(${lanOverlap.aIp} ↔ ${lanOverlap.bIp})，走 LAN 直连`
+          );
+          // 不 continue，继续往下走正常指令生成流程
         }
 
         const portA = parsePort(a.pubSocket);
@@ -458,6 +504,7 @@ export class NatHoleCoordinator {
           receiverRangeTo = Math.min(65535, senderPort + diff + PORTS_RANGE_NUMBER);
         }
 
+        // ★ LAN endpoints：客户端会优先尝试
         const senderLanEndpoints = buildLanEndpoints(sender);
         const receiverLanEndpoints = buildLanEndpoints(receiver);
 
