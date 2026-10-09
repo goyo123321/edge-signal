@@ -50,6 +50,12 @@ function parsePort(sock) {
   return i < 0 ? 0 : parseInt(sock.slice(i + 1), 10) || 0;
 }
 
+function extractIP(sock) {
+  if (!sock) return "";
+  const i = sock.lastIndexOf(":");
+  return i < 0 ? "" : sock.slice(0, i);
+}
+
 function peerKey(p) {
   return p && p.mac;
 }
@@ -304,7 +310,7 @@ export class NatHoleCoordinator {
 
         if (!a.pubSocket || !b.pubSocket) continue;
 
-        // ★ 端口为 0 视为无效（防御性检查）
+        // ★ 端口为 0 视为无效
         if (parsePort(a.pubSocket) <= 0 || parsePort(b.pubSocket) <= 0) {
           console.log(`[NAT] ${key} 跳过：pubSocket 端口无效 ` +
             `a=${a.pubSocket} b=${b.pubSocket}`);
@@ -314,6 +320,16 @@ export class NatHoleCoordinator {
         }
 
         if (isIPv6Sock(a.pubSocket) || isIPv6Sock(b.pubSocket)) {
+          paired.add(aKey);
+          paired.add(bKey);
+          continue;
+        }
+
+        // ★ 同 STUN 出口 IP → 同 CGNAT，hairpin 必失败，直接跳过
+        const aIP = extractIP(a.pubSocket);
+        const bIP = extractIP(b.pubSocket);
+        if (aIP && bIP && aIP === bIP) {
+          console.log(`[NAT] ${key} 跳过：同 STUN 出口 IP (${aIP})，hairpin NAT 大概率失败`);
           paired.add(aKey);
           paired.add(bKey);
           continue;
