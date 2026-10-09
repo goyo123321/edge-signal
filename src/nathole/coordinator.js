@@ -264,8 +264,10 @@ export class NatHoleCoordinator {
 
   coordinate(community) {
     const instructions = new Map();
+    // ★ 强制降级列表：peerKey → Set<peerKey>
+    const forceFallbacks = new Map();
     const online = community.getOnlinePeers();
-    if (online.length < 2) return { instructions, wakeAt: null };
+    if (online.length < 2) return { instructions, forceFallbacks, wakeAt: null };
 
     const now = Date.now();
     const paired = new Set();
@@ -310,7 +312,7 @@ export class NatHoleCoordinator {
 
         if (!a.pubSocket || !b.pubSocket) continue;
 
-        // ★ 端口为 0 视为无效
+        // 端口为 0 视为无效
         if (parsePort(a.pubSocket) <= 0 || parsePort(b.pubSocket) <= 0) {
           console.log(`[NAT] ${key} 跳过：pubSocket 端口无效 ` +
             `a=${a.pubSocket} b=${b.pubSocket}`);
@@ -325,11 +327,28 @@ export class NatHoleCoordinator {
           continue;
         }
 
-        // ★ 同 STUN 出口 IP → 同 CGNAT，hairpin 必失败，直接跳过
+        // ★ 同 STUN 出口 IP → 同 CGNAT，hairpin 必失败
         const aIP = extractIP(a.pubSocket);
         const bIP = extractIP(b.pubSocket);
         if (aIP && bIP && aIP === bIP) {
-          console.log(`[NAT] ${key} 跳过：同 STUN 出口 IP (${aIP})，hairpin NAT 大概率失败`);
+          console.log(`[NAT] ${key} 跳过：同 STUN 出口 IP (${aIP})，标记强制降级`);
+          // 用 failCounts 去重，只标记一次
+          const fc = this.failCounts.get(key) || 0;
+          if (fc === 0) {
+            this.failCounts.set(key, 1);
+            this.punchState.set(key, {
+              aState: 2, bState: 2,
+              aAttempts: 0, bAttempts: 0,
+              aP2PStatus: 0, bP2PStatus: 0,
+              behaviorIndex: null,
+              at: now,
+              everValidated: false,
+            });
+            if (!forceFallbacks.has(aKey)) forceFallbacks.set(aKey, new Set());
+            if (!forceFallbacks.has(bKey)) forceFallbacks.set(bKey, new Set());
+            forceFallbacks.get(aKey).add(bKey);
+            forceFallbacks.get(bKey).add(aKey);
+          }
           paired.add(aKey);
           paired.add(bKey);
           continue;
@@ -527,6 +546,6 @@ export class NatHoleCoordinator {
       }
     }
 
-    return { instructions, wakeAt: earliestWake };
+    return { instructions, forceFallbacks, wakeAt: earliestWake };
   }
 }
