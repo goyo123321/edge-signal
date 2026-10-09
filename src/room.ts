@@ -88,8 +88,7 @@ export class Room extends DurableObject {
     return parseInt(endpoint.slice(i + 1), 10) || 0;
   }
 
-  // ★ 严格用 STUN 上报的 UDP 出口。CGNAT 池化下 WS 出口和 UDP 出口不同，
-  //   不做 _publicIp fallback。
+  // 严格用 STUN 上报的 UDP 出口，不做 _publicIp fallback
   private peerPublicAddr(p: PeerRecord): { ip: string; port: number } {
     if (p.publicEndpoint) {
       const ip = this.extractIp(p.publicEndpoint);
@@ -285,7 +284,13 @@ export class Room extends DurableObject {
 
     const clientId = url.searchParams.get("cid") || crypto.randomUUID();
     this.community = url.pathname.split("/")[2] || "default";
-    const publicIp = request.headers.get("cf-connecting-ip") || request.headers.get("x-real-ip") || "";
+
+    // ★ 多读几个 header：自定义域 / Tunnel 转发时 cf-connecting-ip 可能缺失
+    const publicIp =
+      request.headers.get("cf-connecting-ip") ||
+      request.headers.get("x-real-ip") ||
+      request.headers.get("x-forwarded-for")?.split(",")[0].trim() ||
+      "";
 
     this.closeDuplicate(clientId);
 
@@ -350,9 +355,7 @@ export class Room extends DurableObject {
       },
     }));
 
-    // ★ 不在这里广播 joined。此时客户端 STUN 还没完成，
-    //   pubSocket 为空，广播会让对端拿到假 endpoint。
-    //   等客户端上报 p2p_metadata 后再无条件广播。
+    // ★ 不在这里广播 joined，等 p2p_metadata 上报后再广播
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -414,9 +417,7 @@ export class Room extends DurableObject {
             `multiExit=${peer.multiExit || false}`
           );
 
-          // ★ 无条件广播 joined，即使 publicEndpoint 为空。
-          //   对端会拿到 publicPort=0，不创建 UDPAddr，
-          //   协调器自动跳过这个 pair，走 TURN/WS 兜底。
+          // ★ 无条件广播 joined
           this.broadcast(from, {
             type: "joined", from,
             payload: {
