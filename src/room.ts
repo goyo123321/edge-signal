@@ -29,10 +29,8 @@ interface PeerRecord {
   relayPacketsIn: number;
   relayPacketsOut: number;
   _publicIp?: string;
-  // ★ LAN 直连：本机所有局域网 IPv4 + 本地 UDP 端口
   lanIps?: string[];
   lanPort?: number;
-  // ★ WS/STUN 出口不一致（CGNAT 池化）
   multiExit?: boolean;
 }
 
@@ -90,6 +88,8 @@ export class Room extends DurableObject {
     return parseInt(endpoint.slice(i + 1), 10) || 0;
   }
 
+  // ★ 严格用 STUN 上报的 UDP 出口。CGNAT 池化下 WS 出口和 UDP 出口不同，
+  //   不做 _publicIp fallback。
   private peerPublicAddr(p: PeerRecord): { ip: string; port: number } {
     if (p.publicEndpoint) {
       const ip = this.extractIp(p.publicEndpoint);
@@ -101,7 +101,7 @@ export class Room extends DurableObject {
       const port = this.extractPort(p.p2pEndpoint);
       if (ip && port > 0) return { ip, port };
     }
-    return { ip: p._publicIp || "", port: 0 };
+    return { ip: "", port: 0 };
   }
 
   private async ensureLoaded(): Promise<void> {
@@ -148,7 +148,6 @@ export class Room extends DurableObject {
             relayPacketsIn: p.relayPacketsIn || 0,
             relayPacketsOut: p.relayPacketsOut || 0,
             _publicIp: p._publicIp || "",
-            // ★ LAN
             lanIps: Array.isArray(p.lanIps) ? p.lanIps : [],
             lanPort: p.lanPort || 0,
             multiExit: !!p.multiExit,
@@ -187,7 +186,6 @@ export class Room extends DurableObject {
           turnRelayAddr: p.turnRelayAddr, relayBytesIn: p.relayBytesIn,
           relayBytesOut: p.relayBytesOut, relayPacketsIn: p.relayPacketsIn,
           relayPacketsOut: p.relayPacketsOut, _publicIp: p._publicIp,
-          // ★ LAN
           lanIps: p.lanIps, lanPort: p.lanPort, multiExit: p.multiExit,
         };
       }
@@ -309,7 +307,6 @@ export class Room extends DurableObject {
           publicPort: addr.port,
           natType: p.natType || "unknown",
           turnRelayAddr: p.turnRelayAddr || "",
-          // 不再下发 lanIps —— 打洞指令里会带 targetLanEndpoints
         };
       });
 
@@ -353,18 +350,9 @@ export class Room extends DurableObject {
       },
     }));
 
-    const peerAddr = this.peerPublicAddr(peer);
-    this.broadcast(clientId, {
-      type: "joined", from: clientId,
-      payload: {
-        id: clientId,
-        virtualIp: peer.virtualIp,
-        publicIp: peerAddr.ip,
-        publicPort: peerAddr.port,
-        natType: peer.natType || "unknown",
-        turnRelayAddr: peer.turnRelayAddr || "",
-      },
-    });
+    // ★ 不在这里广播 joined。此时客户端 STUN 还没完成，
+    //   pubSocket 为空，广播会让对端拿到假 endpoint。
+    //   等客户端上报 p2p_metadata 后再无条件广播。
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -401,6 +389,7 @@ export class Room extends DurableObject {
           peer.behavior = p.behavior || peer.behavior;
           peer.assistedSockets = Array.isArray(p.assistedSockets) ? p.assistedSockets : [];
           if (typeof p.p2pEndpoint === "string" && p.p2pEndpoint) peer.p2pEndpoint = p.p2pEndpoint;
+
           const publicEndpoint = typeof p.publicEndpoint === "string" ? p.publicEndpoint : "";
           if (publicEndpoint && publicEndpoint !== "") {
             peer.publicEndpoint = publicEndpoint;
@@ -408,12 +397,11 @@ export class Room extends DurableObject {
           } else {
             if (!peer.publicEndpoint) peer.pubSocket = "";
           }
-          // ★ LAN 字段
+
           if (Array.isArray(p.lanIps)) {
             peer.lanIps = p.lanIps.filter((s: any) => typeof s === "string" && s);
           }
           if (typeof p.udpPort === "number" && p.udpPort > 0) peer.lanPort = p.udpPort;
-          // ★ CGNAT 池化标记
           if (typeof p.multiExit === "boolean") peer.multiExit = p.multiExit;
 
           this.saveStateThrottled();
@@ -421,22 +409,25 @@ export class Room extends DurableObject {
           const addr = this.peerPublicAddr(peer);
           console.log(
             `[Room] p2p_metadata from ${from}: natType=${peer.natType} ` +
-            `pub=${addr.ip}:${addr.port} lanIps=${JSON.stringify(peer.lanIps || [])} ` +
-            `lanPort=${peer.lanPort || 0} multiExit=${peer.multiExit || false}`
+            `pub=${addr.ip}:${addr.port} (pubSocket=${peer.pubSocket || "<empty>"}) ` +
+            `lanIps=${JSON.stringify(peer.lanIps || [])} lanPort=${peer.lanPort || 0} ` +
+            `multiExit=${peer.multiExit || false}`
           );
-          if (addr.ip && addr.port > 0) {
-            this.broadcast(from, {
-              type: "joined", from,
-              payload: {
-                id: from,
-                virtualIp: peer.virtualIp,
-                publicIp: addr.ip,
-                publicPort: addr.port,
-                natType: peer.natType || "unknown",
-                turnRelayAddr: peer.turnRelayAddr || "",
-              },
-            });
-          }
+
+          // ★ 无条件广播 joined，即使 publicEndpoint 为空。
+          //   对端会拿到 publicPort=0，不创建 UDPAddr，
+          //   协调器自动跳过这个 pair，走 TURN/WS 兜底。
+          this.broadcast(from, {
+            type: "joined", from,
+            payload: {
+              id: from,
+              virtualIp: peer.virtualIp,
+              publicIp: addr.ip,
+              publicPort: addr.port,
+              natType: peer.natType || "unknown",
+              turnRelayAddr: peer.turnRelayAddr || "",
+            },
+          });
         }
         await this.runCoordination();
         await this.setupSaveAlarm();
