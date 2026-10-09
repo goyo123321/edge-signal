@@ -61,10 +61,6 @@ function isIPv6Sock(sock) {
   return colonCount > 1;
 }
 
-/**
- * ★ 把一个 peer 的 LAN IP 列表拼成 endpoint 字符串列表。
- * 例: lanIps=["192.168.10.2"], lanPort=49918 → ["192.168.10.2:49918"]
- */
 function buildLanEndpoints(peer) {
   if (!peer || !Array.isArray(peer.lanIps) || peer.lanIps.length === 0) {
     return [];
@@ -212,8 +208,6 @@ export class NatHoleCoordinator {
             `(self=${selfP2PStatus} other=${otherP2PStatus})，后续不再重复校验`
           );
         }
-      } else {
-        console.log(`[NAT] ${key} 再次成功（已通过首次校验），跳过交叉校验`);
       }
     }
 
@@ -309,6 +303,15 @@ export class NatHoleCoordinator {
         }
 
         if (!a.pubSocket || !b.pubSocket) continue;
+
+        // ★ 端口为 0 视为无效（防御性检查）
+        if (parsePort(a.pubSocket) <= 0 || parsePort(b.pubSocket) <= 0) {
+          console.log(`[NAT] ${key} 跳过：pubSocket 端口无效 ` +
+            `a=${a.pubSocket} b=${b.pubSocket}`);
+          paired.add(aKey);
+          paired.add(bKey);
+          continue;
+        }
 
         if (isIPv6Sock(a.pubSocket) || isIPv6Sock(b.pubSocket)) {
           paired.add(aKey);
@@ -420,7 +423,6 @@ export class NatHoleCoordinator {
           receiverRangeTo = Math.min(65535, senderPort + diff + PORTS_RANGE_NUMBER);
         }
 
-        // ★ 预拼 LAN endpoints
         const senderLanEndpoints = buildLanEndpoints(sender);
         const receiverLanEndpoints = buildLanEndpoints(receiver);
 
@@ -452,7 +454,6 @@ export class NatHoleCoordinator {
           targetVirtualIp: receiver.virtualIp,
           targetPubSocket: receiver.pubSocket || "",
           targetAssistedEndpoints: receiver.assistedSockets || [],
-          // ★ 发送方发给接收方的 LAN 候选
           targetLanEndpoints: receiverLanEndpoints,
           ...shared,
         };
@@ -467,7 +468,6 @@ export class NatHoleCoordinator {
           targetVirtualIp: sender.virtualIp,
           targetPubSocket: sender.pubSocket || "",
           targetAssistedEndpoints: sender.assistedSockets || [],
-          // ★ 接收方发给发送方的 LAN 候选
           targetLanEndpoints: senderLanEndpoints,
           ...shared,
         };
@@ -500,7 +500,6 @@ export class NatHoleCoordinator {
         paired.add(receiverKey);
         noteWake(now + backoffMs);
 
-        // 日志：包含 LAN 候选数
         if (senderLanEndpoints.length > 0 || receiverLanEndpoints.length > 0) {
           console.log(
             `[NAT] ${key} 生成指令 (rung ${rung}), ` +
