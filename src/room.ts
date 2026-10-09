@@ -29,8 +29,10 @@ interface PeerRecord {
   relayPacketsIn: number;
   relayPacketsOut: number;
   _publicIp?: string;
+  // ★ LAN 直连：本机所有局域网 IPv4 + 本地 UDP 端口
   lanIps?: string[];
   lanPort?: number;
+  // ★ WS/STUN 出口不一致（CGNAT 池化）
   multiExit?: boolean;
 }
 
@@ -146,6 +148,7 @@ export class Room extends DurableObject {
             relayPacketsIn: p.relayPacketsIn || 0,
             relayPacketsOut: p.relayPacketsOut || 0,
             _publicIp: p._publicIp || "",
+            // ★ LAN
             lanIps: Array.isArray(p.lanIps) ? p.lanIps : [],
             lanPort: p.lanPort || 0,
             multiExit: !!p.multiExit,
@@ -184,6 +187,7 @@ export class Room extends DurableObject {
           turnRelayAddr: p.turnRelayAddr, relayBytesIn: p.relayBytesIn,
           relayBytesOut: p.relayBytesOut, relayPacketsIn: p.relayPacketsIn,
           relayPacketsOut: p.relayPacketsOut, _publicIp: p._publicIp,
+          // ★ LAN
           lanIps: p.lanIps, lanPort: p.lanPort, multiExit: p.multiExit,
         };
       }
@@ -305,8 +309,7 @@ export class Room extends DurableObject {
           publicPort: addr.port,
           natType: p.natType || "unknown",
           turnRelayAddr: p.turnRelayAddr || "",
-          lanIps: p.lanIps || [],
-          lanPort: p.lanPort || 0,
+          // 不再下发 lanIps —— 打洞指令里会带 targetLanEndpoints
         };
       });
 
@@ -360,8 +363,6 @@ export class Room extends DurableObject {
         publicPort: peerAddr.port,
         natType: peer.natType || "unknown",
         turnRelayAddr: peer.turnRelayAddr || "",
-        lanIps: peer.lanIps || [],
-        lanPort: peer.lanPort || 0,
       },
     });
 
@@ -407,16 +408,22 @@ export class Room extends DurableObject {
           } else {
             if (!peer.publicEndpoint) peer.pubSocket = "";
           }
-          // ★ LAN 直连字段
+          // ★ LAN 字段
           if (Array.isArray(p.lanIps)) {
-            peer.lanIps = p.lanIps.filter((x: any) => typeof x === "string" && x);
+            peer.lanIps = p.lanIps.filter((s: any) => typeof s === "string" && s);
           }
           if (typeof p.udpPort === "number" && p.udpPort > 0) peer.lanPort = p.udpPort;
+          // ★ CGNAT 池化标记
           if (typeof p.multiExit === "boolean") peer.multiExit = p.multiExit;
+
           this.saveStateThrottled();
 
           const addr = this.peerPublicAddr(peer);
-          console.log(`[Room] p2p_metadata from ${from}: natType=${peer.natType} pub=${addr.ip}:${addr.port} lanIps=${JSON.stringify(peer.lanIps || [])} multiExit=${peer.multiExit}`);
+          console.log(
+            `[Room] p2p_metadata from ${from}: natType=${peer.natType} ` +
+            `pub=${addr.ip}:${addr.port} lanIps=${JSON.stringify(peer.lanIps || [])} ` +
+            `lanPort=${peer.lanPort || 0} multiExit=${peer.multiExit || false}`
+          );
           if (addr.ip && addr.port > 0) {
             this.broadcast(from, {
               type: "joined", from,
@@ -427,8 +434,6 @@ export class Room extends DurableObject {
                 publicPort: addr.port,
                 natType: peer.natType || "unknown",
                 turnRelayAddr: peer.turnRelayAddr || "",
-                lanIps: peer.lanIps || [],
-                lanPort: peer.lanPort || 0,
               },
             });
           }
