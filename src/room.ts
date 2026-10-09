@@ -285,7 +285,6 @@ export class Room extends DurableObject {
     const clientId = url.searchParams.get("cid") || crypto.randomUUID();
     this.community = url.pathname.split("/")[2] || "default";
 
-    // ★ 多读几个 header：自定义域 / Tunnel 转发时 cf-connecting-ip 可能缺失
     const publicIp =
       request.headers.get("cf-connecting-ip") ||
       request.headers.get("x-real-ip") ||
@@ -355,8 +354,6 @@ export class Room extends DurableObject {
       },
     }));
 
-    // ★ 不在这里广播 joined，等 p2p_metadata 上报后再广播
-
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -417,7 +414,6 @@ export class Room extends DurableObject {
             `multiExit=${peer.multiExit || false}`
           );
 
-          // ★ 无条件广播 joined
           this.broadcast(from, {
             type: "joined", from,
             payload: {
@@ -539,7 +535,26 @@ export class Room extends DurableObject {
     if (onlinePeers.length < 2) return;
 
     const community = { getOnlinePeers: () => onlinePeers };
-    const { instructions } = this.coordinator.coordinate(community);
+    const { instructions, forceFallbacks } = this.coordinator.coordinate(community);
+
+    // ★ 下发 force_fallback（同 CGNAT IP 场景）
+    if (forceFallbacks && forceFallbacks.size > 0) {
+      for (const [mac, peers] of forceFallbacks) {
+        const targetWs = this.sessions.get(mac);
+        if (!targetWs) continue;
+        const peerList = Array.from(peers);
+        try {
+          targetWs.send(JSON.stringify({
+            type: "force_fallback",
+            from: "server",
+            payload: { peers: peerList, reason: "same-cgnat-ip" },
+          }));
+          console.log(`[Room] → ${mac} 下发 force_fallback (${peerList.length} peers)`);
+        } catch (e) {
+          console.error(`[Room] force_fallback 发送失败:`, e);
+        }
+      }
+    }
 
     if (instructions.size === 0) return;
     for (const [mac, instr] of instructions) {
