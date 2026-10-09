@@ -16,6 +16,9 @@ const FAIL_BACKOFF_CAP_MS = 60000;
 const INFLIGHT_TIMEOUT_MS = 10000;
 const SUCCESS_GRACE_MS = 30000;
 
+// ★ 跨 ISP 判定阈值
+const CROSS_ISP_PORT_GAP_THRESHOLD = 1000;
+
 const CONN_P2P = "p2p";
 const P2P_FULLDUPLEX = 3;
 
@@ -317,6 +320,47 @@ export class NatHoleCoordinator {
 
         const key = pairKeyFor(aKey, bKey);
 
+        // ============ ★ 跨 ISP 检测 ============
+        // 两端 pubSocket 公网 IP 不同，且都不是私网，且端口差 > 1000 ——
+        // 这种场景打洞几乎不可能成功（CGNAT 映射已经完全漂移/不同运营商出口），
+        // 直接下发 force_fallback，避免客户端白跑几十秒打洞。
+        const aPubIP = extractIP(a.pubSocket);
+        const bPubIP = extractIP(b.pubSocket);
+        const aPort = parsePort(a.pubSocket);
+        const bPort = parsePort(b.pubSocket);
+        const portGap = Math.abs(aPort - bPort);
+
+        const isDifferentPublicIP = aPubIP && bPubIP && aPubIP !== bPubIP;
+        const isCrossISP = isDifferentPublicIP &&
+          portGap > CROSS_ISP_PORT_GAP_THRESHOLD;
+
+        if (isCrossISP) {
+          const fc = this.failCounts.get(key) || 0;
+          if (fc < 1) {
+            console.log(
+              `[NAT] ${key} 跨 ISP (${aPubIP}:${aPort} ↔ ${bPubIP}:${bPort}, ` +
+              `gap=${portGap})，直接降级到中继`
+            );
+            this.failCounts.set(key, 1);
+            this.punchState.set(key, {
+              aState: 2, bState: 2,
+              aAttempts: 0, bAttempts: 0,
+              aP2PStatus: 0, bP2PStatus: 0,
+              behaviorIndex: null,
+              at: now,
+              everValidated: false,
+            });
+            if (!forceFallbacks.has(aKey)) forceFallbacks.set(aKey, new Set());
+            if (!forceFallbacks.has(bKey)) forceFallbacks.set(bKey, new Set());
+            forceFallbacks.get(aKey).add(bKey);
+            forceFallbacks.get(bKey).add(aKey);
+          }
+          paired.add(aKey);
+          paired.add(bKey);
+          continue;
+        }
+
+        // ============ 已有 P2P 成功记录 ============
         const prevPunch = this.punchState.get(key);
         if (prevPunch && (prevPunch.aState === 3 || prevPunch.bState === 3)) {
           if (shouldRetireSuccess(prevPunch, a, b, now)) {
@@ -353,13 +397,8 @@ export class NatHoleCoordinator {
           continue;
         }
 
-        // ★ 同 STUN 出口 IP 处理：
-        //   - LAN 同网段 → 走 LAN 直连
-        //   - 首次遇到（fc=0）→ 允许一次 hairpin 尝试
-        //   - 已失败过（fc>0）→ 强制降级
-        const aIP = extractIP(a.pubSocket);
-        const bIP = extractIP(b.pubSocket);
-        const sameStunIP = aIP && bIP && aIP === bIP;
+        // ============ 同 STUN 出口 IP 处理 ============
+        const sameStunIP = aPubIP && bPubIP && aPubIP === bPubIP;
 
         if (sameStunIP) {
           const lanOverlap = checkLanOverlap(a, b);
@@ -367,17 +406,17 @@ export class NatHoleCoordinator {
 
           if (lanOverlap) {
             console.log(
-              `[NAT] ${key} 同 STUN IP (${aIP}) 但 LAN 同网段 ` +
+              `[NAT] ${key} 同 STUN IP (${aPubIP}) 但 LAN 同网段 ` +
               `(${lanOverlap.aIp} ↔ ${lanOverlap.bIp})，走 LAN 直连`
             );
           } else if (fc === 0) {
             console.log(
-              `[NAT] ${key} 同 STUN IP (${aIP})，允许一次 hairpin 尝试 ` +
+              `[NAT] ${key} 同 STUN IP (${aPubIP})，允许一次 hairpin 尝试 ` +
               `（部分 CGNAT 支持 hairpin，成功则走 P2P）`
             );
           } else {
             console.log(
-              `[NAT] ${key} 跳过：同 STUN IP (${aIP}) 已尝试失败，标记强制降级`
+              `[NAT] ${key} 跳过：同 STUN IP (${aPubIP}) 已尝试失败，标记强制降级`
             );
             this.failCounts.set(key, fc + 1);
             this.punchState.set(key, {
@@ -398,10 +437,8 @@ export class NatHoleCoordinator {
           }
         }
 
-        const portA = parsePort(a.pubSocket);
-        const portB = parsePort(b.pubSocket);
-        const sender = portA <= portB ? a : b;
-        const receiver = portA <= portB ? b : a;
+        const sender = aPort <= bPort ? a : b;
+        const receiver = aPort <= bPort ? b : a;
         const senderKey = peerKey(sender);
         const receiverKey = peerKey(receiver);
         const senderFeature = classifyNat(sender);
@@ -490,20 +527,13 @@ export class NatHoleCoordinator {
         const senderPort = parsePort(sender.pubSocket);
         const receiverPort = parsePort(receiver.pubSocket);
 
-        // NAT 行为差异（来自客户端上报的 portsDifference 之差）
         const natDiff = Math.abs(
           senderFeature.portsDifference - receiverFeature.portsDifference
         );
+        const senderReceiverGap = Math.abs(senderPort - receiverPort);
 
-        // ★ 两端 pubSocket 的实际端口差
-        //   HardNAT 下 pubSocket 是"发到 STUN 时"的端口，但两端 STUN 时刻不同，
-        //   CGNAT 中间可能为其他连接分配了几十个端口，导致真实出口端口差距很大。
-        //   扫描范围必须至少覆盖这个差距，否则永远命中不了对方。
-        const portGap = Math.abs(senderPort - receiverPort);
-
-        // ★ 有效范围 = max(natDiff, portGap) + 缓冲，上限 30
-        let halfWidth = Math.max(natDiff, portGap) + PORTS_RANGE_NARROW;
-        if (halfWidth > 30) halfWidth = 30;
+        let halfWidth = Math.max(natDiff, senderReceiverGap) + PORTS_RANGE_NARROW;
+        if (halfWidth > 100) halfWidth = 100;
 
         let senderRangeFrom = 0, senderRangeTo = 0;
         let receiverRangeFrom = 0, receiverRangeTo = 0;
@@ -531,7 +561,7 @@ export class NatHoleCoordinator {
           receiverPubSocket: receiver.pubSocket || "",
           receiverNatType: receiverFeature.natType,
           receiverAssistedEndpoints: receiver.assistedSockets || [],
-          portsDifference: Math.max(natDiff, portGap),
+          portsDifference: Math.max(natDiff, senderReceiverGap),
           regularPortsChange: !!senderFeature.regularPortsChange,
         };
 
