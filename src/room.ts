@@ -29,6 +29,9 @@ interface PeerRecord {
   relayPacketsIn: number;
   relayPacketsOut: number;
   _publicIp?: string;
+  lanIps?: string[];
+  lanPort?: number;
+  multiExit?: boolean;
 }
 
 const STAGGER_FALLBACK_SAVE_MS = 300 * 1000;
@@ -143,6 +146,9 @@ export class Room extends DurableObject {
             relayPacketsIn: p.relayPacketsIn || 0,
             relayPacketsOut: p.relayPacketsOut || 0,
             _publicIp: p._publicIp || "",
+            lanIps: Array.isArray(p.lanIps) ? p.lanIps : [],
+            lanPort: p.lanPort || 0,
+            multiExit: !!p.multiExit,
           });
 
           if (p.virtualIp && p.online) {
@@ -178,6 +184,7 @@ export class Room extends DurableObject {
           turnRelayAddr: p.turnRelayAddr, relayBytesIn: p.relayBytesIn,
           relayBytesOut: p.relayBytesOut, relayPacketsIn: p.relayPacketsIn,
           relayPacketsOut: p.relayPacketsOut, _publicIp: p._publicIp,
+          lanIps: p.lanIps, lanPort: p.lanPort, multiExit: p.multiExit,
         };
       }
       await this.ctx.storage.put(PEERS_STORAGE_KEY, peersData);
@@ -298,7 +305,8 @@ export class Room extends DurableObject {
           publicPort: addr.port,
           natType: p.natType || "unknown",
           turnRelayAddr: p.turnRelayAddr || "",
-          assistedSockets: Array.isArray(p.assistedSockets) ? p.assistedSockets : [],
+          lanIps: p.lanIps || [],
+          lanPort: p.lanPort || 0,
         };
       });
 
@@ -321,6 +329,7 @@ export class Room extends DurableObject {
         behavior: "BehaviorPortChanged", assistedSockets: [], observedRaddr: "",
         turnRelayAddr: "", relayBytesIn: 0, relayBytesOut: 0, relayPacketsIn: 0, relayPacketsOut: 0,
         _publicIp: publicIp,
+        lanIps: [], lanPort: 0, multiExit: false,
       };
       this.peers.set(clientId, peer);
     }
@@ -351,7 +360,8 @@ export class Room extends DurableObject {
         publicPort: peerAddr.port,
         natType: peer.natType || "unknown",
         turnRelayAddr: peer.turnRelayAddr || "",
-        assistedSockets: Array.isArray(peer.assistedSockets) ? peer.assistedSockets : [],
+        lanIps: peer.lanIps || [],
+        lanPort: peer.lanPort || 0,
       },
     });
 
@@ -397,10 +407,16 @@ export class Room extends DurableObject {
           } else {
             if (!peer.publicEndpoint) peer.pubSocket = "";
           }
+          // ★ LAN 直连字段
+          if (Array.isArray(p.lanIps)) {
+            peer.lanIps = p.lanIps.filter((x: any) => typeof x === "string" && x);
+          }
+          if (typeof p.udpPort === "number" && p.udpPort > 0) peer.lanPort = p.udpPort;
+          if (typeof p.multiExit === "boolean") peer.multiExit = p.multiExit;
           this.saveStateThrottled();
 
           const addr = this.peerPublicAddr(peer);
-          console.log(`[Room] p2p_metadata from ${from}: natType=${peer.natType} pub=${addr.ip}:${addr.port} assisted=${peer.assistedSockets.length}`);
+          console.log(`[Room] p2p_metadata from ${from}: natType=${peer.natType} pub=${addr.ip}:${addr.port} lanIps=${JSON.stringify(peer.lanIps || [])} multiExit=${peer.multiExit}`);
           if (addr.ip && addr.port > 0) {
             this.broadcast(from, {
               type: "joined", from,
@@ -411,7 +427,8 @@ export class Room extends DurableObject {
                 publicPort: addr.port,
                 natType: peer.natType || "unknown",
                 turnRelayAddr: peer.turnRelayAddr || "",
-                assistedSockets: Array.isArray(peer.assistedSockets) ? peer.assistedSockets : [],
+                lanIps: peer.lanIps || [],
+                lanPort: peer.lanPort || 0,
               },
             });
           }
@@ -589,7 +606,8 @@ export class Room extends DurableObject {
         publicIp: p._publicIp || "",
         pubSocket: p.pubSocket, p2pEndpoint: p.p2pEndpoint, publicEndpoint: p.publicEndpoint,
         turnRelayAddr: p.turnRelayAddr, natType: p.natType,
-        assistedSockets: Array.isArray(p.assistedSockets) ? p.assistedSockets : [],
+        lanIps: p.lanIps || [], lanPort: p.lanPort || 0,
+        multiExit: !!p.multiExit,
         online: p.online, connectedAt: p.connectedAt, lastSeen: p.lastSeen, disconnectedAt: p.disconnectedAt,
         onlineFor: now - p.connectedAt,
         offlineFor: p.online ? 0 : (p.disconnectedAt ? now - p.disconnectedAt : 0),
