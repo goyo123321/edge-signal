@@ -10,90 +10,13 @@ import { NatHoleAnalyzer, pairKeyFor } from "./analyzer.js";
 const PORTS_RANGE_NUMBER = 10;
 const PUNCH_STAGGER_MS_DEFAULT = 1000;
 const SENDER_DISPATCH_DELAY_MS_DEFAULT = 1000;
-
-// 退避上限 60s。300s 只让一个不可能成功的 pair 空转——每轮打洞都是
-// 相同地址、相同 NAT 映射，等更久不会提高成功率。
 const FAIL_BACKOFF_BASE_MS = 15000;
 const FAIL_BACKOFF_CAP_MS = 60000;
-
-// in-flight 窗口。覆盖"派发到收到终态报告"这段往返延迟。
 const INFLIGHT_TIMEOUT_MS = 10000;
-
-// 成功记录退役的宽限期。
 const SUCCESS_GRACE_MS = 30000;
 
 const CONN_P2P = "p2p";
 const P2P_FULLDUPLEX = 3;
-
-// ============================================================
-// ★ LAN 直连相关
-// ============================================================
-
-/**
- * 组装对端候选地址列表——把 lanIps 放最前面。
- *
- * 客户端打洞时按 TargetAssistedEndpoints 的顺序循环发包。
- * 同网段时 lanIps 里的地址最先命中，不同网段时忽略它们走后面的
- * assistedSockets / 公网地址。
- *
- * @param {object} peer PeerRecord
- * @returns {string[]} "ip:port" 列表
- */
-function buildAssistedList(peer) {
-  const list = [];
-  // 1. 对端的所有局域网 IP（最高优先——同网段时直接用）
-  if (Array.isArray(peer.lanIps)) {
-    const port = peer.lanPort || 0;
-    if (port > 0) {
-      for (const ip of peer.lanIps) {
-        const entry = `${ip}:${port}`;
-        if (ip && !list.includes(entry)) {
-          list.push(entry);
-        }
-      }
-    }
-  }
-  // 2. 对端上报的 assistedSockets（本机 LAN 地址，含多网卡）
-  if (Array.isArray(peer.assistedSockets)) {
-    for (const s of peer.assistedSockets) {
-      if (s && !list.includes(s)) list.push(s);
-    }
-  }
-  return list;
-}
-
-/**
- * 判断两个 peer 是否在同一局域网 /24 子网。
- *
- * 只比 IP 前三段——网关字段对判断无用。与客户端 edge.go 的
- * anySameSubnet() 逻辑一致，任何一对 IP 前缀相同即视为同网。
- */
-function isSameLan(a, b) {
-  if (!Array.isArray(a.lanIps) || !Array.isArray(b.lanIps)) return false;
-  for (const ipa of a.lanIps) {
-    const pa = parseIPv4(ipa);
-    if (!pa) continue;
-    for (const ipb of b.lanIps) {
-      const pb = parseIPv4(ipb);
-      if (!pb) continue;
-      if (pa[0] === pb[0] && pa[1] === pb[1] && pa[2] === pb[2]) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-function parseIPv4(s) {
-  const parts = String(s).split(".").map(Number);
-  if (parts.length !== 4) return null;
-  if (parts.some((p) => isNaN(p) || p < 0 || p > 255)) return null;
-  return parts;
-}
-
-// ============================================================
-// 基础工具
-// ============================================================
 
 function classifyNat(peer) {
   if (!peer || !peer.natType) {
@@ -139,11 +62,20 @@ function isIPv6Sock(sock) {
 }
 
 /**
- * 判断一个已记录的成功是否还能代表当前隧道。
- *
- * 双方当前都不在 P2P（客户端 connection_status 表里没有 "p2p"），
- * 且成功记录已存在超过 SUCCESS_GRACE_MS。
+ * ★ 把一个 peer 的 LAN IP 列表拼成 endpoint 字符串列表。
+ * 例: lanIps=["192.168.10.2"], lanPort=49918 → ["192.168.10.2:49918"]
  */
+function buildLanEndpoints(peer) {
+  if (!peer || !Array.isArray(peer.lanIps) || peer.lanIps.length === 0) {
+    return [];
+  }
+  const port = peer.lanPort || 0;
+  if (port <= 0) return [];
+  return peer.lanIps
+    .filter((ip) => typeof ip === "string" && ip)
+    .map((ip) => `${ip}:${port}`);
+}
+
 function shouldRetireSuccess(prev, a, b, now) {
   if (!prev) return false;
   if (prev.aState !== 3 && prev.bState !== 3) return false;
@@ -152,23 +84,17 @@ function shouldRetireSuccess(prev, a, b, now) {
   const keyOf = (p) => p.clientId || p.mac || "";
   const aConns = a.connections;
   const bConns = b.connections;
-  const aToB =
-    aConns && typeof aConns.get === "function" ? aConns.get(keyOf(b)) : undefined;
-  const bToA =
-    bConns && typeof bConns.get === "function" ? bConns.get(keyOf(a)) : undefined;
+  const aToB = aConns && typeof aConns.get === "function"
+    ? aConns.get(keyOf(b))
+    : undefined;
+  const bToA = bConns && typeof bConns.get === "function"
+    ? bConns.get(keyOf(a))
+    : undefined;
 
   return aToB !== CONN_P2P && bToA !== CONN_P2P;
 }
 
-/**
- * 判断一条已派发但未收到终态报告的指令是否仍在飞行中。
- */
-function shouldHoldForInFlight(
-  flight,
-  candidate,
-  now,
-  timeoutMs = INFLIGHT_TIMEOUT_MS
-) {
+function shouldHoldForInFlight(flight, candidate, now, timeoutMs = INFLIGHT_TIMEOUT_MS) {
   if (!flight) return { hold: false, reason: "nothing-in-flight" };
   if (flight.rung !== candidate.rung) {
     return { hold: false, reason: "rung-changed" };
@@ -186,10 +112,6 @@ function shouldHoldForInFlight(
     wakeAt: deadline,
   };
 }
-
-// ============================================================
-// NatHoleCoordinator
-// ============================================================
 
 export class NatHoleCoordinator {
   constructor(env = {}) {
@@ -215,37 +137,20 @@ export class NatHoleCoordinator {
     const needle = String(mac).toLowerCase();
     const touches = (key) =>
       key.split("|").some((m) => m.toLowerCase() === needle);
-    for (const k of [...this.backoff.keys()])
-      if (touches(k)) this.backoff.delete(k);
-    for (const k of [...this.punchState.keys()])
-      if (touches(k)) this.punchState.delete(k);
-    for (const k of [...this.failCounts.keys()])
-      if (touches(k)) this.failCounts.delete(k);
-    for (const k of [...this.lastDispatchedRung.keys()])
-      if (touches(k)) this.lastDispatchedRung.delete(k);
-    for (const k of [...this.inFlight.keys()])
-      if (touches(k)) this.inFlight.delete(k);
+    for (const k of [...this.backoff.keys()]) if (touches(k)) this.backoff.delete(k);
+    for (const k of [...this.punchState.keys()]) if (touches(k)) this.punchState.delete(k);
+    for (const k of [...this.failCounts.keys()]) if (touches(k)) this.failCounts.delete(k);
+    for (const k of [...this.lastDispatchedRung.keys()]) if (touches(k)) this.lastDispatchedRung.delete(k);
+    for (const k of [...this.inFlight.keys()]) if (touches(k)) this.inFlight.delete(k);
     this.analyzer.forgetMAC(mac);
   }
 
-  /**
-   * 记录一次打洞结果。
-   *
-   * 单侧 state===3 即视为 pair 已建立——客户端在 executeNatHole 里
-   * 只有在 hasRealTrafficFromAny() 确认收到对端"真实数据帧"后才上报 3。
-   * 要求双方都报 3 会让单向可达的 pair 卡死。
-   *
-   * InProgress（state===1）不走终态路径：客户端在收到指令后立即上报，
-   * 比首个探测包早 sendDelayMs（最长 10s）。这里只刷新 in-flight 的
-   * 时间戳，让窗口从此刻重新计时。
-   */
   recordPunchResult(reporterMAC, peerMAC, result, selfP2PStatus = 0) {
     if (!reporterMAC || !peerMAC || !result) return;
     const key = pairKeyFor(reporterMAC, peerMAC);
     let state = typeof result.state === "number" ? result.state : 0;
     if (state === 0) return;
 
-    // === InProgress：刷新 in-flight，提前返回 ===
     if (state === 1) {
       const flight = this.inFlight.get(key);
       if (flight) {
@@ -257,7 +162,6 @@ export class NatHoleCoordinator {
       return;
     }
 
-    // === 终态报告：清 in-flight ===
     this.inFlight.delete(key);
 
     let entry = this.punchState.get(key);
@@ -284,7 +188,6 @@ export class NatHoleCoordinator {
       entry.bP2PStatus = selfP2PStatus;
     }
 
-    // === 首次成功时的交叉校验 ===
     if (state === 3) {
       if (!entry.everValidated) {
         const otherP2PStatus = isA ? entry.bP2PStatus : entry.aP2PStatus;
@@ -310,9 +213,7 @@ export class NatHoleCoordinator {
           );
         }
       } else {
-        console.log(
-          `[NAT] ${key} 再次成功（已通过首次校验），跳过交叉校验`
-        );
+        console.log(`[NAT] ${key} 再次成功（已通过首次校验），跳过交叉校验`);
       }
     }
 
@@ -343,9 +244,6 @@ export class NatHoleCoordinator {
     }
   }
 
-  /**
-   * 返回一个绝对时间戳，表示下一个需要被唤醒的时刻。
-   */
   nextWakeDeadline() {
     let earliest = null;
     const now = Date.now();
@@ -364,9 +262,6 @@ export class NatHoleCoordinator {
     return earliest;
   }
 
-  /**
-   * 一次完整的决策遍历。返回 { instructions, wakeAt }。
-   */
   coordinate(community) {
     const instructions = new Map();
     const online = community.getOnlinePeers();
@@ -396,7 +291,6 @@ export class NatHoleCoordinator {
 
         const key = pairKeyFor(aKey, bKey);
 
-        // === 已成功：检查是否应该退役 ===
         const prevPunch = this.punchState.get(key);
         if (prevPunch && (prevPunch.aState === 3 || prevPunch.bState === 3)) {
           if (shouldRetireSuccess(prevPunch, a, b, now)) {
@@ -414,20 +308,6 @@ export class NatHoleCoordinator {
           }
         }
 
-        // === ★ 同网段判断：局域网直连优先 ===
-        //
-        // 客户端上报的 lanIps 有交集 → 同一局域网。
-        // 客户端本地已经会判断并 MarkP2P，服务端这里只需要跳过打洞，
-        // 避免浪费 ladder（同 WiFi 下打洞物理上不可能成功）。
-        if (isSameLan(a, b)) {
-          console.log(
-            `[NAT] ${key} 同网段（${JSON.stringify(a.lanIps)} ↔ ${JSON.stringify(b.lanIps)}），跳过打洞`
-          );
-          paired.add(aKey);
-          paired.add(bKey);
-          continue;
-        }
-
         if (!a.pubSocket || !b.pubSocket) continue;
 
         if (isIPv6Sock(a.pubSocket) || isIPv6Sock(b.pubSocket)) {
@@ -436,7 +316,6 @@ export class NatHoleCoordinator {
           continue;
         }
 
-        // === 角色分配：pubSocket 端口小的一方是 sender ===
         const portA = parsePort(a.pubSocket);
         const portB = parsePort(b.pubSocket);
         const sender = portA <= portB ? a : b;
@@ -455,11 +334,9 @@ export class NatHoleCoordinator {
         const behavior =
           ladder[Math.min(rung, ladder.length - 1)] || ladder[0];
 
-        // === 签名包含梯级 ===
         const signature = `${senderKey}->${receiverKey}@${rung}`;
         const candidate = { rung, signature };
 
-        // === in-flight 和解 ===
         const flightEntry = this.inFlight.get(key);
         if (
           flightEntry &&
@@ -485,7 +362,6 @@ export class NatHoleCoordinator {
           continue;
         }
 
-        // === 错峰 ===
         const backoffEntry = this.backoff.get(key);
         if (
           backoffEntry &&
@@ -515,7 +391,6 @@ export class NatHoleCoordinator {
           }
         }
 
-        // === 退避 ===
         if (
           backoffEntry &&
           backoffEntry.signature === signature &&
@@ -527,7 +402,6 @@ export class NatHoleCoordinator {
           continue;
         }
 
-        // === 生成指令 ===
         const senderBeh = behavior.sender || {};
         const receiverBeh = behavior.receiver || {};
 
@@ -546,6 +420,10 @@ export class NatHoleCoordinator {
           receiverRangeTo = Math.min(65535, senderPort + diff + PORTS_RANGE_NUMBER);
         }
 
+        // ★ 预拼 LAN endpoints
+        const senderLanEndpoints = buildLanEndpoints(sender);
+        const receiverLanEndpoints = buildLanEndpoints(receiver);
+
         const shared = {
           mode,
           behaviorIndex: rung,
@@ -554,14 +432,12 @@ export class NatHoleCoordinator {
           senderPubSocket: sender.pubSocket || "",
           senderNatType: senderFeature.natType,
           senderBehavior: senderFeature.behavior,
-          // ★ 候选地址列表：对端 lanIps + assistedSockets
-          //   客户端按顺序循环打，同网段时 lanIps 最先命中。
-          senderAssistedEndpoints: buildAssistedList(sender),
+          senderAssistedEndpoints: sender.assistedSockets || [],
           receiverMac: receiverKey,
           receiverP2pEndpoint: receiver.p2pEndpoint || "",
           receiverPubSocket: receiver.pubSocket || "",
           receiverNatType: receiverFeature.natType,
-          receiverAssistedEndpoints: buildAssistedList(receiver),
+          receiverAssistedEndpoints: receiver.assistedSockets || [],
           portsDifference: diff,
           regularPortsChange: !!senderFeature.regularPortsChange,
         };
@@ -575,7 +451,9 @@ export class NatHoleCoordinator {
           targetMac: receiverKey,
           targetVirtualIp: receiver.virtualIp,
           targetPubSocket: receiver.pubSocket || "",
-          targetAssistedEndpoints: buildAssistedList(receiver),
+          targetAssistedEndpoints: receiver.assistedSockets || [],
+          // ★ 发送方发给接收方的 LAN 候选
+          targetLanEndpoints: receiverLanEndpoints,
           ...shared,
         };
 
@@ -588,11 +466,12 @@ export class NatHoleCoordinator {
           targetMac: senderKey,
           targetVirtualIp: sender.virtualIp,
           targetPubSocket: sender.pubSocket || "",
-          targetAssistedEndpoints: buildAssistedList(sender),
+          targetAssistedEndpoints: sender.assistedSockets || [],
+          // ★ 接收方发给发送方的 LAN 候选
+          targetLanEndpoints: senderLanEndpoints,
           ...shared,
         };
 
-        // 退避计算
         let backoffMs;
         if (fc > 0) {
           backoffMs = Math.min(
@@ -620,6 +499,15 @@ export class NatHoleCoordinator {
         paired.add(senderKey);
         paired.add(receiverKey);
         noteWake(now + backoffMs);
+
+        // 日志：包含 LAN 候选数
+        if (senderLanEndpoints.length > 0 || receiverLanEndpoints.length > 0) {
+          console.log(
+            `[NAT] ${key} 生成指令 (rung ${rung}), ` +
+            `LAN 候选: sender→recv=${receiverLanEndpoints.length} recv→sender=${senderLanEndpoints.length}`
+          );
+        }
+
         break;
       }
     }
