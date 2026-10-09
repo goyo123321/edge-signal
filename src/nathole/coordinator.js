@@ -370,13 +370,11 @@ export class NatHoleCoordinator {
               `[NAT] ${key} 同 STUN IP (${aIP}) 但 LAN 同网段 ` +
               `(${lanOverlap.aIp} ↔ ${lanOverlap.bIp})，走 LAN 直连`
             );
-            // 不 continue，继续生成指令
           } else if (fc === 0) {
             console.log(
               `[NAT] ${key} 同 STUN IP (${aIP})，允许一次 hairpin 尝试 ` +
               `（部分 CGNAT 支持 hairpin，成功则走 P2P）`
             );
-            // 不 continue，继续生成指令
           } else {
             console.log(
               `[NAT] ${key} 跳过：同 STUN IP (${aIP}) 已尝试失败，标记强制降级`
@@ -491,20 +489,29 @@ export class NatHoleCoordinator {
 
         const senderPort = parsePort(sender.pubSocket);
         const receiverPort = parsePort(receiver.pubSocket);
-        const diff = Math.abs(
+
+        // NAT 行为差异（来自客户端上报的 portsDifference 之差）
+        const natDiff = Math.abs(
           senderFeature.portsDifference - receiverFeature.portsDifference
         );
 
-        // ★ 端口差小 → 窄范围扫描（减少无效尝试）
-        const rangeWidth = diff <= 3 ? PORTS_RANGE_NARROW : PORTS_RANGE_NUMBER;
+        // ★ 两端 pubSocket 的实际端口差
+        //   HardNAT 下 pubSocket 是"发到 STUN 时"的端口，但两端 STUN 时刻不同，
+        //   CGNAT 中间可能为其他连接分配了几十个端口，导致真实出口端口差距很大。
+        //   扫描范围必须至少覆盖这个差距，否则永远命中不了对方。
+        const portGap = Math.abs(senderPort - receiverPort);
+
+        // ★ 有效范围 = max(natDiff, portGap) + 缓冲，上限 30
+        let halfWidth = Math.max(natDiff, portGap) + PORTS_RANGE_NARROW;
+        if (halfWidth > 30) halfWidth = 30;
 
         let senderRangeFrom = 0, senderRangeTo = 0;
         let receiverRangeFrom = 0, receiverRangeTo = 0;
         if (!bothEasy) {
-          senderRangeFrom = Math.max(1, receiverPort - diff - rangeWidth);
-          senderRangeTo = Math.min(65535, receiverPort + diff + rangeWidth);
-          receiverRangeFrom = Math.max(1, senderPort - diff - rangeWidth);
-          receiverRangeTo = Math.min(65535, senderPort + diff + rangeWidth);
+          senderRangeFrom = Math.max(1, receiverPort - halfWidth);
+          senderRangeTo = Math.min(65535, receiverPort + halfWidth);
+          receiverRangeFrom = Math.max(1, senderPort - halfWidth);
+          receiverRangeTo = Math.min(65535, senderPort + halfWidth);
         }
 
         const senderLanEndpoints = buildLanEndpoints(sender);
@@ -524,7 +531,7 @@ export class NatHoleCoordinator {
           receiverPubSocket: receiver.pubSocket || "",
           receiverNatType: receiverFeature.natType,
           receiverAssistedEndpoints: receiver.assistedSockets || [],
-          portsDifference: diff,
+          portsDifference: Math.max(natDiff, portGap),
           regularPortsChange: !!senderFeature.regularPortsChange,
         };
 
@@ -587,7 +594,8 @@ export class NatHoleCoordinator {
         if (senderLanEndpoints.length > 0 || receiverLanEndpoints.length > 0) {
           console.log(
             `[NAT] ${key} 生成指令 (rung ${rung}), ` +
-            `LAN 候选: sender→recv=${receiverLanEndpoints.length} recv→sender=${senderLanEndpoints.length}`
+            `LAN 候选: sender→recv=${receiverLanEndpoints.length} recv→sender=${senderLanEndpoints.length}, ` +
+            `halfWidth=${halfWidth}`
           );
         }
 
