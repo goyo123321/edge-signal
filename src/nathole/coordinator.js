@@ -272,7 +272,7 @@ export class NatHoleCoordinator {
         const key = pairKeyFor(aKey, bKey);
 
         // ★ 一边成功就停：客户端只有在「收到对端 probe 并回 5 轮」后才上报，
-        //   任一端 state=3 即代表双向通道已建立。CGNAT hairpin 是双向的。
+        //   任一端 state=3 即代表双向通道已建立。
         const prevPunch = this.punchState.get(key);
         const anySucceeded = prevPunch &&
           (prevPunch.aState === 3 || prevPunch.bState === 3);
@@ -404,7 +404,6 @@ export class NatHoleCoordinator {
         const receiverRangeFrom = Math.max(1, aPort - 10000);
         const receiverRangeTo = Math.min(65535, aPort + 10000);
 
-        // ★ 带上 assistedEndpoints
         const shared = {
           mode,
           behaviorIndex: rung,
@@ -480,7 +479,7 @@ export class NatHoleCoordinator {
         console.log(
           `[NAT] ${key} 生成指令 (rung ${rung}), ` +
           `sender=${sender.pubSocket} receiver=${receiver.pubSocket} ` +
-          `assisted(s=${(sender.assistedSockets || []).length},r=${(receiver.assistedSockets || []).length})`
+          `assisted=${(receiver.assistedSockets || []).length}/${(sender.assistedSockets || []).length}`
         );
 
         break;
