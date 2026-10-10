@@ -7,17 +7,12 @@ import {
 } from "./ladder.js";
 import { NatHoleAnalyzer, pairKeyFor } from "./analyzer.js";
 
-const PORTS_RANGE_NUMBER = 10;
-const PORTS_RANGE_NARROW = 3;
 const PUNCH_STAGGER_MS_DEFAULT = 1000;
 const SENDER_DISPATCH_DELAY_MS_DEFAULT = 1000;
 const FAIL_BACKOFF_BASE_MS = 15000;
 const FAIL_BACKOFF_CAP_MS = 60000;
 const INFLIGHT_TIMEOUT_MS = 10000;
 const SUCCESS_GRACE_MS = 30000;
-
-// ★ 跨 ISP 判定阈值
-const CROSS_ISP_PORT_GAP_THRESHOLD = 1000;
 
 const CONN_P2P = "p2p";
 const P2P_FULLDUPLEX = 3;
@@ -54,12 +49,6 @@ function parsePort(sock) {
   return i < 0 ? 0 : parseInt(sock.slice(i + 1), 10) || 0;
 }
 
-function extractIP(sock) {
-  if (!sock) return "";
-  const i = sock.lastIndexOf(":");
-  return i < 0 ? "" : sock.slice(0, i);
-}
-
 function peerKey(p) {
   return p && p.mac;
 }
@@ -70,41 +59,6 @@ function isIPv6Sock(sock) {
   const colonCount = (sock.match(/:/g) || []).length;
   return colonCount > 1;
 }
-
-// ============ LAN 相关 ============
-
-function isSameSubnet24(ipA, ipB) {
-  if (!ipA || !ipB) return false;
-  const a = String(ipA).split(".");
-  const b = String(ipB).split(".");
-  if (a.length !== 4 || b.length !== 4) return false;
-  return a[0] === b[0] && a[1] === b[1] && a[2] === b[2];
-}
-
-function checkLanOverlap(a, b) {
-  const aLanIPs = Array.isArray(a.lanIps) ? a.lanIps : [];
-  const bLanIPs = Array.isArray(b.lanIps) ? b.lanIps : [];
-  if (aLanIPs.length === 0 || bLanIPs.length === 0) return null;
-  for (const aIp of aLanIPs) {
-    for (const bIp of bLanIPs) {
-      if (isSameSubnet24(aIp, bIp)) return { aIp, bIp };
-    }
-  }
-  return null;
-}
-
-function buildLanEndpoints(peer) {
-  if (!peer || !Array.isArray(peer.lanIps) || peer.lanIps.length === 0) {
-    return [];
-  }
-  const port = peer.lanPort || 0;
-  if (port <= 0) return [];
-  return peer.lanIps
-    .filter((ip) => typeof ip === "string" && ip)
-    .map((ip) => `${ip}:${port}`);
-}
-
-// ============ 其他辅助 ============
 
 function shouldRetireSuccess(prev, a, b, now) {
   if (!prev) return false;
@@ -290,6 +244,11 @@ export class NatHoleCoordinator {
     return earliest;
   }
 
+  // ============ 简化版 coordinate ============
+  //
+  // 只做最基本的事：给每对 peer 下发打洞指令。
+  // 不再判断：跨 ISP / NAT 类型 / LAN / 同 STUN IP。
+  // 客户端自己根据 targetPubSocket + 本机 STUN 结果决定扫描范围。
   coordinate(community) {
     const instructions = new Map();
     const forceFallbacks = new Map();
@@ -314,53 +273,9 @@ export class NatHoleCoordinator {
         const bKey = peerKey(b);
         if (!bKey || paired.has(bKey)) continue;
 
-        const fa = classifyNat(a);
-        const fb = classifyNat(b);
-        if (fa.natType === "unknown" || fb.natType === "unknown") continue;
-
         const key = pairKeyFor(aKey, bKey);
 
-        // ============ ★ 跨 ISP 检测 ============
-        // 两端 pubSocket 公网 IP 不同，且都不是私网，且端口差 > 1000 ——
-        // 这种场景打洞几乎不可能成功（CGNAT 映射已经完全漂移/不同运营商出口），
-        // 直接下发 force_fallback，避免客户端白跑几十秒打洞。
-        const aPubIP = extractIP(a.pubSocket);
-        const bPubIP = extractIP(b.pubSocket);
-        const aPort = parsePort(a.pubSocket);
-        const bPort = parsePort(b.pubSocket);
-        const portGap = Math.abs(aPort - bPort);
-
-        const isDifferentPublicIP = aPubIP && bPubIP && aPubIP !== bPubIP;
-        const isCrossISP = isDifferentPublicIP &&
-          portGap > CROSS_ISP_PORT_GAP_THRESHOLD;
-
-        if (isCrossISP) {
-          const fc = this.failCounts.get(key) || 0;
-          if (fc < 1) {
-            console.log(
-              `[NAT] ${key} 跨 ISP (${aPubIP}:${aPort} ↔ ${bPubIP}:${bPort}, ` +
-              `gap=${portGap})，直接降级到中继`
-            );
-            this.failCounts.set(key, 1);
-            this.punchState.set(key, {
-              aState: 2, bState: 2,
-              aAttempts: 0, bAttempts: 0,
-              aP2PStatus: 0, bP2PStatus: 0,
-              behaviorIndex: null,
-              at: now,
-              everValidated: false,
-            });
-            if (!forceFallbacks.has(aKey)) forceFallbacks.set(aKey, new Set());
-            if (!forceFallbacks.has(bKey)) forceFallbacks.set(bKey, new Set());
-            forceFallbacks.get(aKey).add(bKey);
-            forceFallbacks.get(bKey).add(aKey);
-          }
-          paired.add(aKey);
-          paired.add(bKey);
-          continue;
-        }
-
-        // ============ 已有 P2P 成功记录 ============
+        // 已有 P2P 成功记录 → 检查是否过期
         const prevPunch = this.punchState.get(key);
         if (prevPunch && (prevPunch.aState === 3 || prevPunch.bState === 3)) {
           if (shouldRetireSuccess(prevPunch, a, b, now)) {
@@ -397,46 +312,8 @@ export class NatHoleCoordinator {
           continue;
         }
 
-        // ============ 同 STUN 出口 IP 处理 ============
-        const sameStunIP = aPubIP && bPubIP && aPubIP === bPubIP;
-
-        if (sameStunIP) {
-          const lanOverlap = checkLanOverlap(a, b);
-          const fc = this.failCounts.get(key) || 0;
-
-          if (lanOverlap) {
-            console.log(
-              `[NAT] ${key} 同 STUN IP (${aPubIP}) 但 LAN 同网段 ` +
-              `(${lanOverlap.aIp} ↔ ${lanOverlap.bIp})，走 LAN 直连`
-            );
-          } else if (fc === 0) {
-            console.log(
-              `[NAT] ${key} 同 STUN IP (${aPubIP})，允许一次 hairpin 尝试 ` +
-              `（部分 CGNAT 支持 hairpin，成功则走 P2P）`
-            );
-          } else {
-            console.log(
-              `[NAT] ${key} 跳过：同 STUN IP (${aPubIP}) 已尝试失败，标记强制降级`
-            );
-            this.failCounts.set(key, fc + 1);
-            this.punchState.set(key, {
-              aState: 2, bState: 2,
-              aAttempts: 0, bAttempts: 0,
-              aP2PStatus: 0, bP2PStatus: 0,
-              behaviorIndex: null,
-              at: now,
-              everValidated: false,
-            });
-            if (!forceFallbacks.has(aKey)) forceFallbacks.set(aKey, new Set());
-            if (!forceFallbacks.has(bKey)) forceFallbacks.set(bKey, new Set());
-            forceFallbacks.get(aKey).add(bKey);
-            forceFallbacks.get(bKey).add(aKey);
-            paired.add(aKey);
-            paired.add(bKey);
-            continue;
-          }
-        }
-
+        const aPort = parsePort(a.pubSocket);
+        const bPort = parsePort(b.pubSocket);
         const sender = aPort <= bPort ? a : b;
         const receiver = aPort <= bPort ? b : a;
         const senderKey = peerKey(sender);
@@ -524,28 +401,11 @@ export class NatHoleCoordinator {
         const senderBeh = behavior.sender || {};
         const receiverBeh = behavior.receiver || {};
 
-        const senderPort = parsePort(sender.pubSocket);
-        const receiverPort = parsePort(receiver.pubSocket);
-
-        const natDiff = Math.abs(
-          senderFeature.portsDifference - receiverFeature.portsDifference
-        );
-        const senderReceiverGap = Math.abs(senderPort - receiverPort);
-
-        let halfWidth = Math.max(natDiff, senderReceiverGap) + PORTS_RANGE_NARROW;
-        if (halfWidth > 100) halfWidth = 100;
-
-        let senderRangeFrom = 0, senderRangeTo = 0;
-        let receiverRangeFrom = 0, receiverRangeTo = 0;
-        if (!bothEasy) {
-          senderRangeFrom = Math.max(1, receiverPort - halfWidth);
-          senderRangeTo = Math.min(65535, receiverPort + halfWidth);
-          receiverRangeFrom = Math.max(1, senderPort - halfWidth);
-          receiverRangeTo = Math.min(65535, senderPort + halfWidth);
-        }
-
-        const senderLanEndpoints = buildLanEndpoints(sender);
-        const receiverLanEndpoints = buildLanEndpoints(receiver);
+        // 下发的 range 只是兼容旧客户端的兜底，新客户端忽略。
+        const senderRangeFrom = Math.max(1, bPort - 10000);
+        const senderRangeTo = Math.min(65535, bPort + 10000);
+        const receiverRangeFrom = Math.max(1, aPort - 10000);
+        const receiverRangeTo = Math.min(65535, aPort + 10000);
 
         const shared = {
           mode,
@@ -561,8 +421,8 @@ export class NatHoleCoordinator {
           receiverPubSocket: receiver.pubSocket || "",
           receiverNatType: receiverFeature.natType,
           receiverAssistedEndpoints: receiver.assistedSockets || [],
-          portsDifference: Math.max(natDiff, senderReceiverGap),
-          regularPortsChange: !!senderFeature.regularPortsChange,
+          portsDifference: 0,
+          regularPortsChange: false,
         };
 
         const senderInstr = {
@@ -575,7 +435,7 @@ export class NatHoleCoordinator {
           targetVirtualIp: receiver.virtualIp,
           targetPubSocket: receiver.pubSocket || "",
           targetAssistedEndpoints: receiver.assistedSockets || [],
-          targetLanEndpoints: receiverLanEndpoints,
+          targetLanEndpoints: [],
           ...shared,
         };
 
@@ -589,7 +449,7 @@ export class NatHoleCoordinator {
           targetVirtualIp: sender.virtualIp,
           targetPubSocket: sender.pubSocket || "",
           targetAssistedEndpoints: sender.assistedSockets || [],
-          targetLanEndpoints: senderLanEndpoints,
+          targetLanEndpoints: [],
           ...shared,
         };
 
@@ -621,13 +481,10 @@ export class NatHoleCoordinator {
         paired.add(receiverKey);
         noteWake(now + backoffMs);
 
-        if (senderLanEndpoints.length > 0 || receiverLanEndpoints.length > 0) {
-          console.log(
-            `[NAT] ${key} 生成指令 (rung ${rung}), ` +
-            `LAN 候选: sender→recv=${receiverLanEndpoints.length} recv→sender=${senderLanEndpoints.length}, ` +
-            `halfWidth=${halfWidth}`
-          );
-        }
+        console.log(
+          `[NAT] ${key} 生成指令 (rung ${rung}), ` +
+          `sender=${sender.pubSocket} receiver=${receiver.pubSocket}`
+        );
 
         break;
       }
