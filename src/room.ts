@@ -318,6 +318,27 @@ export class Room extends DurableObject {
       peer.lastSeen = now;
       peer.disconnectedAt = undefined;
       peer._publicIp = publicIp;
+
+      // ★ 检测 VIP 冲突：其他在线 peer 是否也占用了同一个 VIP
+      //
+      // 场景：A 离线（30 分钟 TTL 内），B 进入时 allocateIp 未看到 A 的 VIP
+      //      （因为 ensureLoaded 只恢复在线 peer 到 ipToClient）
+      //      → B 拿到和 A 相同的 VIP
+      //      → A 重启后复用旧 VIP
+      //      → 冲突
+      const conflict = Array.from(this.peers.values()).find(
+        (p) => p.clientId !== clientId && p.online && p.virtualIp === peer!.virtualIp
+      );
+      if (conflict) {
+        const oldVip = peer.virtualIp;
+        // 先把自己从 ipToClient 摘掉，避免 allocateIp 看到自己占用
+        this.ipToClient.delete(oldVip);
+        peer.virtualIp = this.allocateIp();
+        console.log(
+          `[Room] ${clientId} VIP 冲突：${oldVip} 已被 ${conflict.clientId} 占用，` +
+          `重新分配 ${peer.virtualIp}`
+        );
+      }
     } else {
       peer = {
         clientId, mac: clientId, name: "",
@@ -740,12 +761,22 @@ export class Room extends DurableObject {
     }
   }
 
+  // ★ allocateIp 现在检查所有 peer 的 VIP（含离线 TTL 内的），
+  //   避免离线 peer 的 VIP 被重新分配出去。
   private allocateIp(): string {
+    const used = new Set<string>();
+    for (const p of this.peers.values()) {
+      if (p.virtualIp) used.add(p.virtualIp);
+    }
+    for (const ip of this.ipToClient.keys()) {
+      used.add(ip);
+    }
+
     for (let i = 0; i < 254; i++) {
       const ip = `10.64.0.${this.ipCounter}`;
       this.ipCounter++;
       if (this.ipCounter > 254) this.ipCounter = 2;
-      if (!this.ipToClient.has(ip)) return ip;
+      if (!used.has(ip)) return ip;
     }
     throw new Error("IP pool exhausted");
   }
