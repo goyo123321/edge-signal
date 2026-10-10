@@ -295,7 +295,6 @@ export class Room extends DurableObject {
     const now = Date.now();
     try { await this.ctx.storage.put(COMMUNITY_STORAGE_KEY, this.community); } catch {}
 
-    // ★ ready 消息：带上 assistedEndpoints
     const onlinePeersForClient = Array.from(this.peers.values())
       .filter((p) => p.online && p.clientId !== clientId)
       .map((p) => {
@@ -384,9 +383,8 @@ export class Room extends DurableObject {
           peer.portsDifference = p.portsDifference || 0;
           peer.regularPortsChange = !!p.regularPortsChange;
           peer.behavior = p.behavior || peer.behavior;
-          if (typeof p.p2pEndpoint === "string" && p.p2pEndpoint) peer.p2pEndpoint = p.p2pEndpoint;
 
-          // ★ assistedEndpoints（新字段）
+          // ★ assistedEndpoints（新协议）；兼容旧字段 assistedSockets
           if (Array.isArray(p.assistedEndpoints)) {
             peer.assistedSockets = p.assistedEndpoints.filter(
               (s: any) => typeof s === "string" && s
@@ -396,6 +394,8 @@ export class Room extends DurableObject {
               (s: any) => typeof s === "string" && s
             );
           }
+
+          if (typeof p.p2pEndpoint === "string" && p.p2pEndpoint) peer.p2pEndpoint = p.p2pEndpoint;
 
           const publicEndpoint = typeof p.publicEndpoint === "string" ? p.publicEndpoint : "";
           if (publicEndpoint && publicEndpoint !== "") {
@@ -412,11 +412,10 @@ export class Room extends DurableObject {
           const addr = this.peerPublicAddr(peer);
           console.log(
             `[Room] p2p_metadata from ${from}: natType=${peer.natType} ` +
-            `pub=${addr.ip}:${addr.port} assisted=${peer.assistedSockets.length} ` +
-            `multiExit=${peer.multiExit || false}`
+            `pub=${addr.ip}:${addr.port} (pubSocket=${peer.pubSocket || "<empty>"}) ` +
+            `multiExit=${peer.multiExit || false} assisted=${peer.assistedSockets.length}`
           );
 
-          // ★ joined 广播带上 assistedEndpoints
           this.broadcast(from, {
             type: "joined", from,
             payload: {
@@ -569,7 +568,7 @@ export class Room extends DurableObject {
           from: "server",
           payload: instr,
         }));
-        console.log(`[Room] → ${mac} 下发 nat_hole_instruction role=${instr.role} target=${instr.targetPubSocket} assisted=${(instr.targetAssistedEndpoints || []).length}`);
+        console.log(`[Room] → ${mac} 下发 nat_hole_instruction role=${instr.role} target=${instr.targetPubSocket}`);
       } catch (e) {
         console.error(`[Room] 发送给 ${mac} 失败:`, e);
       }
@@ -620,9 +619,9 @@ export class Room extends DurableObject {
         virtualIp: p.online ? p.virtualIp : "",
         publicIp: p._publicIp || "",
         pubSocket: p.pubSocket, p2pEndpoint: p.p2pEndpoint, publicEndpoint: p.publicEndpoint,
-        assistedSockets: p.assistedSockets || [],
         turnRelayAddr: p.turnRelayAddr, natType: p.natType,
         multiExit: !!p.multiExit,
+        assistedSockets: p.assistedSockets || [],
         online: p.online, connectedAt: p.connectedAt, lastSeen: p.lastSeen, disconnectedAt: p.disconnectedAt,
         onlineFor: now - p.connectedAt,
         offlineFor: p.online ? 0 : (p.disconnectedAt ? now - p.disconnectedAt : 0),
