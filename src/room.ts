@@ -1,749 +1,771 @@
-package internal
+import { DurableObject } from "cloudflare:workers";
+import { NatHoleCoordinator } from "./nathole/coordinator.js";
 
-import (
-	"crypto/hmac"
-	"crypto/md5"
-	"crypto/rand"
-	"crypto/sha1"
-	"encoding/binary"
-	"fmt"
-	"log"
-	"net"
-	"runtime/debug"
-	"strings"
-	"sync"
-	"time"
-)
+type ConnType = "p2p" | "turn" | "relay" | "unknown";
 
-// ============ STUN 常量 ============
-
-const stunMagicCookie = 0x2112A442
-
-const (
-	msgAllocateRequest     = 0x0003
-	msgAllocateSuccess     = 0x0103
-	msgAllocateError       = 0x0113
-	msgRefreshRequest      = 0x0004
-	msgRefreshSuccess      = 0x0104
-	msgCreatePermissionReq = 0x0008
-	msgCreatePermissionSuc = 0x0108
-	msgSendIndication      = 0x0016
-	msgDataIndication      = 0x0017
-)
-
-const (
-	attrMappedAddress    = 0x0001
-	attrUsername         = 0x0006
-	attrMessageIntegrity = 0x0008
-	attrErrorCode        = 0x0009
-	attrLifetime         = 0x000D
-	attrXorPeerAddress   = 0x0012
-	attrData             = 0x0013
-	attrRealm            = 0x0014
-	attrNonce            = 0x0015
-	attrXorRelayedAddr   = 0x0016
-	attrRequestedTransID = 0x0019
-	attrXorMappedAddress = 0x0020
-)
-
-const transportUDP = 17
-
-const (
-	turnPermissionTTL   = 4 * time.Minute
-	turnDefaultLifetime = 600
-	turnRefreshInterval = 60 * time.Second
-	turnRequestTimeout  = 5 * time.Second
-)
-
-// ============ 内部结构 ============
-
-type stunAttr struct {
-	typ   uint16
-	value []byte
+interface PeerRecord {
+  clientId: string;
+  mac: string;
+  name: string;
+  virtualIp: string;
+  online: boolean;
+  connectedAt: number;
+  registeredAt: number;
+  lastSeen: number;
+  disconnectedAt?: number;
+  connections: Map<string, ConnType>;
+  pubSocket: string;
+  p2pEndpoint: string;
+  publicEndpoint: string;
+  natType: string;
+  portsDifference: number;
+  regularPortsChange: boolean;
+  behavior: string;
+  assistedSockets: string[];
+  observedRaddr: string;
+  turnRelayAddr: string;
+  relayBytesIn: number;
+  relayBytesOut: number;
+  relayPacketsIn: number;
+  relayPacketsOut: number;
+  _publicIp?: string;
+  multiExit?: boolean;
 }
 
-type stunMessage struct {
-	msgType uint16
-	txid    [12]byte
-	attrs   map[uint16][]byte
+const STAGGER_FALLBACK_SAVE_MS = 300 * 1000;
+const REGISTRY_REFRESH_MS = 5 * 60 * 1000;
+const PEERS_STORAGE_KEY = "peers";
+const COMMUNITY_STORAGE_KEY = "community";
+const OFFLINE_TTL_MS = 30 * 60 * 1000;
+const SAVE_THROTTLE_MS = 3 * 1000;
+
+function idxToCode(i: number): string {
+  if (i < 26) return String.fromCharCode(65 + i);
+  const first = Math.floor(i / 26) - 1;
+  const second = i % 26;
+  return String.fromCharCode(65 + first) + String.fromCharCode(65 + second);
 }
 
-type TURNLite struct {
-	serverAddr string
-	username   string
-	password   string
-	useTCP     bool
-
-	realm string
-	nonce []byte
-	key   []byte
-
-	conn net.Conn
-
-	relayAddr  *net.UDPAddr
-	mappedAddr *net.UDPAddr
-
-	permissions map[string]time.Time
-	permMu      sync.Mutex
-
-	onMessage func([]byte, net.Addr)
-
-	pendingMu sync.Mutex
-	pending   map[[12]byte]chan *stunMessage
-
-	mu       sync.Mutex
-	stopped  bool
-	stopCh   chan struct{}
-	stopOnce sync.Once
+function onlineCount(peers: Map<string, PeerRecord>): number {
+  let n = 0;
+  for (const p of peers.values()) if (p.online) n++;
+  return n;
 }
 
-func NewTURNLite(serverAddr, username, password string) *TURNLite {
-	return NewTURNLiteWithTCP(serverAddr, username, password, false)
-}
-
-func NewTURNLiteWithTCP(serverAddr, username, password string, useTCP bool) *TURNLite {
-	return &TURNLite{
-		serverAddr:  serverAddr,
-		username:    username,
-		password:    password,
-		useTCP:      useTCP,
-		permissions: make(map[string]time.Time),
-		pending:     make(map[[12]byte]chan *stunMessage),
-		stopCh:      make(chan struct{}),
-	}
-}
-
-// ============ 辅助 ============
-
-func isNetworkUnreachable(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := err.Error()
-	return strings.Contains(s, "network is unreachable") ||
-		strings.Contains(s, "no route to host") ||
-		strings.Contains(s, "network is down")
-}
-
-func (t *TURNLite) IsAlive() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return !t.stopped
-}
-
-// ============ STUN 编解码 ============
-
-func buildSTUNMsg(msgType uint16, txid [12]byte, attrs []stunAttr) []byte {
-	total := 20
-	for _, a := range attrs {
-		total += 4 + ((len(a.value) + 3) &^ 3)
-	}
-	buf := make([]byte, total)
-	binary.BigEndian.PutUint16(buf[0:2], msgType)
-	binary.BigEndian.PutUint16(buf[2:4], uint16(total-20))
-	binary.BigEndian.PutUint32(buf[4:8], stunMagicCookie)
-	copy(buf[8:20], txid[:])
-	offset := 20
-	for _, a := range attrs {
-		binary.BigEndian.PutUint16(buf[offset:offset+2], a.typ)
-		binary.BigEndian.PutUint16(buf[offset+2:offset+4], uint16(len(a.value)))
-		copy(buf[offset+4:], a.value)
-		offset += 4 + ((len(a.value) + 3) &^ 3)
-	}
-	return buf
-}
-
-func parseSTUNMsg(data []byte) (*stunMessage, error) {
-	if len(data) < 20 {
-		return nil, fmt.Errorf("STUN 消息太短")
-	}
-	if binary.BigEndian.Uint32(data[4:8]) != stunMagicCookie {
-		return nil, fmt.Errorf("magic cookie 不匹配")
-	}
-	msgLen := int(binary.BigEndian.Uint16(data[2:4]))
-	end := 20 + msgLen
-	if end > len(data) {
-		end = len(data)
-	}
-	attrs := make(map[uint16][]byte)
-	offset := 20
-	for offset+4 <= end {
-		typ := binary.BigEndian.Uint16(data[offset : offset+2])
-		l := int(binary.BigEndian.Uint16(data[offset+2 : offset+4]))
-		if offset+4+l > end {
-			break
-		}
-		attrs[typ] = data[offset+4 : offset+4+l]
-		offset += 4 + ((l + 3) &^ 3)
-	}
-	var txid [12]byte
-	copy(txid[:], data[8:20])
-	return &stunMessage{
-		msgType: binary.BigEndian.Uint16(data[0:2]),
-		txid:    txid,
-		attrs:   attrs,
-	}, nil
-}
-
-// ============ XOR 地址 ============
-
-var magicBytes = [4]byte{0x21, 0x12, 0xA4, 0x42}
-
-func xorEncodePeer(ip net.IP, port int) []byte {
-	if v4 := ip.To4(); v4 != nil {
-		buf := make([]byte, 8)
-		buf[1] = 0x01
-		binary.BigEndian.PutUint16(buf[2:4], uint16(port)^0x2112)
-		for i := 0; i < 4; i++ {
-			buf[4+i] = v4[i] ^ magicBytes[i]
-		}
-		return buf
-	}
-	if v6 := ip.To16(); v6 != nil {
-		buf := make([]byte, 20)
-		buf[1] = 0x02
-		binary.BigEndian.PutUint16(buf[2:4], uint16(port)^0x2112)
-		for i := 0; i < 16; i++ {
-			buf[4+i] = v6[i] ^ magicBytes[i%4]
-		}
-		return buf
-	}
-	return nil
-}
-
-func xorDecodePeer(data []byte) (net.IP, int, error) {
-	if len(data) < 4 {
-		return nil, 0, fmt.Errorf("XOR 地址太短")
-	}
-	family := data[1]
-	port := int(binary.BigEndian.Uint16(data[2:4]) ^ 0x2112)
-	switch family {
-	case 0x01:
-		if len(data) < 8 {
-			return nil, 0, fmt.Errorf("IPv4 数据不足")
-		}
-		ip := make(net.IP, 4)
-		for i := 0; i < 4; i++ {
-			ip[i] = data[4+i] ^ magicBytes[i]
-		}
-		return ip, port, nil
-	case 0x02:
-		if len(data) < 20 {
-			return nil, 0, fmt.Errorf("IPv6 数据不足")
-		}
-		ip := make(net.IP, 16)
-		for i := 0; i < 16; i++ {
-			ip[i] = data[4+i] ^ magicBytes[i%4]
-		}
-		return ip, port, nil
-	}
-	return nil, 0, fmt.Errorf("未知地址族 0x%02x", family)
-}
-
-// ============ HMAC-SHA1 签名 ============
-
-func (t *TURNLite) sign(msg []byte) []byte {
-	if t.key == nil {
-		return msg
-	}
-
-	newBodyLen := len(msg) - 20 + 24
-
-	tmp := make([]byte, len(msg))
-	copy(tmp, msg)
-	binary.BigEndian.PutUint16(tmp[2:4], uint16(newBodyLen))
-
-	mac := hmac.New(sha1.New, t.key)
-	mac.Write(tmp)
-	sig := mac.Sum(nil)
-
-	out := make([]byte, len(msg)+24)
-	copy(out, msg)
-	binary.BigEndian.PutUint16(out[len(msg):len(msg)+2], attrMessageIntegrity)
-	binary.BigEndian.PutUint16(out[len(msg)+2:len(msg)+4], 20)
-	copy(out[len(msg)+4:], sig)
-	binary.BigEndian.PutUint16(out[2:4], uint16(newBodyLen))
-	return out
-}
-
-func randTxID() [12]byte {
-	var t [12]byte
-	_, _ = rand.Read(t[:])
-	return t
-}
-
-// ============ 发送 + 等待（按 txid 分发） ============
-
-func (t *TURNLite) sendRequest(msgType uint16, attrs []stunAttr, withAuth bool) (*stunMessage, error) {
-	txid := randTxID()
-
-	if withAuth && t.key != nil {
-		attrs = append(attrs,
-			stunAttr{typ: attrUsername, value: []byte(t.username)},
-			stunAttr{typ: attrRealm, value: []byte(t.realm)},
-			stunAttr{typ: attrNonce, value: t.nonce},
-		)
-	}
-
-	msg := buildSTUNMsg(msgType, txid, attrs)
-	if withAuth && t.key != nil {
-		msg = t.sign(msg)
-	}
-
-	ch := make(chan *stunMessage, 1)
-	t.pendingMu.Lock()
-	t.pending[txid] = ch
-	t.pendingMu.Unlock()
-	defer func() {
-		t.pendingMu.Lock()
-		delete(t.pending, txid)
-		t.pendingMu.Unlock()
-	}()
-
-	if _, err := t.conn.Write(msg); err != nil {
-		if isNetworkUnreachable(err) {
-			log.Printf("[TURN-Lite] socket 失效（网络变化），关闭等待重建")
-			go t.Close()
-		}
-		return nil, fmt.Errorf("发送失败: %w", err)
-	}
-
-	timeout := time.After(turnRequestTimeout)
-	select {
-	case resp := <-ch:
-		if resp == nil {
-			return nil, fmt.Errorf("空响应")
-		}
-		return resp, nil
-	case <-timeout:
-		return nil, fmt.Errorf("请求超时 (type=0x%04x)", msgType)
-	case <-t.stopCh:
-		return nil, fmt.Errorf("已关闭")
-	}
-}
-
-func (t *TURNLite) dispatch(msg *stunMessage) {
-	t.pendingMu.Lock()
-	ch := t.pending[msg.txid]
-	t.pendingMu.Unlock()
-	if ch != nil {
-		select {
-		case ch <- msg:
-		default:
-		}
-	}
-}
-
-// ============ Allocate ============
-
-func (t *TURNLite) Allocate() error {
-	protectedDialer := newProtectedDialer()
-
-	if t.useTCP {
-		log.Printf("[TURN-Lite] TCP transport → %s", t.serverAddr)
-		conn, err := protectedDialer.Dial("tcp", t.serverAddr)
-		if err != nil {
-			return fmt.Errorf("TCP 连接失败: %w", err)
-		}
-		// TCP keepalive：尽早检测对端断开
-		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			_ = tcpConn.SetKeepAlive(true)
-			_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
-		}
-		t.conn = conn
-	} else {
-		log.Printf("[TURN-Lite] UDP transport → %s", t.serverAddr)
-		conn, err := protectedDialer.Dial("udp4", t.serverAddr)
-		if err != nil {
-			return fmt.Errorf("UDP 连接失败: %w", err)
-		}
-		t.conn = conn
-	}
-
-	safeGo("turn-lite-readLoop", t.readLoop)
-
-	reqTransport := []byte{transportUDP, 0, 0, 0}
-
-	log.Printf("[TURN-Lite] 发送初始 Allocate（无认证）")
-	resp, err := t.sendRequest(msgAllocateRequest, []stunAttr{
-		{typ: attrRequestedTransID, value: reqTransport},
-	}, false)
-	if err != nil {
-		t.Close()
-		return fmt.Errorf("初始 Allocate 失败: %w", err)
-	}
-
-	if resp.msgType == msgAllocateError {
-		realm := string(resp.attrs[attrRealm])
-		nonce := resp.attrs[attrNonce]
-		if realm == "" || len(nonce) == 0 {
-			t.Close()
-			return fmt.Errorf("401 缺 realm/nonce")
-		}
-		t.realm = realm
-		t.nonce = nonce
-
-		h := md5.Sum([]byte(fmt.Sprintf("%s:%s:%s", t.username, t.realm, t.password)))
-		t.key = h[:]
-
-		log.Printf("[TURN-Lite] 401 realm=%q nonce=%d 字节 (username=%s)", realm, len(nonce), t.username)
-	} else if resp.msgType == msgAllocateSuccess {
-		return t.extractAllocateResult(resp)
-	} else {
-		t.Close()
-		return fmt.Errorf("初始 Allocate 返回意外类型 0x%04x", resp.msgType)
-	}
-
-	log.Printf("[TURN-Lite] 发送 Allocate（带认证）")
-	resp, err = t.sendRequest(msgAllocateRequest, []stunAttr{
-		{typ: attrRequestedTransID, value: reqTransport},
-		{typ: attrLifetime, value: uint32ToBytes(turnDefaultLifetime)},
-	}, true)
-	if err != nil {
-		t.Close()
-		return fmt.Errorf("认证 Allocate 失败: %w", err)
-	}
-
-	if resp.msgType != msgAllocateSuccess {
-		t.Close()
-		code := parseErrorCode(resp.attrs[attrErrorCode])
-		return fmt.Errorf("Allocate 失败: code=%d", code)
-	}
-
-	return t.extractAllocateResult(resp)
-}
-
-func (t *TURNLite) extractAllocateResult(resp *stunMessage) error {
-	relayData := resp.attrs[attrXorRelayedAddr]
-	ip, port, err := xorDecodePeer(relayData)
-	if err != nil {
-		return fmt.Errorf("解析 relay 失败: %w", err)
-	}
-	t.relayAddr = &net.UDPAddr{IP: ip, Port: port}
-
-	if m := resp.attrs[attrXorMappedAddress]; m != nil {
-		if ip2, port2, err2 := xorDecodePeer(m); err2 == nil {
-			t.mappedAddr = &net.UDPAddr{IP: ip2, Port: port2}
-		}
-	}
-
-	log.Printf("[TURN-Lite] ✅ Allocation 成功: relay=%s", t.relayAddr)
-
-	safeGo("turn-lite-refresh", t.refreshLoop)
-	return nil
-}
-
-// ============ CreatePermission ============
-
-// ensurePermission 确保向 remoteAddr 的发送已被 TURN 服务器授权。
-//
-// TURN 协议（RFC 5766）要求客户端向某个对端地址发送数据前，必须先
-// 用 CreatePermission 在服务器上建立对该 IP 的权限。
-//
-// ★ 438 Stale Nonce 是 TURN 服务器的正常行为（每 60 秒轮换 nonce），
-//   需要换新 nonce 重试一次。
-func (t *TURNLite) ensurePermission(ip net.IP) error {
-	key := ip.String()
-	t.permMu.Lock()
-	last, exists := t.permissions[key]
-	t.permMu.Unlock()
-
-	if exists && time.Since(last) < turnPermissionTTL {
-		return nil
-	}
-
-	peerData := xorEncodePeer(ip, 0)
-
-	// 第一次尝试
-	resp, err := t.sendRequest(msgCreatePermissionReq, []stunAttr{
-		{typ: attrXorPeerAddress, value: peerData},
-	}, true)
-	if err != nil {
-		return fmt.Errorf("CreatePermission: %w", err)
-	}
-
-	// ★ 438 Stale Nonce：换 nonce 重试一次
-	if resp.msgType != msgCreatePermissionSuc {
-		code := parseErrorCode(resp.attrs[attrErrorCode])
-		if code == 438 {
-			newNonce := resp.attrs[attrNonce]
-			if len(newNonce) > 0 {
-				t.mu.Lock()
-				t.nonce = newNonce
-				t.mu.Unlock()
-				log.Printf("[TURN-Lite] CreatePermission 收到 438，换 nonce 重试")
-
-				resp, err = t.sendRequest(msgCreatePermissionReq, []stunAttr{
-					{typ: attrXorPeerAddress, value: peerData},
-				}, true)
-				if err != nil {
-					return fmt.Errorf("CreatePermission 438 重试失败: %w", err)
-				}
-			} else {
-				log.Printf("[TURN-Lite] CreatePermission 438 但响应无 nonce")
-			}
-		}
-	}
-
-	if resp.msgType != msgCreatePermissionSuc {
-		code := parseErrorCode(resp.attrs[attrErrorCode])
-		return fmt.Errorf("CreatePermission 被拒 code=%d", code)
-	}
-
-	t.permMu.Lock()
-	t.permissions[key] = time.Now()
-	t.permMu.Unlock()
-	return nil
-}
-
-// ============ 发送 ============
-
-func (t *TURNLite) SendTo(data []byte, peerAddr *net.UDPAddr) error {
-	if t.conn == nil {
-		return fmt.Errorf("TURN 未就绪")
-	}
-	if len(data) == 0 {
-		return nil
-	}
-	if err := t.ensurePermission(peerAddr.IP); err != nil {
-		return err
-	}
-	peerData := xorEncodePeer(peerAddr.IP, peerAddr.Port)
-	msg := buildSTUNMsg(msgSendIndication, randTxID(), []stunAttr{
-		{typ: attrXorPeerAddress, value: peerData},
-		{typ: attrData, value: data},
-	})
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.stopped {
-		return fmt.Errorf("已关闭")
-	}
-	_, err := t.conn.Write(msg)
-	return err
-}
-
-// ============ 读循环 ============
-
-func (t *TURNLite) readLoop() {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("[TURN-Lite] readLoop panic: %v\n%s", r, debug.Stack())
-			go t.Close()
-		}
-	}()
-	if t.useTCP {
-		t.readLoopTCP()
-	} else {
-		t.readLoopUDP()
-	}
-}
-
-func (t *TURNLite) readLoopUDP() {
-	buf := make([]byte, 65535)
-	for {
-		select {
-		case <-t.stopCh:
-			return
-		default:
-		}
-		_ = t.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-		n, err := t.conn.Read(buf)
-		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				continue
-			}
-			if isNetworkUnreachable(err) {
-				log.Printf("[TURN-Lite] 读 socket 失效（网络变化），关闭")
-				go t.Close()
-				return
-			}
-			select {
-			case <-t.stopCh:
-				return
-			default:
-			}
-			log.Printf("[TURN-Lite] UDP 读错误: %v", err)
-			return
-		}
-		t.handleIncoming(buf[:n])
-	}
-}
-
-func (t *TURNLite) readLoopTCP() {
-	for {
-		select {
-		case <-t.stopCh:
-			return
-		default:
-		}
-		_ = t.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-		pkt, err := readTCPPacket(t.conn)
-		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				continue
-			}
-			if isNetworkUnreachable(err) {
-				log.Printf("[TURN-Lite] TCP 读 socket 失效（网络变化），关闭")
-				go t.Close()
-				return
-			}
-			select {
-			case <-t.stopCh:
-				return
-			default:
-			}
-			log.Printf("[TURN-Lite] TCP 读错误: %v", err)
-			return
-		}
-		t.handleIncoming(pkt)
-	}
-}
-
-func (t *TURNLite) handleIncoming(data []byte) {
-	if len(data) < 4 {
-		return
-	}
-	if data[0]&0xC0 == 0x40 {
-		return
-	}
-	msg, err := parseSTUNMsg(data)
-	if err != nil {
-		return
-	}
-	switch msg.msgType {
-	case msgDataIndication:
-		peerData := msg.attrs[attrXorPeerAddress]
-		dataPayload := msg.attrs[attrData]
-		if peerData == nil || dataPayload == nil {
-			return
-		}
-		ip, port, err := xorDecodePeer(peerData)
-		if err != nil {
-			return
-		}
-		if t.onMessage != nil {
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						log.Printf("[TURN-Lite] onMessage panic: %v\n%s", r, debug.Stack())
-					}
-				}()
-				t.onMessage(dataPayload, &net.UDPAddr{IP: ip, Port: port})
-			}()
-		}
-	default:
-		t.dispatch(msg)
-	}
-}
-
-// ============ 定时刷新 ============
-
-// refreshLoop 每 60 秒刷新 TURN allocation。
-//
-// 连续失败 3 次主动关闭自己，让上层 turn-reconnect（30 秒周期）
-// 检测到 IsReady()==false 并触发重建。
-//
-// 触发场景：
-//   - TCP transport 下 TURN 服务器 idle 5 分钟断连 → Write 成功但
-//     Read 超时 → 连续失败 → Close → 重建
-//   - UDP transport 下临时网络抖动 → 大概率单次失败自愈，不会到 3 次
-func (t *TURNLite) refreshLoop() {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("[TURN-Lite] refreshLoop panic: %v\n%s", r, debug.Stack())
-		}
-	}()
-
-	consecutiveFails := 0
-
-	ticker := time.NewTicker(turnRefreshInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-t.stopCh:
-			return
-		case <-ticker.C:
-			if !t.IsAlive() {
-				return
-			}
-
-			resp, err := t.sendRequest(msgRefreshRequest, []stunAttr{
-				{typ: attrLifetime, value: uint32ToBytes(turnDefaultLifetime)},
-			}, true)
-			if err != nil {
-				if isNetworkUnreachable(err) {
-					return
-				}
-				consecutiveFails++
-				log.Printf("[TURN-Lite] Refresh 失败 (%d/3): %v", consecutiveFails, err)
-				if consecutiveFails >= 3 {
-					log.Printf("[TURN-Lite] Refresh 连续失败 %d 次，关闭等待重建", consecutiveFails)
-					go t.Close()
-					return
-				}
-				continue
-			}
-
-			// 成功清零计数
-			consecutiveFails = 0
-
-			if resp.msgType == msgRefreshSuccess {
-				continue
-			}
-
-			code := parseErrorCode(resp.attrs[attrErrorCode])
-			if code == 438 {
-				newNonce := resp.attrs[attrNonce]
-				if len(newNonce) > 0 {
-					t.mu.Lock()
-					t.nonce = newNonce
-					t.mu.Unlock()
-					_, err2 := t.sendRequest(msgRefreshRequest, []stunAttr{
-						{typ: attrLifetime, value: uint32ToBytes(turnDefaultLifetime)},
-					}, true)
-					if err2 != nil && !isNetworkUnreachable(err2) {
-						log.Printf("[TURN-Lite] 438 重试失败: %v", err2)
-					}
-				} else {
-					log.Printf("[TURN-Lite] 438 但响应无 nonce")
-				}
-			} else {
-				log.Printf("[TURN-Lite] Refresh 被拒: code=%d", code)
-			}
-		}
-	}
-}
-
-// ============ 查询 / 关闭 ============
-
-func (t *TURNLite) GetRelayAddr() string {
-	if t.relayAddr == nil {
-		return ""
-	}
-	return t.relayAddr.String()
-}
-
-func (t *TURNLite) Close() {
-	t.stopOnce.Do(func() {
-		t.mu.Lock()
-		t.stopped = true
-		t.mu.Unlock()
-		close(t.stopCh)
-	})
-	if t.conn != nil {
-		_ = t.conn.Close()
-	}
-}
-
-func uint32ToBytes(v int) []byte {
-	b := make([]byte, 4)
-	binary.BigEndian.PutUint32(b, uint32(v))
-	return b
-}
-
-func parseErrorCode(data []byte) int {
-	if len(data) < 4 {
-		return 0
-	}
-	return int(data[2]&0x07)*100 + int(data[3])
+export class Room extends DurableObject {
+  private sessions: Map<string, WebSocket> = new Map();
+  private peers: Map<string, PeerRecord> = new Map();
+  private ipToClient: Map<string, string> = new Map();
+  private ipCounter = 2;
+  private community = "";
+  private lastReport = 0;
+  private lastRegistryRefresh = 0;
+  private coordinator: NatHoleCoordinator;
+  private pendingStaggerAt: number | null = null;
+  private saveAlarmScheduled = false;
+  private loadedFromStorage = false;
+  private lastSaveAt = 0;
+  private pendingSaveTimer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor(state: DurableObjectState, env: any) {
+    super(state, env);
+    this.coordinator = new NatHoleCoordinator(env || {});
+  }
+
+  private extractIp(endpoint: string): string {
+    if (!endpoint) return "";
+    const i = endpoint.lastIndexOf(":");
+    if (i < 0) return endpoint;
+    return endpoint.slice(0, i);
+  }
+
+  private extractPort(endpoint: string): number {
+    if (!endpoint) return 0;
+    const i = endpoint.lastIndexOf(":");
+    if (i < 0) return 0;
+    return parseInt(endpoint.slice(i + 1), 10) || 0;
+  }
+
+  private peerPublicAddr(p: PeerRecord): { ip: string; port: number } {
+    if (p.publicEndpoint) {
+      const ip = this.extractIp(p.publicEndpoint);
+      const port = this.extractPort(p.publicEndpoint);
+      if (ip && port > 0) return { ip, port };
+    }
+    if (p.p2pEndpoint) {
+      const ip = this.extractIp(p.p2pEndpoint);
+      const port = this.extractPort(p.p2pEndpoint);
+      if (ip && port > 0) return { ip, port };
+    }
+    return { ip: "", port: 0 };
+  }
+
+  private async ensureLoaded(): Promise<void> {
+    if (this.loadedFromStorage) return;
+    this.loadedFromStorage = true;
+
+    try {
+      const storedCommunity = await this.ctx.storage.get<string>(COMMUNITY_STORAGE_KEY);
+      if (storedCommunity && !this.community) this.community = storedCommunity;
+
+      const storedPeers = await this.ctx.storage.get<Record<string, any>>(PEERS_STORAGE_KEY);
+      if (storedPeers) {
+        const now = Date.now();
+        let restored = 0, removed = 0;
+
+        for (const [id, p] of Object.entries(storedPeers)) {
+          const offlineSince = p.disconnectedAt || p.lastSeen || 0;
+          if (!p.online && now - offlineSince > OFFLINE_TTL_MS) { removed++; continue; }
+          if (p.online && now - (p.lastSeen || 0) > OFFLINE_TTL_MS) { removed++; continue; }
+
+          this.peers.set(id, {
+            clientId: p.clientId || id,
+            mac: p.mac || id,
+            name: p.name || "",
+            virtualIp: p.virtualIp,
+            online: !!p.online,
+            connectedAt: p.connectedAt || now,
+            registeredAt: p.registeredAt || now,
+            lastSeen: p.lastSeen || now,
+            disconnectedAt: p.disconnectedAt,
+            connections: new Map(Object.entries(p.connections || {})),
+            pubSocket: p.pubSocket || "",
+            p2pEndpoint: p.p2pEndpoint || "",
+            publicEndpoint: p.publicEndpoint || "",
+            natType: p.natType || "unknown",
+            portsDifference: p.portsDifference || 0,
+            regularPortsChange: !!p.regularPortsChange,
+            behavior: p.behavior || "",
+            assistedSockets: Array.isArray(p.assistedSockets) ? p.assistedSockets : [],
+            observedRaddr: p.observedRaddr || "",
+            turnRelayAddr: p.turnRelayAddr || "",
+            relayBytesIn: p.relayBytesIn || 0,
+            relayBytesOut: p.relayBytesOut || 0,
+            relayPacketsIn: p.relayPacketsIn || 0,
+            relayPacketsOut: p.relayPacketsOut || 0,
+            _publicIp: p._publicIp || "",
+            multiExit: !!p.multiExit,
+          });
+
+          if (p.virtualIp && p.online) {
+            this.ipToClient.set(p.virtualIp, id);
+            const parts = String(p.virtualIp).split(".");
+            if (parts.length === 4) {
+              const last = parseInt(parts[3], 10);
+              if (!isNaN(last) && last >= this.ipCounter) this.ipCounter = last + 1;
+            }
+          }
+          restored++;
+        }
+        console.log(`[Room] 恢复 ${restored} 个 peer（删 ${removed} 个 stale）`);
+      }
+    } catch (e) {
+      console.error("[Room] ensureLoaded failed:", e);
+    }
+  }
+
+  private async saveStateNow(): Promise<void> {
+    try {
+      const peersData: Record<string, any> = {};
+      for (const [id, p] of this.peers) {
+        peersData[id] = {
+          clientId: p.clientId, mac: p.mac, name: p.name, virtualIp: p.virtualIp,
+          online: p.online, connectedAt: p.connectedAt, registeredAt: p.registeredAt,
+          lastSeen: p.lastSeen, disconnectedAt: p.disconnectedAt,
+          connections: Object.fromEntries(p.connections),
+          pubSocket: p.pubSocket, p2pEndpoint: p.p2pEndpoint, publicEndpoint: p.publicEndpoint,
+          natType: p.natType, portsDifference: p.portsDifference,
+          regularPortsChange: p.regularPortsChange, behavior: p.behavior,
+          assistedSockets: p.assistedSockets, observedRaddr: p.observedRaddr,
+          turnRelayAddr: p.turnRelayAddr, relayBytesIn: p.relayBytesIn,
+          relayBytesOut: p.relayBytesOut, relayPacketsIn: p.relayPacketsIn,
+          relayPacketsOut: p.relayPacketsOut, _publicIp: p._publicIp,
+          multiExit: p.multiExit,
+        };
+      }
+      await this.ctx.storage.put(PEERS_STORAGE_KEY, peersData);
+      if (this.community) await this.ctx.storage.put(COMMUNITY_STORAGE_KEY, this.community);
+      this.lastSaveAt = Date.now();
+    } catch (e) {
+      console.error("[Room] saveStateNow failed:", e);
+    }
+  }
+
+  private saveStateThrottled(): void {
+    const now = Date.now();
+    if (now - this.lastSaveAt >= SAVE_THROTTLE_MS) {
+      this.lastSaveAt = now;
+      this.saveStateNow().catch(() => {});
+      return;
+    }
+    if (this.pendingSaveTimer) return;
+    const delay = SAVE_THROTTLE_MS - (now - this.lastSaveAt);
+    this.pendingSaveTimer = setTimeout(() => {
+      this.pendingSaveTimer = null;
+      this.lastSaveAt = Date.now();
+      this.saveStateNow().catch(() => {});
+    }, delay);
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    await this.ensureLoaded();
+    const url = new URL(request.url);
+
+    if (url.pathname === "/_clear") {
+      const onlinePeers = Array.from(this.peers.values()).filter((p) => p.online);
+      const force = url.searchParams.get("force") === "1";
+      if (onlinePeers.length > 0 && !force) {
+        return new Response(JSON.stringify({
+          error: "Room has online peers",
+          onlineCount: onlinePeers.length,
+          onlinePeers: onlinePeers.map((p) => ({ clientId: p.clientId, name: p.name, virtualIp: p.virtualIp })),
+        }), { status: 409, headers: { "Content-Type": "application/json" } });
+      }
+      for (const [_, ws] of this.sessions) { try { ws.close(1000, "Admin cleanup"); } catch {} }
+      await new Promise((r) => setTimeout(r, 300));
+      this.sessions.clear();
+      this.peers.clear();
+      this.ipToClient.clear();
+      try {
+        this.coordinator = new (this.coordinator as any).constructor(this.env || {});
+      } catch (e) {}
+      try { await this.ctx.storage.deleteAll(); } catch (e) {}
+      this.ipCounter = 2;
+      this.lastSaveAt = 0;
+      return new Response(JSON.stringify({ ok: true, room: this.community }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (url.pathname === "/_kick" && request.method === "POST") {
+      const cid = url.searchParams.get("cid");
+      if (!cid) return new Response(JSON.stringify({ error: "Missing cid" }), { status: 400, headers: { "Content-Type": "application/json" } });
+      const ws = this.sessions.get(cid);
+      const peer = this.peers.get(cid);
+      if (!ws && !peer) return new Response(JSON.stringify({ error: "Peer not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
+      if (ws) { try { ws.close(1000, "Admin kicked"); } catch {} }
+      if (peer) {
+        peer.online = false;
+        peer.disconnectedAt = Date.now();
+        peer.connections = new Map();
+        peer.pubSocket = "";
+        peer.p2pEndpoint = "";
+        peer.publicEndpoint = "";
+      }
+      this.sessions.delete(cid);
+      if (peer?.virtualIp) this.ipToClient.delete(peer.virtualIp);
+      this.coordinator.clearPairStateFor(cid);
+      this.broadcast(cid, { type: "left", from: cid });
+      await this.reportToRegistry(true);
+      await this.saveStateNow();
+      return new Response(JSON.stringify({ ok: true, kicked: cid }), { headers: { "Content-Type": "application/json" } });
+    }
+
+    if (url.pathname === "/_status") {
+      const publicOnly = url.searchParams.get("public") === "1";
+      const communityParam = url.searchParams.get("community");
+      if (communityParam && !this.community) this.community = communityParam;
+      return this.getStatusResponse(publicOnly);
+    }
+
+    if (url.pathname === "/_nathole") {
+      const communityParam = url.searchParams.get("community");
+      if (communityParam && !this.community) this.community = communityParam;
+      return this.getNatHoleStatusResponse();
+    }
+
+    const upgrade = request.headers.get("Upgrade");
+    if (upgrade !== "websocket") return new Response("Expected WebSocket", { status: 426 });
+
+    const clientId = url.searchParams.get("cid") || crypto.randomUUID();
+    this.community = url.pathname.split("/")[2] || "default";
+
+    const publicIp =
+      request.headers.get("cf-connecting-ip") ||
+      request.headers.get("x-real-ip") ||
+      request.headers.get("x-forwarded-for")?.split(",")[0].trim() ||
+      "";
+
+    this.closeDuplicate(clientId);
+
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    (this.ctx as any).acceptWebSocket(server);
+
+    const now = Date.now();
+    try { await this.ctx.storage.put(COMMUNITY_STORAGE_KEY, this.community); } catch {}
+
+    const onlinePeersForClient = Array.from(this.peers.values())
+      .filter((p) => p.online && p.clientId !== clientId)
+      .map((p) => {
+        const addr = this.peerPublicAddr(p);
+        return {
+          id: p.clientId,
+          virtualIp: p.virtualIp,
+          publicIp: addr.ip,
+          publicPort: addr.port,
+          natType: p.natType || "unknown",
+          turnRelayAddr: p.turnRelayAddr || "",
+          assistedEndpoints: p.assistedSockets || [],
+        };
+      });
+
+    let peer = this.peers.get(clientId);
+    if (peer) {
+      this.coordinator.clearPairStateFor(clientId);
+      peer.online = true;
+      peer.connectedAt = now;
+      peer.lastSeen = now;
+      peer.disconnectedAt = undefined;
+      peer._publicIp = publicIp;
+    } else {
+      peer = {
+        clientId, mac: clientId, name: "",
+        virtualIp: this.allocateIp(),
+        online: true, connectedAt: now, registeredAt: now, lastSeen: now,
+        connections: new Map(),
+        pubSocket: "", p2pEndpoint: "", publicEndpoint: "",
+        natType: "unknown", portsDifference: 0, regularPortsChange: false,
+        behavior: "BehaviorPortChanged", assistedSockets: [], observedRaddr: "",
+        turnRelayAddr: "", relayBytesIn: 0, relayBytesOut: 0, relayPacketsIn: 0, relayPacketsOut: 0,
+        _publicIp: publicIp,
+        multiExit: false,
+      };
+      this.peers.set(clientId, peer);
+    }
+    this.ipToClient.set(peer.virtualIp, clientId);
+    this.sessions.set(clientId, server);
+
+    await this.reportToRegistry(true);
+    await this.setupSaveAlarm();
+    await this.saveStateNow();
+
+    server.send(JSON.stringify({
+      type: "ready", from: clientId,
+      payload: {
+        id: clientId,
+        virtualIp: peer.virtualIp,
+        yourPublicIp: publicIp,
+        peers: onlinePeersForClient,
+      },
+    }));
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (typeof message === "string") await this.handleControl(ws, message);
+    else await this.handleBinary(ws, message);
+  }
+
+  private async handleControl(ws: WebSocket, message: string): Promise<void> {
+    let msg: any;
+    try { msg = JSON.parse(message); } catch { return; }
+    const from = this.findClientId(ws);
+    if (!from) return;
+    const peer = this.peers.get(from);
+    if (peer) peer.lastSeen = Date.now();
+
+    switch (msg.type) {
+      case "ping":
+        try { ws.send(JSON.stringify({ type: "pong", from, t: msg.ts || Date.now() })); } catch {}
+        return;
+
+      case "connection_status":
+        if (peer) peer.connections = new Map(Object.entries(msg.payload?.connections || {}));
+        return;
+
+      case "p2p_metadata":
+        if (peer) {
+          const p = msg.payload || {};
+          if (typeof p.name === "string" && p.name) peer.name = p.name;
+          peer.natType = p.natType || peer.natType;
+          peer.portsDifference = p.portsDifference || 0;
+          peer.regularPortsChange = !!p.regularPortsChange;
+          peer.behavior = p.behavior || peer.behavior;
+
+          // assistedEndpoints（新协议）；兼容旧字段 assistedSockets
+          if (Array.isArray(p.assistedEndpoints)) {
+            peer.assistedSockets = p.assistedEndpoints.filter(
+              (s: any) => typeof s === "string" && s
+            );
+          } else if (Array.isArray(p.assistedSockets)) {
+            peer.assistedSockets = p.assistedSockets.filter(
+              (s: any) => typeof s === "string" && s
+            );
+          }
+
+          if (typeof p.p2pEndpoint === "string" && p.p2pEndpoint) peer.p2pEndpoint = p.p2pEndpoint;
+
+          const publicEndpoint = typeof p.publicEndpoint === "string" ? p.publicEndpoint : "";
+          if (publicEndpoint && publicEndpoint !== "") {
+            // ★ 检测 pubSocket 变化 → 清空该 peer 的打洞状态
+            const oldPubSocket = peer.pubSocket;
+            if (oldPubSocket && oldPubSocket !== publicEndpoint) {
+              this.coordinator.clearPairStateFor(from);
+              console.log(`[Room] ${from} pubSocket 变化: ${oldPubSocket} → ${publicEndpoint}，清空打洞状态`);
+            }
+            peer.publicEndpoint = publicEndpoint;
+            peer.pubSocket = publicEndpoint;
+          } else {
+            if (!peer.publicEndpoint) peer.pubSocket = "";
+          }
+
+          if (typeof p.multiExit === "boolean") peer.multiExit = p.multiExit;
+
+          this.saveStateThrottled();
+
+          const addr = this.peerPublicAddr(peer);
+          console.log(
+            `[Room] p2p_metadata from ${from}: natType=${peer.natType} ` +
+            `pub=${addr.ip}:${addr.port} (pubSocket=${peer.pubSocket || "<empty>"}) ` +
+            `multiExit=${peer.multiExit || false} assisted=${peer.assistedSockets.length}`
+          );
+
+          this.broadcast(from, {
+            type: "joined", from,
+            payload: {
+              id: from,
+              virtualIp: peer.virtualIp,
+              publicIp: addr.ip,
+              publicPort: addr.port,
+              natType: peer.natType || "unknown",
+              turnRelayAddr: peer.turnRelayAddr || "",
+              assistedEndpoints: peer.assistedSockets || [],
+            },
+          });
+        }
+        await this.runCoordination();
+        await this.setupSaveAlarm();
+        return;
+
+      case "p2p_state_info":
+        if (peer && msg.payload && Array.isArray(msg.payload.to)) {
+          for (const t of msg.payload.to) {
+            if (!t || !t.macAddr) continue;
+            if (t.observedRaddr) {
+              const target = this.peers.get(t.macAddr);
+              if (target) target.observedRaddr = t.observedRaddr;
+            }
+            if (t.punchResult && t.punchResultPeerMac) {
+              const selfStatus = typeof t.p2pStatus === "number" ? t.p2pStatus : 0;
+              this.coordinator.recordPunchResult(
+                from,
+                t.punchResultPeerMac,
+                t.punchResult,
+                selfStatus
+              );
+            }
+          }
+        }
+        await this.runCoordination();
+        await this.setupSaveAlarm();
+        return;
+
+      case "turn_relay_info": {
+        if (!peer) return;
+        const relayAddr = msg.relayAddr || "";
+        if (!relayAddr) return;
+        peer.turnRelayAddr = relayAddr;
+        this.saveStateThrottled();
+        for (const [id, p] of this.peers) {
+          if (id === from || !p.online) continue;
+          const targetWs = this.sessions.get(id);
+          if (!targetWs) continue;
+          try { targetWs.send(JSON.stringify({ type: "turn_peer_info", edgeMac: from, relayAddr })); } catch {}
+        }
+        return;
+      }
+
+      default:
+        if (msg.to) {
+          const target = this.sessions.get(msg.to);
+          if (target) target.send(JSON.stringify({ ...msg, from }));
+        } else {
+          this.broadcast(from, { ...msg, from });
+        }
+    }
+  }
+
+  private async handleBinary(ws: WebSocket, message: ArrayBuffer | Blob): Promise<void> {
+    let buffer: ArrayBuffer;
+    if (message instanceof ArrayBuffer) buffer = message;
+    else buffer = await (message as Blob).arrayBuffer();
+
+    const data = new Uint8Array(buffer);
+    if (data.length < 20) return;
+    if (data[0] >> 4 !== 4) return;
+    if (data[16] !== 10 || data[17] !== 64 || data[18] !== 0) return;
+
+    const from = this.findClientId(ws);
+    if (!from) return;
+    const dstIp = `${data[16]}.${data[17]}.${data[18]}.${data[19]}`;
+    const targetClientId = this.ipToClient.get(dstIp);
+    if (!targetClientId) return;
+    const targetWs = this.sessions.get(targetClientId);
+    if (!targetWs) return;
+
+    try {
+      targetWs.send(buffer);
+      const fromPeer = this.peers.get(from);
+      const toPeer = this.peers.get(targetClientId);
+      if (fromPeer) { fromPeer.relayBytesOut += data.length; fromPeer.relayPacketsOut += 1; }
+      if (toPeer) { toPeer.relayBytesIn += data.length; toPeer.relayPacketsIn += 1; }
+    } catch {}
+  }
+
+  async webSocketClose(ws: WebSocket): Promise<void> {
+    const clientId = this.findClientId(ws);
+    if (clientId) {
+      const peer = this.peers.get(clientId);
+      if (peer) {
+        peer.online = false;
+        peer.disconnectedAt = Date.now();
+        peer.connections = new Map();
+        peer.pubSocket = "";
+        peer.p2pEndpoint = "";
+        peer.publicEndpoint = "";
+      }
+      this.sessions.delete(clientId);
+      if (peer?.virtualIp) this.ipToClient.delete(peer.virtualIp);
+      this.coordinator.clearPairStateFor(clientId);
+      this.broadcast(clientId, { type: "left", from: clientId });
+      await this.reportToRegistry(true);
+      await this.saveStateNow();
+    }
+  }
+
+  async webSocketError(ws: WebSocket): Promise<void> {
+    await this.webSocketClose(ws);
+  }
+
+  private async runCoordination(): Promise<void> {
+    const onlinePeers = Array.from(this.peers.values()).filter((p) => p.online);
+    if (onlinePeers.length < 2) return;
+
+    const community = { getOnlinePeers: () => onlinePeers };
+    const { instructions, forceFallbacks } = this.coordinator.coordinate(community);
+
+    if (forceFallbacks && forceFallbacks.size > 0) {
+      for (const [mac, peers] of forceFallbacks) {
+        const targetWs = this.sessions.get(mac);
+        if (!targetWs) continue;
+        const peerList = Array.from(peers);
+        try {
+          targetWs.send(JSON.stringify({
+            type: "force_fallback",
+            from: "server",
+            payload: { peers: peerList, reason: "server-forced" },
+          }));
+          console.log(`[Room] → ${mac} 下发 force_fallback (${peerList.length} peers)`);
+        } catch (e) {
+          console.error(`[Room] force_fallback 发送失败:`, e);
+        }
+      }
+    }
+
+    if (instructions.size === 0) return;
+    for (const [mac, instr] of instructions) {
+      const targetWs = this.sessions.get(mac);
+      if (!targetWs) continue;
+      try {
+        targetWs.send(JSON.stringify({
+          type: "nat_hole_instruction",
+          from: "server",
+          payload: instr,
+        }));
+        console.log(`[Room] → ${mac} 下发 nat_hole_instruction role=${instr.role} target=${instr.targetPubSocket}`);
+      } catch (e) {
+        console.error(`[Room] 发送给 ${mac} 失败:`, e);
+      }
+    }
+  }
+
+  private getStatusResponse(publicOnly = false): Response {
+    const now = Date.now();
+    const sortedPeers = Array.from(this.peers.values()).sort((a, b) => a.registeredAt - b.registeredAt);
+    const codeMap = new Map<string, string>();
+    sortedPeers.forEach((p, idx) => codeMap.set(p.clientId, idxToCode(idx)));
+
+    let onlineCnt = 0, offlineCnt = 0;
+    for (const p of this.peers.values()) { if (p.online) onlineCnt++; else offlineCnt++; }
+
+    const peers = sortedPeers.map((p) => {
+      const code = codeMap.get(p.clientId)!;
+      const connectionsByCode: Record<string, string> = {};
+      for (const [cid, type] of p.connections) {
+        const targetCode = codeMap.get(cid);
+        if (targetCode) connectionsByCode[targetCode] = type;
+      }
+      let p2pCount = 0, relayCount = 0, turnCount = 0;
+      for (const t of p.connections.values()) {
+        if (t === "p2p") p2pCount++;
+        else if (t === "relay") relayCount++;
+        else if (t === "turn") turnCount++;
+      }
+      const relayBytesIn = p.relayBytesIn, relayBytesOut = p.relayBytesOut;
+
+      if (publicOnly) {
+        return {
+          code, virtualIp: p.online ? p.virtualIp : "",
+          online: p.online,
+          onlineFor: now - p.connectedAt,
+          offlineFor: p.online ? 0 : (p.disconnectedAt ? now - p.disconnectedAt : 0),
+          idleFor: now - p.lastSeen,
+          p2pCount, relayCount, turnCount,
+          connectionsTotal: p2pCount + relayCount + turnCount,
+          connections: connectionsByCode,
+          natType: p.natType || "unknown",
+          relayBytesIn, relayBytesOut, relayBytesTotal: relayBytesIn + relayBytesOut,
+        };
+      }
+
+      return {
+        code, clientId: p.clientId, name: p.name,
+        virtualIp: p.online ? p.virtualIp : "",
+        publicIp: p._publicIp || "",
+        pubSocket: p.pubSocket, p2pEndpoint: p.p2pEndpoint, publicEndpoint: p.publicEndpoint,
+        turnRelayAddr: p.turnRelayAddr, natType: p.natType,
+        multiExit: !!p.multiExit,
+        assistedSockets: p.assistedSockets || [],
+        online: p.online, connectedAt: p.connectedAt, lastSeen: p.lastSeen, disconnectedAt: p.disconnectedAt,
+        onlineFor: now - p.connectedAt,
+        offlineFor: p.online ? 0 : (p.disconnectedAt ? now - p.disconnectedAt : 0),
+        idleFor: now - p.lastSeen,
+        connections: connectionsByCode,
+        p2pCount, relayCount, turnCount,
+        relayBytesIn, relayBytesOut,
+        relayPacketsIn: p.relayPacketsIn, relayPacketsOut: p.relayPacketsOut,
+      };
+    });
+
+    return new Response(JSON.stringify({
+      community: this.community,
+      peerCount: peers.length,
+      onlineCount: onlineCnt,
+      offlineCount: offlineCnt,
+      peers, timestamp: now, publicOnly,
+    }), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+  }
+
+  private getNatHoleStatusResponse(): Response {
+    const c = this.coordinator as any;
+    const now = Date.now();
+    const backoff: any[] = [];
+    for (const [k, v] of c.backoff) {
+      backoff.push({ pair: k, signature: v.signature, remainingMs: Math.max(0, v.nextAllowedAt - now), staggered: !!v.staggered });
+    }
+    const punch: any[] = [];
+    for (const [k, v] of c.punchState) {
+      punch.push({
+        pair: k,
+        aState: v.aState, bState: v.bState,
+        aAttempts: v.aAttempts, bAttempts: v.bAttempts,
+        aP2PStatus: v.aP2PStatus,
+        bP2PStatus: v.bP2PStatus,
+        everValidated: !!v.everValidated,
+        behaviorIndex: v.behaviorIndex,
+        ageMs: now - v.at,
+      });
+    }
+    const inflight: any[] = [];
+    for (const [k, v] of c.inFlight) {
+      inflight.push({
+        pair: k, rung: v.rung, signature: v.signature,
+        ageMs: now - v.at,
+      });
+    }
+    return new Response(JSON.stringify({ now, backoff, punch, inflight }, null, 2), {
+      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+    });
+  }
+
+  private async setupSaveAlarm(): Promise<void> {
+    let wakeAt = Date.now() + STAGGER_FALLBACK_SAVE_MS;
+    const coordAt = this.coordinator.nextWakeDeadline();
+    if (coordAt != null && coordAt < wakeAt) wakeAt = coordAt;
+    await this.ctx.storage.setAlarm(wakeAt);
+    this.saveAlarmScheduled = true;
+  }
+
+  async alarm(): Promise<void> {
+    const pending = this.pendingStaggerAt;
+    this.pendingStaggerAt = null;
+    try {
+      await this.ensureLoaded();
+      const now = Date.now();
+      let purged = 0;
+      for (const [id, p] of this.peers) {
+        if (!p.online && p.disconnectedAt && now - p.disconnectedAt > OFFLINE_TTL_MS) {
+          if (p.virtualIp) this.ipToClient.delete(p.virtualIp);
+          this.peers.delete(id);
+          purged++;
+        }
+      }
+      await this.runCoordination();
+      await this.setupSaveAlarm();
+      await this.saveStateNow();
+      if (onlineCount(this.peers) > 0) {
+        if (now - this.lastRegistryRefresh >= REGISTRY_REFRESH_MS) {
+          this.lastRegistryRefresh = now;
+          await this.reportToRegistry(true);
+        }
+      }
+    } catch (e) {
+      console.error("[Alarm] failed:", e);
+      if (pending != null && this.pendingStaggerAt == null) this.pendingStaggerAt = pending;
+      try { await this.setupSaveAlarm(); } catch {}
+    }
+  }
+
+  private findClientId(ws: WebSocket): string | undefined {
+    for (const [id, socket] of this.sessions) if (socket === ws) return id;
+    return undefined;
+  }
+
+  private closeDuplicate(clientId: string) {
+    const existing = this.sessions.get(clientId);
+    if (existing) {
+      try { existing.close(1000, "Duplicate connection replaced"); } catch {}
+      this.sessions.delete(clientId);
+    }
+  }
+
+  private broadcast(senderId: string, msg: any) {
+    const data = JSON.stringify(msg);
+    for (const [id, socket] of this.sessions) {
+      if (id !== senderId) {
+        try { socket.send(data); } catch {}
+      }
+    }
+  }
+
+  private allocateIp(): string {
+    for (let i = 0; i < 254; i++) {
+      const ip = `10.64.0.${this.ipCounter}`;
+      this.ipCounter++;
+      if (this.ipCounter > 254) this.ipCounter = 2;
+      if (!this.ipToClient.has(ip)) return ip;
+    }
+    throw new Error("IP pool exhausted");
+  }
+
+  private async reportToRegistry(force = false): Promise<void> {
+    const now = Date.now();
+    if (!force && now - this.lastReport < 5000) return;
+    this.lastReport = now;
+    try {
+      const env = this.env as any;
+      const reg = env.REGISTRY.get(env.REGISTRY.idFromName("global"));
+      await reg.fetch(new Request("http://internal/register", {
+        method: "POST",
+        body: JSON.stringify({
+          roomName: this.community,
+          peerCount: this.peers.size,
+          onlineCount: onlineCount(this.peers),
+          offlineCount: this.peers.size - onlineCount(this.peers),
+        }),
+      }));
+    } catch {}
+  }
 }
