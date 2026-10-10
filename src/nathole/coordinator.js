@@ -244,11 +244,11 @@ export class NatHoleCoordinator {
     return earliest;
   }
 
-  // ============ 简化版 coordinate ============
+  // ============ coordinate ============
   //
-  // 只做最基本的事：给每对 peer 下发打洞指令。
-  // 不再判断：跨 ISP / NAT 类型 / LAN / 同 STUN IP。
-  // 客户端自己根据 targetPubSocket + 本机 STUN 结果决定扫描范围。
+  // 只做基础调度：选 rung、退避、去重、InProgress 刷新。
+  // 所有场景判断（同/异 STUN IP、端口差、全端口扫描）都由客户端
+  // 根据 targetPubSocket + 本机 natMeta.PublicEndpoint 决定。
   coordinate(community) {
     const instructions = new Map();
     const forceFallbacks = new Map();
@@ -401,7 +401,7 @@ export class NatHoleCoordinator {
         const senderBeh = behavior.sender || {};
         const receiverBeh = behavior.receiver || {};
 
-        // 下发的 range 只是兼容旧客户端的兜底，新客户端忽略。
+        // 兜底下发（客户端忽略，只是兼容旧版）
         const senderRangeFrom = Math.max(1, bPort - 10000);
         const senderRangeTo = Math.min(65535, bPort + 10000);
         const receiverRangeFrom = Math.max(1, aPort - 10000);
@@ -415,12 +415,10 @@ export class NatHoleCoordinator {
           senderPubSocket: sender.pubSocket || "",
           senderNatType: senderFeature.natType,
           senderBehavior: senderFeature.behavior,
-          senderAssistedEndpoints: sender.assistedSockets || [],
           receiverMac: receiverKey,
           receiverP2pEndpoint: receiver.p2pEndpoint || "",
           receiverPubSocket: receiver.pubSocket || "",
           receiverNatType: receiverFeature.natType,
-          receiverAssistedEndpoints: receiver.assistedSockets || [],
           portsDifference: 0,
           regularPortsChange: false,
         };
@@ -434,8 +432,6 @@ export class NatHoleCoordinator {
           targetMac: receiverKey,
           targetVirtualIp: receiver.virtualIp,
           targetPubSocket: receiver.pubSocket || "",
-          targetAssistedEndpoints: receiver.assistedSockets || [],
-          targetLanEndpoints: [],
           ...shared,
         };
 
@@ -448,8 +444,6 @@ export class NatHoleCoordinator {
           targetMac: senderKey,
           targetVirtualIp: sender.virtualIp,
           targetPubSocket: sender.pubSocket || "",
-          targetAssistedEndpoints: sender.assistedSockets || [],
-          targetLanEndpoints: [],
           ...shared,
         };
 
