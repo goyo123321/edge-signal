@@ -60,10 +60,10 @@ function isIPv6Sock(sock) {
   return colonCount > 1;
 }
 
-// 修复：只有两端都 state=3 才走"退役成功"逻辑
+// ★ anySucceeded：任一端成功过即可进入退役判定
 function shouldRetireSuccess(prev, a, b, now) {
   if (!prev) return false;
-  if (prev.aState !== 3 || prev.bState !== 3) return false;
+  if (prev.aState !== 3 && prev.bState !== 3) return false;
   if (now - (prev.at || 0) < SUCCESS_GRACE_MS) return false;
 
   const keyOf = (p) => p.clientId || p.mac || "";
@@ -271,12 +271,12 @@ export class NatHoleCoordinator {
 
         const key = pairKeyFor(aKey, bKey);
 
-        // 修复：只有两端都 state=3 才跳过协调。
+        // ★ 一边成功就停：客户端只有在「收到对端 probe 并回 5 轮」后才上报，
+        //   任一端 state=3 即代表双向通道已建立。CGNAT hairpin 是双向的。
         const prevPunch = this.punchState.get(key);
-        const bothSucceeded = prevPunch &&
-          prevPunch.aState === 3 &&
-          prevPunch.bState === 3;
-        if (bothSucceeded) {
+        const anySucceeded = prevPunch &&
+          (prevPunch.aState === 3 || prevPunch.bState === 3);
+        if (anySucceeded) {
           if (shouldRetireSuccess(prevPunch, a, b, now)) {
             this.punchState.delete(key);
             this.failCounts.delete(key);
