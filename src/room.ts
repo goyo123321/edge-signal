@@ -29,8 +29,6 @@ interface PeerRecord {
   relayPacketsIn: number;
   relayPacketsOut: number;
   _publicIp?: string;
-  lanIps?: string[];
-  lanPort?: number;
   multiExit?: boolean;
 }
 
@@ -147,8 +145,6 @@ export class Room extends DurableObject {
             relayPacketsIn: p.relayPacketsIn || 0,
             relayPacketsOut: p.relayPacketsOut || 0,
             _publicIp: p._publicIp || "",
-            lanIps: Array.isArray(p.lanIps) ? p.lanIps : [],
-            lanPort: p.lanPort || 0,
             multiExit: !!p.multiExit,
           });
 
@@ -185,7 +181,7 @@ export class Room extends DurableObject {
           turnRelayAddr: p.turnRelayAddr, relayBytesIn: p.relayBytesIn,
           relayBytesOut: p.relayBytesOut, relayPacketsIn: p.relayPacketsIn,
           relayPacketsOut: p.relayPacketsOut, _publicIp: p._publicIp,
-          lanIps: p.lanIps, lanPort: p.lanPort, multiExit: p.multiExit,
+          multiExit: p.multiExit,
         };
       }
       await this.ctx.storage.put(PEERS_STORAGE_KEY, peersData);
@@ -333,7 +329,7 @@ export class Room extends DurableObject {
         behavior: "BehaviorPortChanged", assistedSockets: [], observedRaddr: "",
         turnRelayAddr: "", relayBytesIn: 0, relayBytesOut: 0, relayPacketsIn: 0, relayPacketsOut: 0,
         _publicIp: publicIp,
-        lanIps: [], lanPort: 0, multiExit: false,
+        multiExit: false,
       };
       this.peers.set(clientId, peer);
     }
@@ -398,10 +394,6 @@ export class Room extends DurableObject {
             if (!peer.publicEndpoint) peer.pubSocket = "";
           }
 
-          if (Array.isArray(p.lanIps)) {
-            peer.lanIps = p.lanIps.filter((s: any) => typeof s === "string" && s);
-          }
-          if (typeof p.udpPort === "number" && p.udpPort > 0) peer.lanPort = p.udpPort;
           if (typeof p.multiExit === "boolean") peer.multiExit = p.multiExit;
 
           this.saveStateThrottled();
@@ -410,7 +402,6 @@ export class Room extends DurableObject {
           console.log(
             `[Room] p2p_metadata from ${from}: natType=${peer.natType} ` +
             `pub=${addr.ip}:${addr.port} (pubSocket=${peer.pubSocket || "<empty>"}) ` +
-            `lanIps=${JSON.stringify(peer.lanIps || [])} lanPort=${peer.lanPort || 0} ` +
             `multiExit=${peer.multiExit || false}`
           );
 
@@ -537,7 +528,6 @@ export class Room extends DurableObject {
     const community = { getOnlinePeers: () => onlinePeers };
     const { instructions, forceFallbacks } = this.coordinator.coordinate(community);
 
-    // ★ 下发 force_fallback（同 CGNAT IP 场景）
     if (forceFallbacks && forceFallbacks.size > 0) {
       for (const [mac, peers] of forceFallbacks) {
         const targetWs = this.sessions.get(mac);
@@ -547,7 +537,7 @@ export class Room extends DurableObject {
           targetWs.send(JSON.stringify({
             type: "force_fallback",
             from: "server",
-            payload: { peers: peerList, reason: "same-cgnat-ip" },
+            payload: { peers: peerList, reason: "server-forced" },
           }));
           console.log(`[Room] → ${mac} 下发 force_fallback (${peerList.length} peers)`);
         } catch (e) {
@@ -618,7 +608,6 @@ export class Room extends DurableObject {
         publicIp: p._publicIp || "",
         pubSocket: p.pubSocket, p2pEndpoint: p.p2pEndpoint, publicEndpoint: p.publicEndpoint,
         turnRelayAddr: p.turnRelayAddr, natType: p.natType,
-        lanIps: p.lanIps || [], lanPort: p.lanPort || 0,
         multiExit: !!p.multiExit,
         online: p.online, connectedAt: p.connectedAt, lastSeen: p.lastSeen, disconnectedAt: p.disconnectedAt,
         onlineFor: now - p.connectedAt,
