@@ -60,9 +60,10 @@ function isIPv6Sock(sock) {
   return colonCount > 1;
 }
 
+// 修复：只有两端都 state=3 才走"退役成功"逻辑
 function shouldRetireSuccess(prev, a, b, now) {
   if (!prev) return false;
-  if (prev.aState !== 3 && prev.bState !== 3) return false;
+  if (prev.aState !== 3 || prev.bState !== 3) return false;
   if (now - (prev.at || 0) < SUCCESS_GRACE_MS) return false;
 
   const keyOf = (p) => p.clientId || p.mac || "";
@@ -244,11 +245,6 @@ export class NatHoleCoordinator {
     return earliest;
   }
 
-  // ============ coordinate ============
-  //
-  // 只做基础调度：选 rung、退避、去重、InProgress 刷新。
-  // 所有场景判断（同/异 STUN IP、端口差、全端口扫描）都由客户端
-  // 根据 targetPubSocket + 本机 natMeta.PublicEndpoint 决定。
   coordinate(community) {
     const instructions = new Map();
     const forceFallbacks = new Map();
@@ -275,9 +271,12 @@ export class NatHoleCoordinator {
 
         const key = pairKeyFor(aKey, bKey);
 
-        // 已有 P2P 成功记录 → 检查是否过期
+        // 修复：只有两端都 state=3 才跳过协调。
         const prevPunch = this.punchState.get(key);
-        if (prevPunch && (prevPunch.aState === 3 || prevPunch.bState === 3)) {
+        const bothSucceeded = prevPunch &&
+          prevPunch.aState === 3 &&
+          prevPunch.bState === 3;
+        if (bothSucceeded) {
           if (shouldRetireSuccess(prevPunch, a, b, now)) {
             this.punchState.delete(key);
             this.failCounts.delete(key);
@@ -295,7 +294,6 @@ export class NatHoleCoordinator {
 
         if (!a.pubSocket || !b.pubSocket) continue;
 
-        // 端口为 0 视为无效
         if (parsePort(a.pubSocket) <= 0 || parsePort(b.pubSocket) <= 0) {
           console.log(
             `[NAT] ${key} 跳过：pubSocket 端口无效 ` +
@@ -401,7 +399,6 @@ export class NatHoleCoordinator {
         const senderBeh = behavior.sender || {};
         const receiverBeh = behavior.receiver || {};
 
-        // 兜底下发（客户端忽略，只是兼容旧版）
         const senderRangeFrom = Math.max(1, bPort - 10000);
         const senderRangeTo = Math.min(65535, bPort + 10000);
         const receiverRangeFrom = Math.max(1, aPort - 10000);
