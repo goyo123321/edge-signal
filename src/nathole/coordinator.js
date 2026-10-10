@@ -404,6 +404,7 @@ export class NatHoleCoordinator {
         const receiverRangeFrom = Math.max(1, aPort - 10000);
         const receiverRangeTo = Math.min(65535, aPort + 10000);
 
+        // ★ 带上 assistedEndpoints
         const shared = {
           mode,
           behaviorIndex: rung,
@@ -412,10 +413,12 @@ export class NatHoleCoordinator {
           senderPubSocket: sender.pubSocket || "",
           senderNatType: senderFeature.natType,
           senderBehavior: senderFeature.behavior,
+          senderAssistedEndpoints: sender.assistedSockets || [],
           receiverMac: receiverKey,
           receiverP2pEndpoint: receiver.p2pEndpoint || "",
           receiverPubSocket: receiver.pubSocket || "",
           receiverNatType: receiverFeature.natType,
+          receiverAssistedEndpoints: receiver.assistedSockets || [],
           portsDifference: 0,
           regularPortsChange: false,
         };
@@ -429,6 +432,7 @@ export class NatHoleCoordinator {
           targetMac: receiverKey,
           targetVirtualIp: receiver.virtualIp,
           targetPubSocket: receiver.pubSocket || "",
+          targetAssistedEndpoints: receiver.assistedSockets || [],
           ...shared,
         };
 
@@ -441,6 +445,7 @@ export class NatHoleCoordinator {
           targetMac: senderKey,
           targetVirtualIp: sender.virtualIp,
           targetPubSocket: sender.pubSocket || "",
+          targetAssistedEndpoints: sender.assistedSockets || [],
           ...shared,
         };
 
@@ -474,7 +479,8 @@ export class NatHoleCoordinator {
 
         console.log(
           `[NAT] ${key} 生成指令 (rung ${rung}), ` +
-          `sender=${sender.pubSocket} receiver=${receiver.pubSocket}`
+          `sender=${sender.pubSocket} receiver=${receiver.pubSocket} ` +
+          `assisted(s=${(sender.assistedSockets || []).length},r=${(receiver.assistedSockets || []).length})`
         );
 
         break;
