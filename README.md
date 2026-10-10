@@ -9,9 +9,9 @@
 - **零运维** — 无需自建服务器，部署到 Cloudflare 即可
 - **全球加速** — 利用 Cloudflare Anycast 网络，就近接入
 - **P2P 打洞** — 移植 FRP 行为阶梯，提升打洞成功率
-- **四级降级** — `LAN → P2P → TURN → WS`，保证连接永远可用
-- **同 CGNAT 处理** — 同 STUN 出口 IP + 同 LAN 网段时走 LAN 直连；首次允许 hairpin 尝试
-- **强制降级** — 同 STUN IP 且 LAN 无交集时下发 `force_fallback` 指令
+- **三级降级** — `P2P → TURN → WS`，保证连接永远可用
+- **同 CGNAT 处理** — 同 STUN 出口 IP 时首次允许 hairpin 尝试，失败后强制降级
+- **强制降级** — 同 STUN IP 时下发 `force_fallback` 指令
 - **动态端口范围** — 扫描范围按两端端口差动态计算（客户端逐级递增：3→10→20→30→60→100）
 - **TURN 中继** — 集成 Cloudflare TURN 或自定义 TURN，减少 Worker 消耗
 - **双面板** — 公开面板 + 管理面板（Token 保护）
@@ -37,16 +37,13 @@
    │   └─ 中继转发（最后兜底）           │
    └────────────────────────────────────┘
             │
-            ├─ 优先级 1: LAN 直连（同子网）
+            ├─ 优先级 1: P2P 直连（含 CGNAT hairpin）
             │  Edge A ←──────────────→ Edge B
             │
-            ├─ 优先级 2: P2P 直连（含 CGNAT hairpin）
-            │  Edge A ←──────────────→ Edge B
-            │
-            ├─ 优先级 3: TURN 中继（不消耗 Worker）
+            ├─ 优先级 2: TURN 中继（不消耗 Worker）
             │  Edge A ──→ TURN ──→ Edge B
             │
-            └─ 优先级 4: WebSocket 中继（最后兜底）
+            └─ 优先级 3: WebSocket 中继（最后兜底）
                Edge A ──→ Worker ──→ Edge B
 ```
 
@@ -199,7 +196,7 @@ npx wrangler secret put CONNECT_TOKEN
 
 ## 📡 TURN 中继配置
 
-TURN 是四级降级的第三级，**打洞失败时优先走 TURN**（不消耗 Worker 配额）。
+TURN 是三级降级的第二级，**打洞失败时优先走 TURN**（不消耗 Worker 配额）。
 
 ### 方式 1：Cloudflare TURN（推荐，1000GB/月免费）
 
@@ -434,39 +431,27 @@ edge-signal/
 | **in-flight 去重** | 派发后写入 in-flight 表，10s 内不重复派发 |
 | **InProgress 刷新** | 客户端收到指令立即上报 InProgress，服务端刷新 in-flight 窗口，覆盖 `sendDelayMs` 期间 |
 | **首次交叉校验** | 首次成功时校验客户端自报的 `p2pStatus`；通过后 `everValidated=true`，后续成功不再校验 |
-| **成功退役** | 双方都不在 P2P 且超过 30s 宽限期时，清空成功记录，重新协调 |
+| **成功退役** | **双方**都不在 P2P 且超过 30s 宽限期时，清空成功记录，重新协调 |
 | **退避上限** | 60s（不是 300s，避免无意义的等待） |
 | **失败惩罚** | -2（与成功 +2 对称） |
 | **tie-break** | rung 0 > rung 4/5 > 其他 |
 
 ### 同 CGNAT 场景处理
 
-**关键问题**：两端 STUN 出口 IP 相同时（同 CGNAT 后面的两个映射），hairpin NAT 大部分运营商不支持，但仍有一小部分支持。需要区分三种情况：
+**关键问题**：两端 STUN 出口 IP 相同时（同 CGNAT 后面的两个映射），hairpin NAT 大部分运营商不支持，但仍有一小部分支持。需要区分两种情况：
 
 | 场景 | 处理 |
 |:---|:---|
-| **同 STUN IP + LAN 同网段** | 走 LAN 直连（正常下发打洞指令，客户端优先尝试 `targetLanEndpoints`） |
-| **同 STUN IP + LAN 无交集 + 首次** | 允许一次 hairpin 尝试（部分 CGNAT 支持） |
-| **同 STUN IP + LAN 无交集 + 已失败过** | 下发 `force_fallback` 强制降级到 TURN/WS |
+| **同 STUN IP + 首次** | 允许一次 hairpin 尝试（部分 CGNAT 支持） |
+| **同 STUN IP + 已失败过** | 下发 `force_fallback` 强制降级到 TURN/WS |
 
-**核心逻辑**：
+### 单向 P2P 的处理
 
-```javascript
-if (sameStunIP) {
-  const lanOverlap = checkLanOverlap(a, b);
-  const fc = this.failCounts.get(key) || 0;
+**问题**：A 的 probe 命中了 B，B 的 probe 因丢包没到 A。B 单方面报 `state=3` 会导致服务端认为 pair 已完成，A 永远收不到指令。
 
-  if (lanOverlap) {
-    // 走 LAN 直连
-  } else if (fc === 0) {
-    // 允许一次 hairpin 尝试
-  } else {
-    // 强制降级
-    forceFallbacks.set(aKey, ...);
-    forceFallbacks.set(bKey, ...);
-  }
-}
-```
+**修复**：
+- **客户端侧**：`hasTrafficFromTarget(peerID, since)` 只检查目标 peer 的 `lastRecvAt`，而不是 `hasTrafficFromAny`（只比对 IP，同 CGNAT 时任何来自同出口 IP 的包都误判成功）
+- **服务端侧**：`coordinate()` 的 `bothSucceeded` 要求 `aState === 3 && bState === 3` 才跳过协调
 
 ### 端口扫描范围
 
@@ -564,7 +549,9 @@ GET /api/admin/nathole/<room>?token=<ADMIN_TOKEN>
 
 **单向打洞成功**——A 的 probe 命中 B，但 B 回发给 A 的 probe 丢包了。
 
-**修复**：客户端 `sendProbeTo` 应**连发 5 次**（每次 100ms），覆盖瞬时丢包。检查客户端版本。
+**修复**：
+- 客户端用 `hasTrafficFromTarget` 替代 `hasTrafficFromAny`
+- 服务端用 `bothSucceeded` 替代 `anySucceeded`
 
 ### Q: 同 STUN 出口 IP 时疯狂打洞？
 
@@ -572,9 +559,8 @@ GET /api/admin/nathole/<room>?token=<ADMIN_TOKEN>
 
 **最新版逻辑**：
 
-1. **同 LAN 网段** → 走 LAN 直连（不派发降级）
-2. **首次遇到** → 允许一次 hairpin 尝试
-3. **已失败过** → 下发 `force_fallback` 强制降级
+1. **首次遇到** → 允许一次 hairpin 尝试
+2. **已失败过** → 下发 `force_fallback` 强制降级
 
 **修复**：重新部署 `coordinator.js`。
 
@@ -612,7 +598,7 @@ GET /api/admin/nathole/<room>?token=<ADMIN_TOKEN>
 **打洞失败时每条数据都走 Worker 中继**，消耗很快。
 
 **修复**：
-1. 优先让 P2P 打通（LAN 直连或 hairpin）
+1. 优先让 P2P 打通（hairpin）
 2. 配置 TURN（`TURN_SERVERS`），让流量走 TURN 而不是 Worker
 
 ### Q: `natType` 显示不一致（一端 HardNAT、一端 EasyNAT）？
@@ -662,8 +648,7 @@ https://dash.cloudflare.com/
 **关键日志**：
 
 ```
-[Room] p2p_metadata from xxx: natType=... pub=... lanIps=... multiExit=...
-[NAT] xxx 同 STUN 出口 IP (120.239.134.13) 但 LAN 同网段 (...)，走 LAN 直连
+[Room] p2p_metadata from xxx: natType=... pub=... multiExit=...
 [NAT] xxx 同 STUN 出口 IP (120.239.134.13)，允许一次 hairpin 尝试
 [NAT] xxx 跳过：同 STUN 出口 IP 已尝试失败，标记强制降级
 [Room] → xxx 下发 force_fallback (1 peers)
