@@ -32,89 +32,61 @@ interface PeerRecord {
   multiExit?: boolean;
 }
 
-// ============ 网段配置：常量 + 环境变量 ============
-
-/**
- * 默认虚拟网段。
- *
- * 只在「环境变量 VIRTUAL_NETWORK 未配置」时使用。
- * 想改网段：
- *   1. 推荐：改 wrangler.toml 里的 VIRTUAL_NETWORK，wrangler deploy
- *   2. 或：在 Cloudflare Dashboard 加 VIRTUAL_NETWORK（同时 wrangler.toml 里删掉该行，否则被覆盖）
- */
-const DEFAULT_VIRTUAL_NETWORK = "10.64.0.0/24";
-
-const NETWORK_STORAGE_KEY = "virtualNetwork";
-
-interface CIDRInfo {
-  /** 网络地址的 32 位无符号整数 */
-  base: number;
-  /** 前缀长度 */
-  prefix: number;
-  /** 可用主机数（不含网络地址和广播地址） */
-  total: number;
-  /** 原始字符串，形如 "10.64.0.0/24" */
-  cidr: string;
-}
-
-/**
- * 解析 CIDR 字符串。
- *
- * 支持 prefix 16~30：
- *   - /16 → 65534 个可用地址
- *   - /24 → 254 个
- *   - /30 → 2 个
- *
- * 不支持 /31 /32 —— VPN 场景无意义（点对点），且位运算边界易出错。
- */
-function parseVirtualNetwork(cidr: string): CIDRInfo {
-  const m = cidr.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/);
-  if (!m) {
-    throw new Error(`非法 CIDR: ${cidr}`);
-  }
-
-  const octets = [
-    parseInt(m[1], 10),
-    parseInt(m[2], 10),
-    parseInt(m[3], 10),
-    parseInt(m[4], 10),
-  ];
-  for (const o of octets) {
-    if (o < 0 || o > 255) throw new Error(`非法 IP 段: ${cidr}`);
-  }
-
-  const ip = ((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]) >>> 0;
-  const prefix = parseInt(m[5], 10);
-
-  if (prefix < 16 || prefix > 30) {
-    throw new Error(`CIDR prefix 必须在 16~30 之间: ${cidr}`);
-  }
-
-  const mask = prefix === 0 ? 0 : (~0 << (32 - prefix)) >>> 0;
-  const network = (ip & mask) >>> 0;
-  const broadcast = (network | (~mask >>> 0)) >>> 0;
-  const total = Math.pow(2, 32 - prefix) - 2; // 减去网络地址和广播地址
-
-  return {
-    base: network,
-    prefix,
-    total,
-    cidr: `${intToIP(network)}/${prefix}`,
-  };
-}
-
-function intToIP(n: number): string {
-  return `${(n >>> 24) & 255}.${(n >>> 16) & 255}.${(n >>> 8) & 255}.${n & 255}`;
-}
-
-// ============ Room DO ============
-
 const STAGGER_FALLBACK_SAVE_MS = 300 * 1000;
 const REGISTRY_REFRESH_MS = 5 * 60 * 1000;
 const PEERS_STORAGE_KEY = "peers";
 const COMMUNITY_STORAGE_KEY = "community";
 const OFFLINE_TTL_MS = 30 * 60 * 1000;
 const SAVE_THROTTLE_MS = 3 * 1000;
+
+// ★ 虚拟网段默认值（环境变量 VIRTUAL_NETWORK 未配置时使用）
+const DEFAULT_VIRTUAL_NETWORK = "10.64.0.0/24";
+
+interface ParsedCIDR {
+  base: number;    // unsigned 32-bit（网络地址）
+  prefix: number;  // 16 ~ 30
+  hostMax: number; // 可用主机数（去掉网络地址和广播地址）
+  cidr: string;    // 规范化后的 CIDR 字符串
+}
+
+// parseCIDR 解析 IPv4 CIDR，例如 "10.64.0.0/24"
+//
+// 支持：/16 ~ /30
+// 自动对齐网络地址（比如传 10.64.0.5/24 会规范化成 10.64.0.0/24）
+function parseCIDR(cidr: string): ParsedCIDR | null {
+  if (!cidr) return null;
+  const parts = cidr.trim().split("/");
+  if (parts.length !== 2) return null;
+
+  const ipOctets = parts[0].split(".").map((s) => parseInt(s, 10));
+  if (ipOctets.length !== 4) return null;
+  if (ipOctets.some((n) => isNaN(n) || n < 0 || n > 255)) return null;
+
+  const prefix = parseInt(parts[1], 10);
+  if (isNaN(prefix) || prefix < 16 || prefix > 30) return null;
+
+  // ★ 用 >>> 0 强制无符号，避免 192.x / 100.x 被当成负数
+  const rawBase =
+    ((ipOctets[0] << 24) | (ipOctets[1] << 16) | (ipOctets[2] << 8) | ipOctets[3]) >>> 0;
+
+  const mask = prefix === 0 ? 0 : ((0xFFFFFFFF << (32 - prefix)) >>> 0);
+  const alignedBase = (rawBase & mask) >>> 0;
+
+  const hostBits = 32 - prefix;
+  const hostMax = Math.pow(2, hostBits) - 2;
+
+  return {
+    base: alignedBase,
+    prefix,
+    hostMax,
+    cidr: `${intToIP(alignedBase)}/${prefix}`,
+  };
+}
+
+function intToIP(n: number): string {
+  n = n >>> 0;
+  return `${(n >>> 24) & 255}.${(n >>> 16) & 255}.${(n >>> 8) & 255}.${n & 255}`;
+}
 
 function idxToCode(i: number): string {
   if (i < 26) return String.fromCharCode(65 + i);
@@ -135,6 +107,13 @@ export class Room extends DurableObject {
   private ipToClient: Map<string, string> = new Map();
   private ipCounter = 2;
   private community = "";
+
+  // ★ 虚拟网段相关字段
+  private virtualBase: number = 0;
+  private virtualPrefix: number = 24;
+  private virtualHostMax: number = 253;
+  private virtualCidr: string = DEFAULT_VIRTUAL_NETWORK;
+
   private lastReport = 0;
   private lastRegistryRefresh = 0;
   private coordinator: NatHoleCoordinator;
@@ -144,32 +123,31 @@ export class Room extends DurableObject {
   private lastSaveAt = 0;
   private pendingSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // ★ 虚拟网段（构造时确定，之后不变）
-  private virtualNetwork: CIDRInfo;
-
   constructor(state: DurableObjectState, env: any) {
     super(state, env);
+    this.coordinator = new NatHoleCoordinator(env || {});
 
-    // ★ 常量 + 环境变量：env.VIRTUAL_NETWORK 存在则覆盖，否则用默认常量
-    const rawCidr = (env?.VIRTUAL_NETWORK as string | undefined)?.trim();
-    const effectiveCidr = rawCidr && rawCidr !== "" ? rawCidr : DEFAULT_VIRTUAL_NETWORK;
+    // ★ 虚拟网段优先级：
+    //   1. env.VIRTUAL_NETWORK（wrangler.toml [vars] 或 Dashboard 环境变量）
+    //   2. DEFAULT_VIRTUAL_NETWORK（代码常量，兜底）
+    const rawCidr =
+      env && typeof env.VIRTUAL_NETWORK === "string" && env.VIRTUAL_NETWORK.trim()
+        ? env.VIRTUAL_NETWORK.trim()
+        : DEFAULT_VIRTUAL_NETWORK;
 
-    try {
-      this.virtualNetwork = parseVirtualNetwork(effectiveCidr);
-    } catch (e) {
-      console.error(
-        `[Room] VIRTUAL_NETWORK 解析失败 (${effectiveCidr})，回退到默认 ${DEFAULT_VIRTUAL_NETWORK}:`,
-        e
-      );
-      this.virtualNetwork = parseVirtualNetwork(DEFAULT_VIRTUAL_NETWORK);
-    }
+    const parsed = parseCIDR(rawCidr) || parseCIDR(DEFAULT_VIRTUAL_NETWORK)!;
+    this.virtualBase = parsed.base;
+    this.virtualPrefix = parsed.prefix;
+    this.virtualHostMax = parsed.hostMax;
+    this.virtualCidr = parsed.cidr;
 
     console.log(
-      `[Room] 虚拟网段: ${this.virtualNetwork.cidr}（source=${rawCidr ? "env" : "default"}，可用 ${this.virtualNetwork.total} 个）`
+      `[Room] 虚拟网段: ${this.virtualCidr} ` +
+      `(prefix=/${this.virtualPrefix}, 可用主机 ${this.virtualHostMax})`
     );
-
-    this.coordinator = new NatHoleCoordinator(env || {});
   }
+
+  // ============ 网络地址工具 ============
 
   private extractIp(endpoint: string): string {
     if (!endpoint) return "";
@@ -199,26 +177,13 @@ export class Room extends DurableObject {
     return { ip: "", port: 0 };
   }
 
+  // ============ 从 Storage 恢复 ============
+
   private async ensureLoaded(): Promise<void> {
     if (this.loadedFromStorage) return;
     this.loadedFromStorage = true;
 
     try {
-      // ★ 网段变化检测：env 里的网段和上次存储的不一致 → 清空房间
-      const storedNetwork = await this.ctx.storage.get<string>(NETWORK_STORAGE_KEY);
-      if (storedNetwork && storedNetwork !== this.virtualNetwork.cidr) {
-        console.log(
-          `[Room] 网段变化: ${storedNetwork} → ${this.virtualNetwork.cidr}，清空房间（强制客户端重连）`
-        );
-        this.peers.clear();
-        this.ipToClient.clear();
-        this.ipCounter = 2;
-        try { await this.ctx.storage.deleteAll(); } catch (e) {
-          console.error("[Room] storage deleteAll failed:", e);
-        }
-      }
-      await this.ctx.storage.put(NETWORK_STORAGE_KEY, this.virtualNetwork.cidr);
-
       const storedCommunity = await this.ctx.storage.get<string>(COMMUNITY_STORAGE_KEY);
       if (storedCommunity && !this.community) this.community = storedCommunity;
 
@@ -263,6 +228,17 @@ export class Room extends DurableObject {
 
           if (p.virtualIp && p.online) {
             this.ipToClient.set(p.virtualIp, id);
+
+            // ★ 从 VIP 反推 host offset，更新 ipCounter
+            const octets = String(p.virtualIp).split(".").map((s) => parseInt(s, 10));
+            if (octets.length === 4 && !octets.some((n) => isNaN(n))) {
+              const ipInt =
+                ((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]) >>> 0;
+              const offset = (ipInt - this.virtualBase) >>> 0;
+              if (offset >= this.ipCounter && offset <= this.virtualHostMax + 1) {
+                this.ipCounter = offset + 1;
+              }
+            }
           }
           restored++;
         }
@@ -272,6 +248,8 @@ export class Room extends DurableObject {
       console.error("[Room] ensureLoaded failed:", e);
     }
   }
+
+  // ============ 状态持久化 ============
 
   private async saveStateNow(): Promise<void> {
     try {
@@ -294,7 +272,6 @@ export class Room extends DurableObject {
       }
       await this.ctx.storage.put(PEERS_STORAGE_KEY, peersData);
       if (this.community) await this.ctx.storage.put(COMMUNITY_STORAGE_KEY, this.community);
-      await this.ctx.storage.put(NETWORK_STORAGE_KEY, this.virtualNetwork.cidr);
       this.lastSaveAt = Date.now();
     } catch (e) {
       console.error("[Room] saveStateNow failed:", e);
@@ -316,6 +293,8 @@ export class Room extends DurableObject {
       this.saveStateNow().catch(() => {});
     }, delay);
   }
+
+  // ============ HTTP 路由 ============
 
   async fetch(request: Request): Promise<Response> {
     await this.ensureLoaded();
@@ -438,7 +417,8 @@ export class Room extends DurableObject {
         this.ipToClient.delete(oldVip);
         peer.virtualIp = this.allocateIp();
         console.log(
-          `[Room] ${clientId} VIP 冲突：${oldVip} 已被 ${conflict.clientId} 占用，重新分配 ${peer.virtualIp}`
+          `[Room] ${clientId} VIP 冲突：${oldVip} 已被 ${conflict.clientId} 占用，` +
+          `重新分配 ${peer.virtualIp}`
         );
       }
     } else {
@@ -468,8 +448,8 @@ export class Room extends DurableObject {
       payload: {
         id: clientId,
         virtualIp: peer.virtualIp,
-        virtualNetwork: this.virtualNetwork.cidr,   // ★ 新增：下发给客户端
         yourPublicIp: publicIp,
+        virtualNetwork: this.virtualCidr,   // ★ 新增：把网段告诉客户端
         peers: onlinePeersForClient,
       },
     }));
@@ -618,10 +598,14 @@ export class Room extends DurableObject {
     if (data.length < 20) return;
     if (data[0] >> 4 !== 4) return;
 
+    // 只处理目标网段内的 IPv4 包
+    const dstIP =
+      `${data[16]}.${data[17]}.${data[18]}.${data[19]}`;
+    if (!this.isInVirtualNetwork(dstIP)) return;
+
     const from = this.findClientId(ws);
     if (!from) return;
-    const dstIp = `${data[16]}.${data[17]}.${data[18]}.${data[19]}`;
-    const targetClientId = this.ipToClient.get(dstIp);
+    const targetClientId = this.ipToClient.get(dstIP);
     if (!targetClientId) return;
     const targetWs = this.sessions.get(targetClientId);
     if (!targetWs) return;
@@ -633,6 +617,15 @@ export class Room extends DurableObject {
       if (fromPeer) { fromPeer.relayBytesOut += data.length; fromPeer.relayPacketsOut += 1; }
       if (toPeer) { toPeer.relayBytesIn += data.length; toPeer.relayPacketsIn += 1; }
     } catch {}
+  }
+
+  // isInVirtualNetwork 检查 IP 是否在当前虚拟网段内
+  private isInVirtualNetwork(ip: string): boolean {
+    const octets = ip.split(".").map((s) => parseInt(s, 10));
+    if (octets.length !== 4 || octets.some((n) => isNaN(n))) return false;
+    const ipInt = ((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]) >>> 0;
+    const mask = ((0xFFFFFFFF << (32 - this.virtualPrefix)) >>> 0);
+    return ((ipInt & mask) >>> 0) === this.virtualBase;
   }
 
   async webSocketClose(ws: WebSocket): Promise<void> {
@@ -762,7 +755,7 @@ export class Room extends DurableObject {
 
     return new Response(JSON.stringify({
       community: this.community,
-      virtualNetwork: this.virtualNetwork.cidr,   // ★ 面板也能看到
+      virtualNetwork: this.virtualCidr,   // ★ 新增：把网段暴露给面板
       peerCount: peers.length,
       onlineCount: onlineCnt,
       offlineCount: offlineCnt,
@@ -862,28 +855,34 @@ export class Room extends DurableObject {
     }
   }
 
-  /**
-   * 分配虚拟 IP。
-   *
-   * 从 `this.virtualNetwork.base + this.ipCounter` 开始遍历。
-   * `ipCounter` 初始为 2（跳过 .0 网络地址 和 .1 网关地址）。
-   * 上限 = `total`（可用主机数）。
-   */
-  private allocateIp(): string {
-    const total = this.virtualNetwork.total;
-    if (total < 1) throw new Error("IP pool empty");
+  // ============ IP 分配 ============
 
-    for (let i = 0; i < total; i++) {
-      const offset = this.ipCounter;
-      this.ipCounter++;
-      if (this.ipCounter > total) {
+  // allocateIp 从虚拟网段分配一个空闲 IP。
+  //
+  // ★ 支持任意 CIDR（/16 ~ /30），由 VIRTUAL_NETWORK 环境变量控制。
+  //   ipCounter 从 2 起（跳过 .0 网络地址 和 .1 网关保留）。
+  private allocateIp(): string {
+    const used = new Set<string>();
+    for (const p of this.peers.values()) {
+      if (p.virtualIp) used.add(p.virtualIp);
+    }
+    for (const ip of this.ipToClient.keys()) {
+      used.add(ip);
+    }
+
+    for (let i = 0; i < this.virtualHostMax; i++) {
+      // 边界检查：ipCounter 溢出时回到 2
+      if (this.ipCounter < 2 || this.ipCounter > this.virtualHostMax + 1) {
         this.ipCounter = 2;
       }
-      const ipNum = (this.virtualNetwork.base + offset) >>> 0;
-      const ip = intToIP(ipNum);
-      if (!this.ipToClient.has(ip)) return ip;
+      const candidate = intToIP(this.virtualBase + this.ipCounter);
+      this.ipCounter++;
+      if (!used.has(candidate)) return candidate;
     }
-    throw new Error("IP pool exhausted");
+
+    throw new Error(
+      `IP pool exhausted (CIDR=${this.virtualCidr}, size=${this.virtualHostMax})`
+    );
   }
 
   private async reportToRegistry(force = false): Promise<void> {
