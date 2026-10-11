@@ -45,7 +45,7 @@ const DEFAULT_VIRTUAL_NETWORK = "10.64.0.0/24";
 interface ParsedCIDR {
   base: number;    // unsigned 32-bit（网络地址）
   prefix: number;  // 16 ~ 30
-  hostMax: number; // 可用主机数（去掉网络地址和广播地址）
+  hostMax: number; // ★ 最大可用主机 offset（= 2^hostBits - 2），不是数量
   cidr: string;    // 规范化后的 CIDR 字符串
 }
 
@@ -73,6 +73,9 @@ function parseCIDR(cidr: string): ParsedCIDR | null {
   const alignedBase = (rawBase & mask) >>> 0;
 
   const hostBits = 32 - prefix;
+  // hostMax = 最后一个可用主机 offset
+  //   /24: 254 (offset 1..254 是主机，0=网络地址、255=广播)
+  //   /20: 4094
   const hostMax = Math.pow(2, hostBits) - 2;
 
   return {
@@ -143,7 +146,7 @@ export class Room extends DurableObject {
 
     console.log(
       `[Room] 虚拟网段: ${this.virtualCidr} ` +
-      `(prefix=/${this.virtualPrefix}, 可用主机 ${this.virtualHostMax})`
+      `(prefix=/${this.virtualPrefix}, 最大主机 offset=${this.virtualHostMax})`
     );
   }
 
@@ -177,6 +180,16 @@ export class Room extends DurableObject {
     return { ip: "", port: 0 };
   }
 
+  // isInVirtualNetwork 检查 IP 是否在当前虚拟网段内
+  private isInVirtualNetwork(ip: string): boolean {
+    if (!ip) return false;
+    const octets = ip.split(".").map((s) => parseInt(s, 10));
+    if (octets.length !== 4 || octets.some((n) => isNaN(n))) return false;
+    const ipInt = ((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]) >>> 0;
+    const mask = ((0xFFFFFFFF << (32 - this.virtualPrefix)) >>> 0);
+    return ((ipInt & mask) >>> 0) === this.virtualBase;
+  }
+
   // ============ 从 Storage 恢复 ============
 
   private async ensureLoaded(): Promise<void> {
@@ -190,7 +203,7 @@ export class Room extends DurableObject {
       const storedPeers = await this.ctx.storage.get<Record<string, any>>(PEERS_STORAGE_KEY);
       if (storedPeers) {
         const now = Date.now();
-        let restored = 0, removed = 0;
+        let restored = 0, removed = 0, droppedByCidr = 0;
 
         for (const [id, p] of Object.entries(storedPeers)) {
           const offlineSince = p.disconnectedAt || p.lastSeen || 0;
@@ -226,7 +239,9 @@ export class Room extends DurableObject {
             multiExit: !!p.multiExit,
           });
 
-          if (p.virtualIp && p.online) {
+          // ★ 回填 ipToClient 时过滤网段：旧网段的 VIP 不进映射表
+          //   否则老 VIP → clientId 一直有效，会误导 handleBinary 的查表
+          if (p.virtualIp && p.online && this.isInVirtualNetwork(p.virtualIp)) {
             this.ipToClient.set(p.virtualIp, id);
 
             // ★ 从 VIP 反推 host offset，更新 ipCounter
@@ -235,14 +250,20 @@ export class Room extends DurableObject {
               const ipInt =
                 ((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]) >>> 0;
               const offset = (ipInt - this.virtualBase) >>> 0;
-              if (offset >= this.ipCounter && offset <= this.virtualHostMax + 1) {
+              // ★ 修复 off-by-one：hostMax 是最大主机 offset，不是 hostMax+1
+              if (offset >= this.ipCounter && offset <= this.virtualHostMax) {
                 this.ipCounter = offset + 1;
               }
             }
+          } else if (p.virtualIp && p.online) {
+            droppedByCidr++;
           }
           restored++;
         }
-        console.log(`[Room] 恢复 ${restored} 个 peer（删 ${removed} 个 stale）`);
+        console.log(
+          `[Room] 恢复 ${restored} 个 peer（删 ${removed} 个 stale，` +
+          `${droppedByCidr} 个 VIP 不在 ${this.virtualCidr} 已跳过映射）`
+        );
       }
     } catch (e) {
       console.error("[Room] ensureLoaded failed:", e);
@@ -408,6 +429,21 @@ export class Room extends DurableObject {
       peer.disconnectedAt = undefined;
       peer._publicIp = publicIp;
 
+      // ★ 新增：VIP 不在当前网段 → 强制重分配
+      //   场景：服务端从 10.64.0.0/24 切到 172.16.0.0/20，DO 重启后
+      //   ensureLoaded 恢复出的老 peer 还带 10.64.0.x。若不重分配：
+      //   客户端重连 → 拿到旧 VIP → 配置 TUN → 发往 10.64.0.x 的包
+      //   在 handleBinary 被 isInVirtualNetwork 拦下 → 静默丢包。
+      if (peer.virtualIp && !this.isInVirtualNetwork(peer.virtualIp)) {
+        const oldVip = peer.virtualIp;
+        this.ipToClient.delete(oldVip);
+        peer.virtualIp = this.allocateIp();
+        console.log(
+          `[Room] ${clientId} 旧 VIP ${oldVip} 不在网段 ${this.virtualCidr}，` +
+          `重新分配 ${peer.virtualIp}`
+        );
+      }
+
       // ★ 检测 VIP 冲突：其他在线 peer 是否也占用了同一个 VIP
       const conflict = Array.from(this.peers.values()).find(
         (p) => p.clientId !== clientId && p.online && p.virtualIp === peer!.virtualIp
@@ -449,7 +485,7 @@ export class Room extends DurableObject {
         id: clientId,
         virtualIp: peer.virtualIp,
         yourPublicIp: publicIp,
-        virtualNetwork: this.virtualCidr,   // ★ 新增：把网段告诉客户端
+        virtualNetwork: this.virtualCidr,   // ★ 把网段告诉客户端
         peers: onlinePeersForClient,
       },
     }));
@@ -619,15 +655,6 @@ export class Room extends DurableObject {
     } catch {}
   }
 
-  // isInVirtualNetwork 检查 IP 是否在当前虚拟网段内
-  private isInVirtualNetwork(ip: string): boolean {
-    const octets = ip.split(".").map((s) => parseInt(s, 10));
-    if (octets.length !== 4 || octets.some((n) => isNaN(n))) return false;
-    const ipInt = ((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]) >>> 0;
-    const mask = ((0xFFFFFFFF << (32 - this.virtualPrefix)) >>> 0);
-    return ((ipInt & mask) >>> 0) === this.virtualBase;
-  }
-
   async webSocketClose(ws: WebSocket): Promise<void> {
     const clientId = this.findClientId(ws);
     if (clientId) {
@@ -755,7 +782,7 @@ export class Room extends DurableObject {
 
     return new Response(JSON.stringify({
       community: this.community,
-      virtualNetwork: this.virtualCidr,   // ★ 新增：把网段暴露给面板
+      virtualNetwork: this.virtualCidr,   // ★ 把网段暴露给面板
       peerCount: peers.length,
       onlineCount: onlineCnt,
       offlineCount: offlineCnt,
@@ -859,8 +886,14 @@ export class Room extends DurableObject {
 
   // allocateIp 从虚拟网段分配一个空闲 IP。
   //
-  // ★ 支持任意 CIDR（/16 ~ /30），由 VIRTUAL_NETWORK 环境变量控制。
-  //   ipCounter 从 2 起（跳过 .0 网络地址 和 .1 网关保留）。
+  // ipCounter 语义是 host offset：
+  //   0       网络地址（保留）
+  //   1       网关（保留）
+  //   2..max  可用主机
+  //   max+1   广播地址（不可用）
+  //
+  // hostMax = 2^hostBits - 2 本身就是最后一个可用主机 offset，
+  // 所以判断上界是 <= hostMax，不是 hostMax + 1。
   private allocateIp(): string {
     const used = new Set<string>();
     for (const p of this.peers.values()) {
@@ -870,9 +903,11 @@ export class Room extends DurableObject {
       used.add(ip);
     }
 
-    for (let i = 0; i < this.virtualHostMax; i++) {
-      // 边界检查：ipCounter 溢出时回到 2
-      if (this.ipCounter < 2 || this.ipCounter > this.virtualHostMax + 1) {
+    // 循环 hostMax 次足以覆盖 offset 2..hostMax
+    const cycles = Math.max(1, this.virtualHostMax - 1);
+    for (let i = 0; i < cycles; i++) {
+      // ★ 修复 off-by-one：上界是 hostMax，不能到 hostMax+1（广播地址）
+      if (this.ipCounter < 2 || this.ipCounter > this.virtualHostMax) {
         this.ipCounter = 2;
       }
       const candidate = intToIP(this.virtualBase + this.ipCounter);
@@ -881,7 +916,7 @@ export class Room extends DurableObject {
     }
 
     throw new Error(
-      `IP pool exhausted (CIDR=${this.virtualCidr}, size=${this.virtualHostMax})`
+      `IP pool exhausted (CIDR=${this.virtualCidr}, max offset=${this.virtualHostMax})`
     );
   }
 
