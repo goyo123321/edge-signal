@@ -12,6 +12,7 @@ export interface Env {
   TURN_SERVERS?: string;
   TURN_USERNAME?: string;
   TURN_PASSWORD?: string;
+  VIRTUAL_NETWORK?: string;   // ★ 新增
 }
 
 const DEFAULT_ADMIN_TOKEN = "12332100";
@@ -49,8 +50,6 @@ function jsonResp(obj: any, status = 200): Response {
   });
 }
 
-// ============ TURN 配置检查 ============
-
 function hasCloudflareTURN(env: Env): boolean {
   return !!(
     env.TURN_KEY_ID &&
@@ -67,8 +66,6 @@ function hasCustomTURN(env: Env): boolean {
 function isTURNEnabled(env: Env): boolean {
   return hasCloudflareTURN(env) || hasCustomTURN(env);
 }
-
-// ============ TURN URL 解析（自定义 TURN 用） ============
 
 function parseTURNUrl(
   raw: string,
@@ -155,8 +152,6 @@ function generateCustomTURN(
   return servers;
 }
 
-// ============ Cloudflare TURN 凭证 ============
-
 /**
  * 生成 Cloudflare TURN 凭证。
  *
@@ -177,15 +172,6 @@ function generateCustomTURN(
  *       "credential": "yyy"
  *     }
  *   ]
- * }
- *
- * 旧端点响应（对象格式，本函数兼容）：
- * {
- *   "iceServers": {
- *     "urls": [...],
- *     "username": "xxx",
- *     "credential": "yyy"
- *   }
  * }
  */
 async function generateCloudflareTURN(
@@ -270,8 +256,6 @@ async function generateCloudflareTURN(
   return [];
 }
 
-// ============ 公开 TURN 信息（脱敏） ============
-
 function publicTURNInfo(env: Env): {
   enabled: boolean;
   source: "cloudflare" | "custom" | "none";
@@ -322,24 +306,19 @@ function publicTURNInfo(env: Env): {
   };
 }
 
-// ============ 主入口 ============
-
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const pathname = url.pathname;
 
-    // 公开面板
     if (pathname === "/" || pathname === "/index.html") {
       return env.ASSETS.fetch(new Request(new URL("/index.html", request.url)));
     }
 
-    // 管理面板
     if (pathname === "/admin" || pathname === "/admin/") {
       return env.ASSETS.fetch(new Request(new URL("/admin.html", request.url)));
     }
 
-    // ========== TURN 凭证端点 ==========
     if (pathname === "/api/turn-credentials") {
       if (env.CONNECT_TOKEN && env.CONNECT_TOKEN.trim() !== "") {
         const provided = url.searchParams.get("token") || "";
@@ -382,8 +361,6 @@ export default {
       }
     }
 
-    // ========== 公开 API ==========
-
     if (pathname === "/api/public/turn-config") {
       return jsonResp(publicTURNInfo(env));
     }
@@ -402,7 +379,6 @@ export default {
       );
     }
 
-    // ========== 管理员 API ==========
     const isAdminRoute =
       pathname.startsWith("/api/admin/") ||
       pathname === "/api/rooms" ||
@@ -554,7 +530,6 @@ export default {
       return new Response("Not found", { status: 404 });
     }
 
-    // ========== WebSocket 信令 ==========
     if (pathname.startsWith("/ws/")) {
       if (env.CONNECT_TOKEN && env.CONNECT_TOKEN.trim() !== "") {
         const provided = url.searchParams.get("token") || "";
