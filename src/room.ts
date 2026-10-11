@@ -32,6 +32,83 @@ interface PeerRecord {
   multiExit?: boolean;
 }
 
+// ============ 网段配置：常量 + 环境变量 ============
+
+/**
+ * 默认虚拟网段。
+ *
+ * 只在「环境变量 VIRTUAL_NETWORK 未配置」时使用。
+ * 想改网段：
+ *   1. 推荐：改 wrangler.toml 里的 VIRTUAL_NETWORK，wrangler deploy
+ *   2. 或：在 Cloudflare Dashboard 加 VIRTUAL_NETWORK（同时 wrangler.toml 里删掉该行，否则被覆盖）
+ */
+const DEFAULT_VIRTUAL_NETWORK = "10.64.0.0/24";
+
+const NETWORK_STORAGE_KEY = "virtualNetwork";
+
+interface CIDRInfo {
+  /** 网络地址的 32 位无符号整数 */
+  base: number;
+  /** 前缀长度 */
+  prefix: number;
+  /** 可用主机数（不含网络地址和广播地址） */
+  total: number;
+  /** 原始字符串，形如 "10.64.0.0/24" */
+  cidr: string;
+}
+
+/**
+ * 解析 CIDR 字符串。
+ *
+ * 支持 prefix 16~30：
+ *   - /16 → 65534 个可用地址
+ *   - /24 → 254 个
+ *   - /30 → 2 个
+ *
+ * 不支持 /31 /32 —— VPN 场景无意义（点对点），且位运算边界易出错。
+ */
+function parseVirtualNetwork(cidr: string): CIDRInfo {
+  const m = cidr.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/);
+  if (!m) {
+    throw new Error(`非法 CIDR: ${cidr}`);
+  }
+
+  const octets = [
+    parseInt(m[1], 10),
+    parseInt(m[2], 10),
+    parseInt(m[3], 10),
+    parseInt(m[4], 10),
+  ];
+  for (const o of octets) {
+    if (o < 0 || o > 255) throw new Error(`非法 IP 段: ${cidr}`);
+  }
+
+  const ip = ((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]) >>> 0;
+  const prefix = parseInt(m[5], 10);
+
+  if (prefix < 16 || prefix > 30) {
+    throw new Error(`CIDR prefix 必须在 16~30 之间: ${cidr}`);
+  }
+
+  const mask = prefix === 0 ? 0 : (~0 << (32 - prefix)) >>> 0;
+  const network = (ip & mask) >>> 0;
+  const broadcast = (network | (~mask >>> 0)) >>> 0;
+  const total = Math.pow(2, 32 - prefix) - 2; // 减去网络地址和广播地址
+
+  return {
+    base: network,
+    prefix,
+    total,
+    cidr: `${intToIP(network)}/${prefix}`,
+  };
+}
+
+function intToIP(n: number): string {
+  return `${(n >>> 24) & 255}.${(n >>> 16) & 255}.${(n >>> 8) & 255}.${n & 255}`;
+}
+
+// ============ Room DO ============
+
 const STAGGER_FALLBACK_SAVE_MS = 300 * 1000;
 const REGISTRY_REFRESH_MS = 5 * 60 * 1000;
 const PEERS_STORAGE_KEY = "peers";
@@ -67,8 +144,30 @@ export class Room extends DurableObject {
   private lastSaveAt = 0;
   private pendingSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // ★ 虚拟网段（构造时确定，之后不变）
+  private virtualNetwork: CIDRInfo;
+
   constructor(state: DurableObjectState, env: any) {
     super(state, env);
+
+    // ★ 常量 + 环境变量：env.VIRTUAL_NETWORK 存在则覆盖，否则用默认常量
+    const rawCidr = (env?.VIRTUAL_NETWORK as string | undefined)?.trim();
+    const effectiveCidr = rawCidr && rawCidr !== "" ? rawCidr : DEFAULT_VIRTUAL_NETWORK;
+
+    try {
+      this.virtualNetwork = parseVirtualNetwork(effectiveCidr);
+    } catch (e) {
+      console.error(
+        `[Room] VIRTUAL_NETWORK 解析失败 (${effectiveCidr})，回退到默认 ${DEFAULT_VIRTUAL_NETWORK}:`,
+        e
+      );
+      this.virtualNetwork = parseVirtualNetwork(DEFAULT_VIRTUAL_NETWORK);
+    }
+
+    console.log(
+      `[Room] 虚拟网段: ${this.virtualNetwork.cidr}（source=${rawCidr ? "env" : "default"}，可用 ${this.virtualNetwork.total} 个）`
+    );
+
     this.coordinator = new NatHoleCoordinator(env || {});
   }
 
@@ -105,6 +204,21 @@ export class Room extends DurableObject {
     this.loadedFromStorage = true;
 
     try {
+      // ★ 网段变化检测：env 里的网段和上次存储的不一致 → 清空房间
+      const storedNetwork = await this.ctx.storage.get<string>(NETWORK_STORAGE_KEY);
+      if (storedNetwork && storedNetwork !== this.virtualNetwork.cidr) {
+        console.log(
+          `[Room] 网段变化: ${storedNetwork} → ${this.virtualNetwork.cidr}，清空房间（强制客户端重连）`
+        );
+        this.peers.clear();
+        this.ipToClient.clear();
+        this.ipCounter = 2;
+        try { await this.ctx.storage.deleteAll(); } catch (e) {
+          console.error("[Room] storage deleteAll failed:", e);
+        }
+      }
+      await this.ctx.storage.put(NETWORK_STORAGE_KEY, this.virtualNetwork.cidr);
+
       const storedCommunity = await this.ctx.storage.get<string>(COMMUNITY_STORAGE_KEY);
       if (storedCommunity && !this.community) this.community = storedCommunity;
 
@@ -149,11 +263,6 @@ export class Room extends DurableObject {
 
           if (p.virtualIp && p.online) {
             this.ipToClient.set(p.virtualIp, id);
-            const parts = String(p.virtualIp).split(".");
-            if (parts.length === 4) {
-              const last = parseInt(parts[3], 10);
-              if (!isNaN(last) && last >= this.ipCounter) this.ipCounter = last + 1;
-            }
           }
           restored++;
         }
@@ -185,6 +294,7 @@ export class Room extends DurableObject {
       }
       await this.ctx.storage.put(PEERS_STORAGE_KEY, peersData);
       if (this.community) await this.ctx.storage.put(COMMUNITY_STORAGE_KEY, this.community);
+      await this.ctx.storage.put(NETWORK_STORAGE_KEY, this.virtualNetwork.cidr);
       this.lastSaveAt = Date.now();
     } catch (e) {
       console.error("[Room] saveStateNow failed:", e);
@@ -320,23 +430,15 @@ export class Room extends DurableObject {
       peer._publicIp = publicIp;
 
       // ★ 检测 VIP 冲突：其他在线 peer 是否也占用了同一个 VIP
-      //
-      // 场景：A 离线（30 分钟 TTL 内），B 进入时 allocateIp 未看到 A 的 VIP
-      //      （因为 ensureLoaded 只恢复在线 peer 到 ipToClient）
-      //      → B 拿到和 A 相同的 VIP
-      //      → A 重启后复用旧 VIP
-      //      → 冲突
       const conflict = Array.from(this.peers.values()).find(
         (p) => p.clientId !== clientId && p.online && p.virtualIp === peer!.virtualIp
       );
       if (conflict) {
         const oldVip = peer.virtualIp;
-        // 先把自己从 ipToClient 摘掉，避免 allocateIp 看到自己占用
         this.ipToClient.delete(oldVip);
         peer.virtualIp = this.allocateIp();
         console.log(
-          `[Room] ${clientId} VIP 冲突：${oldVip} 已被 ${conflict.clientId} 占用，` +
-          `重新分配 ${peer.virtualIp}`
+          `[Room] ${clientId} VIP 冲突：${oldVip} 已被 ${conflict.clientId} 占用，重新分配 ${peer.virtualIp}`
         );
       }
     } else {
@@ -366,6 +468,7 @@ export class Room extends DurableObject {
       payload: {
         id: clientId,
         virtualIp: peer.virtualIp,
+        virtualNetwork: this.virtualNetwork.cidr,   // ★ 新增：下发给客户端
         yourPublicIp: publicIp,
         peers: onlinePeersForClient,
       },
@@ -405,7 +508,6 @@ export class Room extends DurableObject {
           peer.regularPortsChange = !!p.regularPortsChange;
           peer.behavior = p.behavior || peer.behavior;
 
-          // assistedEndpoints（新协议）；兼容旧字段 assistedSockets
           if (Array.isArray(p.assistedEndpoints)) {
             peer.assistedSockets = p.assistedEndpoints.filter(
               (s: any) => typeof s === "string" && s
@@ -420,7 +522,6 @@ export class Room extends DurableObject {
 
           const publicEndpoint = typeof p.publicEndpoint === "string" ? p.publicEndpoint : "";
           if (publicEndpoint && publicEndpoint !== "") {
-            // ★ 检测 pubSocket 变化 → 清空该 peer 的打洞状态
             const oldPubSocket = peer.pubSocket;
             if (oldPubSocket && oldPubSocket !== publicEndpoint) {
               this.coordinator.clearPairStateFor(from);
@@ -516,7 +617,6 @@ export class Room extends DurableObject {
     const data = new Uint8Array(buffer);
     if (data.length < 20) return;
     if (data[0] >> 4 !== 4) return;
-    if (data[16] !== 10 || data[17] !== 64 || data[18] !== 0) return;
 
     const from = this.findClientId(ws);
     if (!from) return;
@@ -662,6 +762,7 @@ export class Room extends DurableObject {
 
     return new Response(JSON.stringify({
       community: this.community,
+      virtualNetwork: this.virtualNetwork.cidr,   // ★ 面板也能看到
       peerCount: peers.length,
       onlineCount: onlineCnt,
       offlineCount: offlineCnt,
@@ -761,22 +862,26 @@ export class Room extends DurableObject {
     }
   }
 
-  // ★ allocateIp 现在检查所有 peer 的 VIP（含离线 TTL 内的），
-  //   避免离线 peer 的 VIP 被重新分配出去。
+  /**
+   * 分配虚拟 IP。
+   *
+   * 从 `this.virtualNetwork.base + this.ipCounter` 开始遍历。
+   * `ipCounter` 初始为 2（跳过 .0 网络地址 和 .1 网关地址）。
+   * 上限 = `total`（可用主机数）。
+   */
   private allocateIp(): string {
-    const used = new Set<string>();
-    for (const p of this.peers.values()) {
-      if (p.virtualIp) used.add(p.virtualIp);
-    }
-    for (const ip of this.ipToClient.keys()) {
-      used.add(ip);
-    }
+    const total = this.virtualNetwork.total;
+    if (total < 1) throw new Error("IP pool empty");
 
-    for (let i = 0; i < 254; i++) {
-      const ip = `10.64.0.${this.ipCounter}`;
+    for (let i = 0; i < total; i++) {
+      const offset = this.ipCounter;
       this.ipCounter++;
-      if (this.ipCounter > 254) this.ipCounter = 2;
-      if (!used.has(ip)) return ip;
+      if (this.ipCounter > total) {
+        this.ipCounter = 2;
+      }
+      const ipNum = (this.virtualNetwork.base + offset) >>> 0;
+      const ip = intToIP(ipNum);
+      if (!this.ipToClient.has(ip)) return ip;
     }
     throw new Error("IP pool exhausted");
   }
