@@ -12,8 +12,9 @@
 - **三级降级** — `P2P → TURN → WS`，保证连接永远可用
 - **同 CGNAT 处理** — 同 STUN 出口 IP 时首次允许 hairpin 尝试，失败后强制降级
 - **强制降级** — 同 STUN IP 时下发 `force_fallback` 指令
-- **动态端口范围** — 扫描范围按两端端口差动态计算（客户端逐级递增：3→10→20→30→60→100）
-- **TURN 中继** — 集成 Cloudflare TURN 或自定义 TURN，减少 Worker 消耗
+- **动态端口范围** — 扫描范围按两端端口差动态计算
+- **Cloudflare TURN 支持** — 原生集成 Cloudflare Calls TURN，1000GB/月免费
+- **自定义 TURN** — 支持自建 coturn（UDP/TCP transport）
 - **双面板** — 公开面板 + 管理面板（Token 保护）
 - **设备代号** — 按上线顺序自动分配 A/B/C/D
 - **在线/离线统计** — 区分当前在线和断线的设备
@@ -203,23 +204,99 @@ TURN 是三级降级的第二级，**打洞失败时优先走 TURN**（不消耗
 **Step 1：创建 TURN Key**
 
 ```
-https://dash.cloudflare.com/
-→ Realtime → TURN Keys → Create
-→ 记录 Key ID 和 API Token（Token 只显示一次）
+1. 打开 Cloudflare Dashboard
+   https://dash.cloudflare.com/
+
+2. 进入你的账户 → 左侧菜单 Realtime → TURN Keys
+
+3. 点击 Create
+   - Name: edge-signal-turn（随便起）
+
+4. ★ 弹窗会一次性显示两个值，必须立即复制：
+   - Token ID   ← 这是 TURN_KEY_ID
+   - API Token  ← 这是 TURN_KEY_API_TOKEN
+
+   ⚠️ API Token 只显示一次，刷新页面就没了。
+      如果忘了，只能删除这个 TURN Key 重新创建。
 ```
 
-**Step 2：在 Worker 里配置环境变量**
+**Step 2：配置到 Worker**
+
+**方式 A：Wrangler CLI（推荐）**
+
+```bash
+cd edge-signal
+
+# 设置 TURN Key ID
+npx wrangler secret put TURN_KEY_ID
+# 粘贴上面复制的 Token ID
+
+# 设置 TURN Key API Token
+npx wrangler secret put TURN_KEY_API_TOKEN
+# 粘贴上面复制的 API Token
+```
+
+**方式 B：Cloudflare Dashboard**
 
 ```
-Workers & Pages → edge-signal → Settings → Variables and Secrets → Add
+Workers & Pages → edge-signal → Settings
+  → Variables and Secrets → Add
+
+Name:  TURN_KEY_ID
+Value: <Token ID>
+Type:  Text
+
+Name:  TURN_KEY_API_TOKEN
+Value: <API Token>
+Type:  Secret        ← ★ 必须选 Secret，加密存储
 ```
 
-| Name | Value | 类型 |
+**Step 3：部署**
+
+```bash
+npx wrangler deploy
+```
+
+**Step 4：验证**
+
+```bash
+curl -s "https://edge-signal.xxx.workers.dev/api/turn-credentials" | jq
+```
+
+**配置正确**：
+
+```json
+{
+  "success": true,
+  "source": "cloudflare",
+  "servers": [
+    {
+      "url": "turn:turn.cloudflare.com:3478?transport=udp",
+      "username": "bc91b63e...",
+      "password": "ebd71f1d...",
+      "ttl": 86400
+    },
+    {
+      "url": "turn:turn.cloudflare.com:3478?transport=tcp",
+      "username": "bc91b63e...",
+      "password": "ebd71f1d...",
+      "ttl": 86400
+    }
+  ]
+}
+```
+
+**`"source": "cloudflare"` 是关键** —— 说明真的在调用 Cloudflare TURN API 并返回了公网 relay 地址。
+
+**⚠️ 常见错误**
+
+| 错误现象 | 原因 | 修复 |
 |:---|:---|:---|
-| `TURN_KEY_ID` | `你的TURN_KEY_ID` | Text |
-| `TURN_KEY_API_TOKEN` | `你的API_TOKEN` | **Secret** |
-
-**⚠️ `TURN_KEY_API_TOKEN` 必须选 Secret 类型**（加密存储，Dashboard 显示 `****`）。
+| `"source": "custom"` | Cloudflare 返回解析失败（旧版代码把 `iceServers` 当数组） | 升级到最新 `index.ts` |
+| `"source": "none"` | 未配置 TURN | 按上文配置 |
+| `"success": false, "error": "TURN not configured"` | 环境变量名写错 | 确认是 `TURN_KEY_ID` / `TURN_KEY_API_TOKEN` |
+| HTTP 401 | `TURN_KEY_API_TOKEN` 值不对 | 重新创建 TURN Key 并替换 |
+| 客户端 relay 是 `172.16.x.x` 之类内网地址 | 用的是自定义 TURN（coturn 未配 `external-ip`） | 修 coturn 或切 Cloudflare TURN |
 
 ### 方式 2：自定义 TURN 服务器
 
@@ -250,47 +327,84 @@ Type:  Text
 | `TURN_USERNAME` | `default_user` |
 | `TURN_PASSWORD` | `default_pass` |
 
+### ⚠️ 自建 coturn 必须配 `external-ip`
+
+如果你的 TURN 服务器在**云厂商 NAT 网关后面**（如阿里云、腾讯云、大部分 VPS），必须在 `/etc/turnserver.conf` 里加：
+
+```conf
+# 格式：公网IP/私网IP
+external-ip=<你的公网IP>/<你的私网IP>
+```
+
+**示例**：
+
+```conf
+external-ip=47.76.28.111/172.16.96.4
+```
+
+**不配的后果**：客户端拿到的 relay 地址是 **`172.16.x.x` 之类的内网地址**，公网根本不可达 → TURN 中继完全不可用。
+
+**改完重启**：
+
+```bash
+sudo systemctl restart coturn
+```
+
+**验证**：客户端日志里 relay 地址应该是**公网 IP**：
+
+```
+[TURN-Lite] ✅ Allocation 成功: relay=47.76.28.111:xxxxx    ← 公网可达
+```
+
 ### 配置优先级
 
 ```
 1. Cloudflare TURN（TURN_KEY_ID + TURN_KEY_API_TOKEN 都配了）
-   ↓ 都失败/未配
+   ↓ 调用失败
 2. 自定义 TURN（TURN_SERVERS 配了）
    ↓ 都失败/未配
 3. 客户端自动降级到 WebSocket 中继
 ```
 
-### 验证 TURN 配置
+**注意**：如果同时配了 Cloudflare TURN 和自定义 TURN，Cloudflare TURN **优先**；只有它返回空时才 fallback 到自定义 TURN。
 
-```bash
-curl -s "https://edge-signal.xxx.workers.dev/api/turn-credentials" | jq
-```
-
-**未配**：
-```json
-{"success": false, "error": "TURN not configured", "servers": []}
-```
-
-**配了自定义 TURN**：
-```json
-{
-  "success": true,
-  "source": "custom",
-  "servers": [
-    {
-      "url": "turn:111.171.194.230:3478",
-      "username": "test",
-      "password": "test",
-      "ttl": 86400
-    }
-  ]
-}
-```
-
-**查看部署级 TURN 配置（脱敏，面板用）**：
+### 查看当前 TURN 配置（脱敏）
 
 ```bash
 curl -s "https://edge-signal.xxx.workers.dev/api/public/turn-config" | jq
+```
+
+**未配**：
+
+```json
+{
+  "enabled": false,
+  "source": "none",
+  "servers": [],
+  "priority": []
+}
+```
+
+**配了 Cloudflare TURN**：
+
+```json
+{
+  "enabled": true,
+  "source": "cloudflare",
+  "servers": [],
+  "priority": ["cloudflare"]
+}
+```
+
+**配了自定义 TURN**：
+
+```json
+{
+  "enabled": true,
+  "source": "custom",
+  "servers": [{"url": "turn:111.171.194.230:3478"}],
+  "priority": ["custom"]
+}
 ```
 
 ## 📊 面板
@@ -429,9 +543,9 @@ edge-signal/
 |:---|:---|
 | **梯级签名** | backoff 签名含梯级：`sender->receiver@rung`。梯级变化时立即重试，不受旧退避抑制 |
 | **in-flight 去重** | 派发后写入 in-flight 表，10s 内不重复派发 |
-| **InProgress 刷新** | 客户端收到指令立即上报 InProgress，服务端刷新 in-flight 窗口，覆盖 `sendDelayMs` 期间 |
-| **首次交叉校验** | 首次成功时校验客户端自报的 `p2pStatus`；通过后 `everValidated=true`，后续成功不再校验 |
-| **成功退役** | **双方**都不在 P2P 且超过 30s 宽限期时，清空成功记录，重新协调 |
+| **InProgress 刷新** | 客户端收到指令立即上报 InProgress，服务端刷新 in-flight 窗口 |
+| **首次交叉校验** | 首次成功时校验客户端自报的 `p2pStatus`；通过后 `everValidated=true` |
+| **成功退役** | 双方都不在 P2P 且超过 30s 宽限期时，清空成功记录，重新协调 |
 | **退避上限** | 60s（不是 300s，避免无意义的等待） |
 | **失败惩罚** | -2（与成功 +2 对称） |
 | **tie-break** | rung 0 > rung 4/5 > 其他 |
@@ -450,14 +564,14 @@ edge-signal/
 **问题**：A 的 probe 命中了 B，B 的 probe 因丢包没到 A。B 单方面报 `state=3` 会导致服务端认为 pair 已完成，A 永远收不到指令。
 
 **修复**：
-- **客户端侧**：`hasTrafficFromTarget(peerID, since)` 只检查目标 peer 的 `lastRecvAt`，而不是 `hasTrafficFromAny`（只比对 IP，同 CGNAT 时任何来自同出口 IP 的包都误判成功）
-- **服务端侧**：`coordinate()` 的 `bothSucceeded` 要求 `aState === 3 && bState === 3` 才跳过协调
+- **客户端侧**：`hasTrafficFromTarget(peerID, since)` 只检查目标 peer 的 `lastRecvAt`
+- **服务端侧**：`coordinate()` 的 `anySucceeded` 允许任一端成功即停止协调
 
 ### 端口扫描范围
 
 **问题**：HardNAT 下两端上报的 `pubSocket` 端口是"发到 STUN 时"的端口，但两端 STUN 时刻不同——CGNAT 中间可能为其他连接分配了几十个端口，导致真实出口端口差距很大。
 
-**解法**：扫描范围必须至少覆盖这个差距。
+**解法**：
 
 ```javascript
 // NAT 行为差异（来自客户端上报的 portsDifference 之差）
@@ -474,8 +588,6 @@ if (halfWidth > 100) halfWidth = 100;
 ```
 
 **客户端侧分阶段扫描**：
-
-服务端下发 `portsRangeFrom` / `portsRangeTo` 作为参考。客户端**实际执行**按分级递增：
 
 | 层 | 范围 | 本轮增量端口数 | 累计 |
 |:---|:---|:---|:---|
@@ -501,7 +613,7 @@ GET /api/admin/nathole/<room>?token=<ADMIN_TOKEN>
 
 返回：
 - `backoff`：所有 pair 的退避窗口
-- `punch`：所有 pair 的打洞状态（含 `aState` / `bState` / `aP2PStatus` / `bP2PStatus` / `everValidated`）
+- `punch`：所有 pair 的打洞状态
 - `inflight`：所有 in-flight 条目
 
 ## 🚨 限制
@@ -551,7 +663,7 @@ GET /api/admin/nathole/<room>?token=<ADMIN_TOKEN>
 
 **修复**：
 - 客户端用 `hasTrafficFromTarget` 替代 `hasTrafficFromAny`
-- 服务端用 `bothSucceeded` 替代 `anySucceeded`
+- 服务端用 `anySucceeded` 替代 `bothSucceeded`
 
 ### Q: 同 STUN 出口 IP 时疯狂打洞？
 
@@ -599,7 +711,7 @@ GET /api/admin/nathole/<room>?token=<ADMIN_TOKEN>
 
 **修复**：
 1. 优先让 P2P 打通（hairpin）
-2. 配置 TURN（`TURN_SERVERS`），让流量走 TURN 而不是 Worker
+2. 配置 TURN，让流量走 TURN 而不是 Worker
 
 ### Q: `natType` 显示不一致（一端 HardNAT、一端 EasyNAT）？
 
@@ -611,7 +723,7 @@ GET /api/admin/nathole/<room>?token=<ADMIN_TOKEN>
 
 **CGNAT 端口漂移**。客户端上报的 `pubSocket` 端口在打洞时已经过期。
 
-**修复**：客户端**启用 UDP 保活**（每 5 秒刷新 STUN 映射），让端口保持稳定。检查客户端版本。
+**修复**：客户端**启用 UDP 保活**（每 5 秒刷新 STUN 映射）。检查客户端版本。
 
 ### Q: 房间清理不掉？
 
@@ -662,6 +774,7 @@ curl -s "https://edge-signal.xxx.workers.dev/api/public/turn-config" | jq
 ```
 
 **未配**：
+
 ```json
 {
   "enabled": false,
@@ -672,6 +785,7 @@ curl -s "https://edge-signal.xxx.workers.dev/api/public/turn-config" | jq
 ```
 
 **配了自定义 TURN**：
+
 ```json
 {
   "enabled": true,
@@ -679,6 +793,80 @@ curl -s "https://edge-signal.xxx.workers.dev/api/public/turn-config" | jq
   "servers": [{"url": "turn:111.171.194.230:3478"}],
   "priority": ["custom"]
 }
+```
+
+### Q: `curl /api/turn-credentials` 返回 `"source": "custom"`，但我配了 Cloudflare TURN？
+
+**症状**：明明设置了 `TURN_KEY_ID` 和 `TURN_KEY_API_TOKEN`，但 `source` 一直是 `custom`。
+
+**原因**：旧版 `index.ts` 里 `generateCloudflareTURN` 有个 bug：
+
+```typescript
+for (const ice of data.iceServers || []) {  // ← iceServers 是对象，不是数组
+```
+
+**`for...of` 对对象会抛 `TypeError`**，或者 `iceServers` 为 undefined 时循环不执行 → `servers` 为空 → fallback 到 `custom`。
+
+**修复**：
+
+1. 用最新版 `index.ts`（本仓库 main 分支）替换
+2. `npx wrangler deploy`
+3. 重新验证：
+
+```bash
+curl -s "https://xxx.workers.dev/api/turn-credentials" | jq '.source'
+# 应该输出 "cloudflare"
+```
+
+### Q: 客户端日志里 TURN relay 是 `172.16.x.x` 之类内网地址？
+
+**症状**：
+
+```
+[TURN-Lite] ✅ Allocation 成功: relay=172.16.96.4:58882
+```
+
+**`172.16.x.x` 是 RFC 1918 私有地址**，公网不可达。
+
+**原因**：你用的是**自建 coturn**，且**没配 `external-ip`**。
+
+**修复**：
+
+```bash
+ssh root@<你的 TURN 服务器 IP>
+sudo nano /etc/turnserver.conf
+# 加一行：
+external-ip=<公网IP>/<私网IP>
+# 例如：
+external-ip=47.76.28.111/172.16.96.4
+sudo systemctl restart coturn
+```
+
+**验证**：
+
+```bash
+# 客户端重启后，relay 应该是公网地址
+[TURN-Lite] ✅ Allocation 成功: relay=47.76.28.111:xxxxx
+```
+
+**替代方案**：切换到 Cloudflare TURN（本文「方式 1」），`172.16.x.x` 问题彻底消失。
+
+### Q: `TURN_KEY_API_TOKEN` 忘了怎么办？
+
+**无法找回**——Cloudflare 只显示一次。
+
+**修复**：
+
+1. Cloudflare Dashboard → Realtime → TURN Keys
+2. **删除**旧的 TURN Key
+3. **Create** 一个新的
+4. **立即复制** Token ID 和 API Token
+5. 更新 Worker 环境变量：
+
+```bash
+npx wrangler secret put TURN_KEY_ID
+npx wrangler secret put TURN_KEY_API_TOKEN
+npx wrangler deploy
 ```
 
 ### Q: 面板上设备代号（A/B/C/D）会变吗？
