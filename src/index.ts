@@ -68,7 +68,7 @@ function isTURNEnabled(env: Env): boolean {
   return hasCloudflareTURN(env) || hasCustomTURN(env);
 }
 
-// ============ TURN URL 解析 ============
+// ============ TURN URL 解析（自定义 TURN 用） ============
 
 function parseTURNUrl(
   raw: string,
@@ -155,11 +155,46 @@ function generateCustomTURN(
   return servers;
 }
 
+// ============ Cloudflare TURN 凭证 ============
+
+/**
+ * 生成 Cloudflare TURN 凭证。
+ *
+ * 端点：https://rtc.live.cloudflare.com/v1/turn/keys/{keyId}/credentials/generate-ice-servers
+ * 认证：Bearer <TURN_KEY_API_TOKEN>
+ *
+ * 新端点响应（数组格式）：
+ * {
+ *   "iceServers": [
+ *     { "urls": ["stun:stun.cloudflare.com:3478"] },
+ *     {
+ *       "urls": [
+ *         "turn:turn.cloudflare.com:3478?transport=udp",
+ *         "turn:turn.cloudflare.com:3478?transport=tcp",
+ *         "turns:turn.cloudflare.com:5349?transport=tcp"
+ *       ],
+ *       "username": "xxx",
+ *       "credential": "yyy"
+ *     }
+ *   ]
+ * }
+ *
+ * 旧端点响应（对象格式，本函数兼容）：
+ * {
+ *   "iceServers": {
+ *     "urls": [...],
+ *     "username": "xxx",
+ *     "credential": "yyy"
+ *   }
+ * }
+ */
 async function generateCloudflareTURN(
   env: Env,
   ttl: number
 ): Promise<Array<{ url: string; username: string; password: string; ttl: number }>> {
-  const apiUrl = `https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/generate`;
+  const apiUrl =
+    `https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/generate-ice-servers`;
+
   const resp = await fetch(apiUrl, {
     method: "POST",
     headers: {
@@ -170,47 +205,79 @@ async function generateCloudflareTURN(
   });
 
   if (!resp.ok) {
-    console.error("[TURN] Cloudflare API failed:", resp.status, await resp.text());
+    const errText = await resp.text().catch(() => "");
+    console.error("[TURN] Cloudflare API failed:", resp.status, errText);
     return [];
   }
 
   const data: any = await resp.json();
   const servers: Array<{ url: string; username: string; password: string; ttl: number }> = [];
 
-  for (const ice of data.iceServers || []) {
-    for (const u of ice.urls || []) {
+  const iceServers = data?.iceServers;
+  if (!iceServers) {
+    console.error("[TURN] Cloudflare 响应无 iceServers:", JSON.stringify(data));
+    return [];
+  }
+
+  // 场景 1：新端点返回数组
+  if (Array.isArray(iceServers)) {
+    for (const ice of iceServers) {
+      if (!ice) continue;
+      const username = ice.username || "";
+      const credential = ice.credential || "";
+      const urls: string[] = Array.isArray(ice.urls)
+        ? ice.urls
+        : (typeof ice.urls === "string" ? [ice.urls] : []);
+
+      for (const u of urls) {
+        if (typeof u !== "string") continue;
+        if (u.startsWith("turn:") || u.startsWith("turns:")) {
+          servers.push({
+            url: u,
+            username,
+            password: credential,
+            ttl,
+          });
+        }
+      }
+    }
+    return servers;
+  }
+
+  // 场景 2：旧端点返回对象（兼容）
+  if (typeof iceServers === "object") {
+    const username = iceServers.username || "";
+    const credential = iceServers.credential || "";
+    const urls: string[] = Array.isArray(iceServers.urls)
+      ? iceServers.urls
+      : (typeof iceServers.urls === "string" ? [iceServers.urls] : []);
+
+    for (const u of urls) {
+      if (typeof u !== "string") continue;
       if (u.startsWith("turn:") || u.startsWith("turns:")) {
         servers.push({
           url: u,
-          username: ice.username,
-          password: ice.credential,
+          username,
+          password: credential,
           ttl,
         });
       }
     }
+    return servers;
   }
 
-  return servers;
+  console.error("[TURN] Cloudflare 响应 iceServers 格式未知:", typeof iceServers);
+  return [];
 }
 
-// ============ ★ 新增：只暴露 TURN 服务器 URL（剥离凭证）============
+// ============ 公开 TURN 信息（脱敏） ============
 
-/**
- * 返回部署级 TURN 配置的脱敏视图。
- *
- * - 自定义 TURN：从 TURN_SERVERS 解析出每个服务器的 URL，去掉 user:pass
- * - Cloudflare TURN：凭证是每次动态生成的，无法静态暴露，只报 source
- *
- * 这个端点给面板显示用，不返回任何密码/token，所以放在 /api/public/ 下
- * 无鉴权即可。
- */
 function publicTURNInfo(env: Env): {
   enabled: boolean;
   source: "cloudflare" | "custom" | "none";
   servers: Array<{ url: string }>;
   priority: Array<"cloudflare" | "custom">;
 } {
-  // 优先级：Cloudflare TURN > 自定义 TURN，和 /api/turn-credentials 一致
   if (hasCloudflareTURN(env)) {
     const priority: Array<"cloudflare" | "custom"> = ["cloudflare"];
     if (hasCustomTURN(env)) priority.push("custom");
@@ -227,7 +294,7 @@ function publicTURNInfo(env: Env): {
     return {
       enabled: true,
       source: "cloudflare",
-      servers,        // 自定义 TURN 作为 fallback，一并列出
+      servers,
       priority,
     };
   }
@@ -317,7 +384,6 @@ export default {
 
     // ========== 公开 API ==========
 
-    // ★ 新增：TURN 配置脱敏视图（面板显示用）
     if (pathname === "/api/public/turn-config") {
       return jsonResp(publicTURNInfo(env));
     }
