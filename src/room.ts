@@ -22,7 +22,7 @@ interface PeerRecord {
   regularPortsChange: boolean;
   behavior: string;
   assistedSockets: string[];
-  lanEndpoints: string[];   // ★ 新增
+  lanEndpoints: string[];
   observedRaddr: string;
   turnRelayAddr: string;
   relayBytesIn: number;
@@ -40,6 +40,7 @@ const COMMUNITY_STORAGE_KEY = "community";
 const OFFLINE_TTL_MS = 30 * 60 * 1000;
 const SAVE_THROTTLE_MS = 3 * 1000;
 const SERVER_PING_INTERVAL_MS = 30 * 1000;
+const PEER_STALE_MS = 90 * 1000;   // ★ 90s 无消息视为掉线
 
 const DEFAULT_VIRTUAL_NETWORK = "10.64.0.0/24";
 
@@ -180,23 +181,92 @@ export class Room extends DurableObject {
     return ((ipInt & mask) >>> 0) === this.virtualBase;
   }
 
-  // ============ server-ping ============
+  // ============ server-ping + stale 检测 ============
 
   private startServerPing(): void {
     if (this.serverPingTimer !== null) return;
 
     this.serverPingTimer = setInterval(() => {
-      if (this.sessions.size === 0) return;
-      const data = JSON.stringify({ type: "server_ping", ts: Date.now() });
-      for (const [id, ws] of this.sessions) {
-        try {
-          ws.send(data);
-        } catch (e) {
-          console.log(`[Room] server_ping 发送失败 ${id}，清理 session`);
-          this.sessions.delete(id);
+      if (this.sessions.size === 0 && this.peers.size === 0) return;
+
+      // 1. 发 server_ping（心跳）
+      if (this.sessions.size > 0) {
+        const data = JSON.stringify({ type: "server_ping", ts: Date.now() });
+        for (const [id, ws] of this.sessions) {
+          try {
+            ws.send(data);
+          } catch (e) {
+            console.log(`[Room] server_ping 发送失败 ${id}，清理 session`);
+            this.sessions.delete(id);
+          }
         }
       }
+
+      // 2. ★ 检测 stale peer（僵尸连接）
+      this.detectStalePeers();
     }, SERVER_PING_INTERVAL_MS);
+  }
+
+  // detectStalePeers 检测长期没有消息的 online peer。
+  //
+  // 场景：客户端网络断了（TCP 半死），服务端的 server_ping 发不出去也
+  // 收不到响应，但 ws.send() 表面成功、webSocketClose 也不触发 → peer
+  // 一直显示 online，其他客户端永远不知道它掉了。
+  //
+  // 修复：检查 peer.lastSeen，超过 PEER_STALE_MS 主动：
+  //   1. 关闭 ws（触发 webSocketClose）
+  //   2. 标记 offline
+  //   3. broadcast left 给所有其他在线 peer
+  private detectStalePeers(): void {
+    const now = Date.now();
+
+    for (const [id, p] of this.peers) {
+      if (!p.online) continue;
+
+      // 情况 A：session 丢失但 peer 还标记 online
+      const ws = this.sessions.get(id);
+      if (!ws) {
+        p.online = false;
+        p.disconnectedAt = now;
+        p.connections = new Map();
+        p.pubSocket = "";
+        p.p2pEndpoint = "";
+        p.publicEndpoint = "";
+        if (p.virtualIp) this.ipToClient.delete(p.virtualIp);
+        this.coordinator.clearPairStateFor(id);
+        this.broadcast(id, { type: "left", from: id });
+        console.log(`[Room] ${id} session 丢失（无 ws），标记离线并广播 left`);
+        continue;
+      }
+
+      // 情况 B：lastSeen 超时
+      const idleMs = now - (p.lastSeen || 0);
+      if (idleMs > PEER_STALE_MS) {
+        console.log(
+          `[Room] ${id} 心跳超时 ${Math.round(idleMs / 1000)}s（阈值 ${PEER_STALE_MS / 1000}s），` +
+          `主动关闭 ws 并广播 left`
+        );
+        // 先标记 offline，避免 webSocketClose 重复处理
+        p.online = false;
+        p.disconnectedAt = now;
+        p.connections = new Map();
+        p.pubSocket = "";
+        p.p2pEndpoint = "";
+        p.publicEndpoint = "";
+        if (p.virtualIp) this.ipToClient.delete(p.virtualIp);
+        this.coordinator.clearPairStateFor(id);
+
+        // 关闭 ws（后续 webSocketClose 会走一遍 cleanup，幂等）
+        try {
+          ws.close(1000, "Stale: no heartbeat");
+        } catch (e) {}
+
+        this.sessions.delete(id);
+
+        // 广播 left，让其他客户端立刻清掉这个 peer
+        this.broadcast(id, { type: "left", from: id });
+      }
+    }
   }
 
   private stopServerPing(): void {
@@ -245,7 +315,7 @@ export class Room extends DurableObject {
             regularPortsChange: !!p.regularPortsChange,
             behavior: p.behavior || "",
             assistedSockets: Array.isArray(p.assistedSockets) ? p.assistedSockets : [],
-            lanEndpoints: Array.isArray(p.lanEndpoints) ? p.lanEndpoints : [],   // ★ 新增
+            lanEndpoints: Array.isArray(p.lanEndpoints) ? p.lanEndpoints : [],
             observedRaddr: p.observedRaddr || "",
             turnRelayAddr: p.turnRelayAddr || "",
             relayBytesIn: p.relayBytesIn || 0,
@@ -298,7 +368,7 @@ export class Room extends DurableObject {
           natType: p.natType, portsDifference: p.portsDifference,
           regularPortsChange: p.regularPortsChange, behavior: p.behavior,
           assistedSockets: p.assistedSockets, observedRaddr: p.observedRaddr,
-          lanEndpoints: p.lanEndpoints || [],   // ★ 新增
+          lanEndpoints: p.lanEndpoints || [],
           turnRelayAddr: p.turnRelayAddr, relayBytesIn: p.relayBytesIn,
           relayBytesOut: p.relayBytesOut, relayPacketsIn: p.relayPacketsIn,
           relayPacketsOut: p.relayPacketsOut, _publicIp: p._publicIp,
@@ -432,7 +502,7 @@ export class Room extends DurableObject {
           natType: p.natType || "unknown",
           turnRelayAddr: p.turnRelayAddr || "",
           assistedEndpoints: p.assistedSockets || [],
-          lanEndpoints: p.lanEndpoints || [],   // ★ 新增
+          lanEndpoints: p.lanEndpoints || [],
         };
       });
 
@@ -476,7 +546,7 @@ export class Room extends DurableObject {
         pubSocket: "", p2pEndpoint: "", publicEndpoint: "",
         natType: "unknown", portsDifference: 0, regularPortsChange: false,
         behavior: "BehaviorPortChanged", assistedSockets: [], observedRaddr: "",
-        lanEndpoints: [],   // ★ 新增
+        lanEndpoints: [],
         turnRelayAddr: "", relayBytesIn: 0, relayBytesOut: 0, relayPacketsIn: 0, relayPacketsOut: 0,
         _publicIp: publicIp,
         multiExit: false,
@@ -550,7 +620,6 @@ export class Room extends DurableObject {
             );
           }
 
-          // ★ 新增：解析 LAN 地址
           if (Array.isArray(p.lanEndpoints)) {
             peer.lanEndpoints = p.lanEndpoints.filter(
               (s: any) => typeof s === "string" && s
@@ -593,7 +662,7 @@ export class Room extends DurableObject {
               natType: peer.natType || "unknown",
               turnRelayAddr: peer.turnRelayAddr || "",
               assistedEndpoints: peer.assistedSockets || [],
-              lanEndpoints: peer.lanEndpoints || [],   // ★ 新增
+              lanEndpoints: peer.lanEndpoints || [],
             },
           });
         }
@@ -682,7 +751,10 @@ export class Room extends DurableObject {
     const clientId = this.findClientId(ws);
     if (clientId) {
       const peer = this.peers.get(clientId);
-      if (peer) {
+      // ★ 如果 detectStalePeers 已经处理过（peer.online=false 且 sessions 里没这个 ws）
+      //   就不再重复广播
+      const alreadyHandled = peer && !peer.online && !this.sessions.has(clientId);
+      if (peer && !alreadyHandled) {
         peer.online = false;
         peer.disconnectedAt = Date.now();
         peer.connections = new Map();
@@ -692,8 +764,10 @@ export class Room extends DurableObject {
       }
       this.sessions.delete(clientId);
       if (peer?.virtualIp) this.ipToClient.delete(peer.virtualIp);
-      this.coordinator.clearPairStateFor(clientId);
-      this.broadcast(clientId, { type: "left", from: clientId });
+      if (!alreadyHandled) {
+        this.coordinator.clearPairStateFor(clientId);
+        this.broadcast(clientId, { type: "left", from: clientId });
+      }
       await this.reportToRegistry(true);
       await this.saveStateNow();
 
@@ -796,7 +870,7 @@ export class Room extends DurableObject {
         turnRelayAddr: p.turnRelayAddr, natType: p.natType,
         multiExit: !!p.multiExit,
         assistedSockets: p.assistedSockets || [],
-        lanEndpoints: p.lanEndpoints || [],   // ★ 新增
+        lanEndpoints: p.lanEndpoints || [],
         online: p.online, connectedAt: p.connectedAt, lastSeen: p.lastSeen, disconnectedAt: p.disconnectedAt,
         onlineFor: now - p.connectedAt,
         offlineFor: p.online ? 0 : (p.disconnectedAt ? now - p.disconnectedAt : 0),
