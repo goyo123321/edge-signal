@@ -40,7 +40,7 @@ const COMMUNITY_STORAGE_KEY = "community";
 const OFFLINE_TTL_MS = 30 * 60 * 1000;
 const SAVE_THROTTLE_MS = 3 * 1000;
 const SERVER_PING_INTERVAL_MS = 30 * 1000;
-const PEER_STALE_MS = 90 * 1000;   // ★ 90s 无消息视为掉线
+const PEER_STALE_MS = 90 * 1000;
 
 const DEFAULT_VIRTUAL_NETWORK = "10.64.0.0/24";
 
@@ -202,7 +202,7 @@ export class Room extends DurableObject {
         }
       }
 
-      // 2. ★ 检测 stale peer（僵尸连接）
+      // 2. 检测 stale peer（僵尸连接）
       this.detectStalePeers();
     }, SERVER_PING_INTERVAL_MS);
   }
@@ -751,7 +751,7 @@ export class Room extends DurableObject {
     const clientId = this.findClientId(ws);
     if (clientId) {
       const peer = this.peers.get(clientId);
-      // ★ 如果 detectStalePeers 已经处理过（peer.online=false 且 sessions 里没这个 ws）
+      // 如果 detectStalePeers 已经处理过（peer.online=false 且 sessions 里没这个 ws）
       //   就不再重复广播
       const alreadyHandled = peer && !peer.online && !this.sessions.has(clientId);
       if (peer && !alreadyHandled) {
@@ -781,6 +781,22 @@ export class Room extends DurableObject {
     await this.webSocketClose(ws);
   }
 
+  // ============ 打洞协调 ============
+
+  // runCoordination 遍历所有在线 peer，让 coordinator 决定哪些 pair 需要下发
+  // nat_hole_instruction，然后**按 role 分阶段下发**。
+  //
+  // 分阶段下发的理由（FRP parity）：
+  //   frps 把 receiver 的 NatHoleResp 立即发出，sender 的延迟 1 秒
+  //   （pkg/nathole/controller.go:229-240）。receiver 先发探测包会在
+  //   它的 NAT 上打开映射，sender 稍后才有包出去时，对端才能收到。
+  //   两端同时发时，sender 的第一个包往往因为对端 NAT 尚未打开而丢失。
+  //
+  // 实现要点：
+  //   1. 按 role（0=sender / 1=receiver）分组
+  //   2. receiver 组立即下发
+  //   3. sender 组延迟 `senderDelayMs`（默认 1000ms，ladder entry 可覆盖）
+  //   4. sender 延迟期间 await，DO 存活期内可靠
   private async runCoordination(): Promise<void> {
     const onlinePeers = Array.from(this.peers.values()).filter((p) => p.online);
     if (onlinePeers.length < 2) return;
@@ -807,9 +823,18 @@ export class Room extends DurableObject {
     }
 
     if (instructions.size === 0) return;
+
+    // 按 role 分组
+    const receivers: Array<[string, any]> = [];
+    const senders: Array<[string, any]> = [];
     for (const [mac, instr] of instructions) {
+      if (instr.role === 0) senders.push([mac, instr]);
+      else receivers.push([mac, instr]);
+    }
+
+    const sendOne = (mac: string, instr: any) => {
       const targetWs = this.sessions.get(mac);
-      if (!targetWs) continue;
+      if (!targetWs) return;
       try {
         targetWs.send(JSON.stringify({
           type: "nat_hole_instruction",
@@ -820,8 +845,36 @@ export class Room extends DurableObject {
       } catch (e) {
         console.error(`[Room] 发送给 ${mac} 失败:`, e);
       }
+    };
+
+    // receiver 立即
+    for (const [mac, instr] of receivers) sendOne(mac, instr);
+
+    // sender 延迟
+    if (senders.length > 0) {
+      let delayMs = this.coordinator.getSenderDelayMs
+        ? this.coordinator.getSenderDelayMs()
+        : 1000;
+
+      // ladder entry 可以覆盖（entry 6-9 带 sendDelayMs 5000/10000）
+      for (const [, instr] of senders) {
+        if (instr.sendDelayMs && instr.sendDelayMs > 0) {
+          delayMs = instr.sendDelayMs;
+          break;
+        }
+      }
+
+      if (delayMs <= 0) {
+        for (const [mac, instr] of senders) sendOne(mac, instr);
+      } else {
+        await new Promise((r) => setTimeout(r, delayMs));
+        for (const [mac, instr] of senders) sendOne(mac, instr);
+        console.log(`[Room] sender 指令延迟 ${delayMs}ms 后下发（${senders.length} 个）`);
+      }
     }
   }
+
+  // ============ 状态查询 ============
 
   private getStatusResponse(publicOnly = false): Response {
     const now = Date.now();
