@@ -22,6 +22,7 @@ interface PeerRecord {
   regularPortsChange: boolean;
   behavior: string;
   assistedSockets: string[];
+  lanEndpoints: string[];   // ★ 新增
   observedRaddr: string;
   turnRelayAddr: string;
   relayBytesIn: number;
@@ -40,7 +41,6 @@ const OFFLINE_TTL_MS = 30 * 60 * 1000;
 const SAVE_THROTTLE_MS = 3 * 1000;
 const SERVER_PING_INTERVAL_MS = 30 * 1000;
 
-// ★ 虚拟网段默认值（环境变量 VIRTUAL_NETWORK 未配置时使用）
 const DEFAULT_VIRTUAL_NETWORK = "10.64.0.0/24";
 
 interface ParsedCIDR {
@@ -50,10 +50,6 @@ interface ParsedCIDR {
   cidr: string;
 }
 
-// parseCIDR 解析 IPv4 CIDR，例如 "10.64.0.0/24"
-//
-// 支持：/16 ~ /30
-// 自动对齐网络地址（比如传 10.64.0.5/24 会规范化成 10.64.0.0/24）
 function parseCIDR(cidr: string): ParsedCIDR | null {
   if (!cidr) return null;
   const parts = cidr.trim().split("/");
@@ -122,7 +118,6 @@ export class Room extends DurableObject {
   private lastSaveAt = 0;
   private pendingSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // ★ server-ping 定时器
   private serverPingTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(state: DurableObjectState, env: any) {
@@ -187,9 +182,6 @@ export class Room extends DurableObject {
 
   // ============ server-ping ============
 
-  // 每 30 秒向所有 session 发 server_ping。
-  // 客户端收到立即回 server_pong。
-  // 若客户端 90 秒内无任何消息，客户端会主动重连。
   private startServerPing(): void {
     if (this.serverPingTimer !== null) return;
 
@@ -253,6 +245,7 @@ export class Room extends DurableObject {
             regularPortsChange: !!p.regularPortsChange,
             behavior: p.behavior || "",
             assistedSockets: Array.isArray(p.assistedSockets) ? p.assistedSockets : [],
+            lanEndpoints: Array.isArray(p.lanEndpoints) ? p.lanEndpoints : [],   // ★ 新增
             observedRaddr: p.observedRaddr || "",
             turnRelayAddr: p.turnRelayAddr || "",
             relayBytesIn: p.relayBytesIn || 0,
@@ -305,6 +298,7 @@ export class Room extends DurableObject {
           natType: p.natType, portsDifference: p.portsDifference,
           regularPortsChange: p.regularPortsChange, behavior: p.behavior,
           assistedSockets: p.assistedSockets, observedRaddr: p.observedRaddr,
+          lanEndpoints: p.lanEndpoints || [],   // ★ 新增
           turnRelayAddr: p.turnRelayAddr, relayBytesIn: p.relayBytesIn,
           relayBytesOut: p.relayBytesOut, relayPacketsIn: p.relayPacketsIn,
           relayPacketsOut: p.relayPacketsOut, _publicIp: p._publicIp,
@@ -354,7 +348,7 @@ export class Room extends DurableObject {
       for (const [_, ws] of this.sessions) { try { ws.close(1000, "Admin cleanup"); } catch {} }
       await new Promise((r) => setTimeout(r, 300));
       this.sessions.clear();
-      this.stopServerPing();  // ★
+      this.stopServerPing();
       this.peers.clear();
       this.ipToClient.clear();
       try {
@@ -438,6 +432,7 @@ export class Room extends DurableObject {
           natType: p.natType || "unknown",
           turnRelayAddr: p.turnRelayAddr || "",
           assistedEndpoints: p.assistedSockets || [],
+          lanEndpoints: p.lanEndpoints || [],   // ★ 新增
         };
       });
 
@@ -481,6 +476,7 @@ export class Room extends DurableObject {
         pubSocket: "", p2pEndpoint: "", publicEndpoint: "",
         natType: "unknown", portsDifference: 0, regularPortsChange: false,
         behavior: "BehaviorPortChanged", assistedSockets: [], observedRaddr: "",
+        lanEndpoints: [],   // ★ 新增
         turnRelayAddr: "", relayBytesIn: 0, relayBytesOut: 0, relayPacketsIn: 0, relayPacketsOut: 0,
         _publicIp: publicIp,
         multiExit: false,
@@ -490,7 +486,6 @@ export class Room extends DurableObject {
     this.ipToClient.set(peer.virtualIp, clientId);
     this.sessions.set(clientId, server);
 
-    // ★ 启动 server-ping 定时器（首次）
     this.startServerPing();
 
     await this.reportToRegistry(true);
@@ -525,7 +520,6 @@ export class Room extends DurableObject {
     if (peer) peer.lastSeen = Date.now();
 
     switch (msg.type) {
-      // ★ 客户端对 server_ping 的回应
       case "server_pong":
         return;
 
@@ -556,6 +550,13 @@ export class Room extends DurableObject {
             );
           }
 
+          // ★ 新增：解析 LAN 地址
+          if (Array.isArray(p.lanEndpoints)) {
+            peer.lanEndpoints = p.lanEndpoints.filter(
+              (s: any) => typeof s === "string" && s
+            );
+          }
+
           if (typeof p.p2pEndpoint === "string" && p.p2pEndpoint) peer.p2pEndpoint = p.p2pEndpoint;
 
           const publicEndpoint = typeof p.publicEndpoint === "string" ? p.publicEndpoint : "";
@@ -579,7 +580,7 @@ export class Room extends DurableObject {
           console.log(
             `[Room] p2p_metadata from ${from}: natType=${peer.natType} ` +
             `pub=${addr.ip}:${addr.port} (pubSocket=${peer.pubSocket || "<empty>"}) ` +
-            `multiExit=${peer.multiExit || false} assisted=${peer.assistedSockets.length}`
+            `lan=${(peer.lanEndpoints || []).length} multiExit=${peer.multiExit || false} assisted=${peer.assistedSockets.length}`
           );
 
           this.broadcast(from, {
@@ -592,6 +593,7 @@ export class Room extends DurableObject {
               natType: peer.natType || "unknown",
               turnRelayAddr: peer.turnRelayAddr || "",
               assistedEndpoints: peer.assistedSockets || [],
+              lanEndpoints: peer.lanEndpoints || [],   // ★ 新增
             },
           });
         }
@@ -695,7 +697,6 @@ export class Room extends DurableObject {
       await this.reportToRegistry(true);
       await this.saveStateNow();
 
-      // 房间空则停 ping
       if (this.sessions.size === 0) {
         this.stopServerPing();
       }
@@ -795,6 +796,7 @@ export class Room extends DurableObject {
         turnRelayAddr: p.turnRelayAddr, natType: p.natType,
         multiExit: !!p.multiExit,
         assistedSockets: p.assistedSockets || [],
+        lanEndpoints: p.lanEndpoints || [],   // ★ 新增
         online: p.online, connectedAt: p.connectedAt, lastSeen: p.lastSeen, disconnectedAt: p.disconnectedAt,
         onlineFor: now - p.connectedAt,
         offlineFor: p.online ? 0 : (p.disconnectedAt ? now - p.disconnectedAt : 0),
@@ -907,8 +909,6 @@ export class Room extends DurableObject {
       }
     }
   }
-
-  // ============ IP 分配 ============
 
   private allocateIp(): string {
     const used = new Set<string>();
