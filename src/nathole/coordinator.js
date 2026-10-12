@@ -17,6 +17,11 @@ const SUCCESS_GRACE_MS = 30000;
 const CONN_P2P = "p2p";
 const P2P_FULLDUPLEX = 3;
 
+// PORTS_RANGE_NARROW：两侧端口差之上的固定缓冲。
+const PORTS_RANGE_NARROW = 100;
+// 上限：超过这个值说明两端根本不可能是同一个 CGNAT，全端口扫描没有意义。
+const PORTS_RANGE_MAX = 10000;
+
 function classifyNat(peer) {
   if (!peer || !peer.natType) {
     return {
@@ -60,7 +65,6 @@ function isIPv6Sock(sock) {
   return colonCount > 1;
 }
 
-// ★ anySucceeded：任一端成功过即可进入退役判定
 function shouldRetireSuccess(prev, a, b, now) {
   if (!prev) return false;
   if (prev.aState !== 3 && prev.bState !== 3) return false;
@@ -115,6 +119,14 @@ export class NatHoleCoordinator {
       env.NAT_SENDER_DISPATCH_DELAY_MS ?? SENDER_DISPATCH_DELAY_MS_DEFAULT,
       10
     );
+  }
+
+  // getSenderDelayMs 暴露 sender 延迟给 room.ts 使用。
+  //
+  // senderDelayMs 是实例私有惯例，room.ts 里访问会有点绕；用 getter
+  // 让外部通过明确定义的接口读取，而不是直接触碰 `this.coordinator.senderDelayMs`。
+  getSenderDelayMs() {
+    return this.senderDelayMs;
   }
 
   clearPairStateFor(mac) {
@@ -271,8 +283,8 @@ export class NatHoleCoordinator {
 
         const key = pairKeyFor(aKey, bKey);
 
-        // ★ 一边成功就停：客户端只有在「收到对端 probe 并回 5 轮」后才上报，
-        //   任一端 state=3 即代表双向通道已建立。
+        // 一边成功就停：客户端只有在「收到对端 probe 并回 5 轮」后才上报，
+        // 任一端 state=3 即代表双向通道已建立。
         const prevPunch = this.punchState.get(key);
         const anySucceeded = prevPunch &&
           (prevPunch.aState === 3 || prevPunch.bState === 3);
@@ -399,10 +411,24 @@ export class NatHoleCoordinator {
         const senderBeh = behavior.sender || {};
         const receiverBeh = behavior.receiver || {};
 
-        const senderRangeFrom = Math.max(1, bPort - 10000);
-        const senderRangeTo = Math.min(65535, bPort + 10000);
-        const receiverRangeFrom = Math.max(1, aPort - 10000);
-        const receiverRangeTo = Math.min(65535, aPort + 10000);
+        // 端口扫描范围 = max(NAT 行为差异, 两端端口差) + 缓冲。
+        //
+        // 直接写死 ±10000 太宽：HardNAT 场景下客户端会按 tier 分阶段扫，
+        // 服务端给的范围只是一个上界。但如果两端端口差本身就不大（比如
+        // 都在同一个 CGNAT 后、端口相差几十），扫描范围应该收窄，让客户端
+        // 的 tier 递进更快命中。
+        const natDiff = Math.abs(
+          (senderFeature.portsDifference || 0) - (receiverFeature.portsDifference || 0)
+        );
+        const portGap = Math.abs(aPort - bPort);
+        let halfWidth = Math.max(natDiff, portGap) + PORTS_RANGE_NARROW;
+        if (halfWidth < PORTS_RANGE_NARROW) halfWidth = PORTS_RANGE_NARROW;
+        if (halfWidth > PORTS_RANGE_MAX) halfWidth = PORTS_RANGE_MAX;
+
+        const senderRangeFrom = Math.max(1, bPort - halfWidth);
+        const senderRangeTo = Math.min(65535, bPort + halfWidth);
+        const receiverRangeFrom = Math.max(1, aPort - halfWidth);
+        const receiverRangeTo = Math.min(65535, aPort + halfWidth);
 
         const shared = {
           mode,
@@ -479,6 +505,7 @@ export class NatHoleCoordinator {
         console.log(
           `[NAT] ${key} 生成指令 (rung ${rung}), ` +
           `sender=${sender.pubSocket} receiver=${receiver.pubSocket} ` +
+          `halfWidth=±${halfWidth} ` +
           `assisted=${(receiver.assistedSockets || []).length}/${(sender.assistedSockets || []).length}`
         );
 
