@@ -38,15 +38,16 @@ const PEERS_STORAGE_KEY = "peers";
 const COMMUNITY_STORAGE_KEY = "community";
 const OFFLINE_TTL_MS = 30 * 60 * 1000;
 const SAVE_THROTTLE_MS = 3 * 1000;
+const SERVER_PING_INTERVAL_MS = 30 * 1000;
 
 // ★ 虚拟网段默认值（环境变量 VIRTUAL_NETWORK 未配置时使用）
 const DEFAULT_VIRTUAL_NETWORK = "10.64.0.0/24";
 
 interface ParsedCIDR {
-  base: number;    // unsigned 32-bit（网络地址）
-  prefix: number;  // 16 ~ 30
-  hostMax: number; // ★ 最大可用主机 offset（= 2^hostBits - 2），不是数量
-  cidr: string;    // 规范化后的 CIDR 字符串
+  base: number;
+  prefix: number;
+  hostMax: number;
+  cidr: string;
 }
 
 // parseCIDR 解析 IPv4 CIDR，例如 "10.64.0.0/24"
@@ -65,7 +66,6 @@ function parseCIDR(cidr: string): ParsedCIDR | null {
   const prefix = parseInt(parts[1], 10);
   if (isNaN(prefix) || prefix < 16 || prefix > 30) return null;
 
-  // ★ 用 >>> 0 强制无符号，避免 192.x / 100.x 被当成负数
   const rawBase =
     ((ipOctets[0] << 24) | (ipOctets[1] << 16) | (ipOctets[2] << 8) | ipOctets[3]) >>> 0;
 
@@ -73,9 +73,6 @@ function parseCIDR(cidr: string): ParsedCIDR | null {
   const alignedBase = (rawBase & mask) >>> 0;
 
   const hostBits = 32 - prefix;
-  // hostMax = 最后一个可用主机 offset
-  //   /24: 254 (offset 1..254 是主机，0=网络地址、255=广播)
-  //   /20: 4094
   const hostMax = Math.pow(2, hostBits) - 2;
 
   return {
@@ -111,7 +108,6 @@ export class Room extends DurableObject {
   private ipCounter = 2;
   private community = "";
 
-  // ★ 虚拟网段相关字段
   private virtualBase: number = 0;
   private virtualPrefix: number = 24;
   private virtualHostMax: number = 253;
@@ -126,13 +122,13 @@ export class Room extends DurableObject {
   private lastSaveAt = 0;
   private pendingSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // ★ server-ping 定时器
+  private serverPingTimer: ReturnType<typeof setInterval> | null = null;
+
   constructor(state: DurableObjectState, env: any) {
     super(state, env);
     this.coordinator = new NatHoleCoordinator(env || {});
 
-    // ★ 虚拟网段优先级：
-    //   1. env.VIRTUAL_NETWORK（wrangler.toml [vars] 或 Dashboard 环境变量）
-    //   2. DEFAULT_VIRTUAL_NETWORK（代码常量，兜底）
     const rawCidr =
       env && typeof env.VIRTUAL_NETWORK === "string" && env.VIRTUAL_NETWORK.trim()
         ? env.VIRTUAL_NETWORK.trim()
@@ -180,7 +176,6 @@ export class Room extends DurableObject {
     return { ip: "", port: 0 };
   }
 
-  // isInVirtualNetwork 检查 IP 是否在当前虚拟网段内
   private isInVirtualNetwork(ip: string): boolean {
     if (!ip) return false;
     const octets = ip.split(".").map((s) => parseInt(s, 10));
@@ -188,6 +183,35 @@ export class Room extends DurableObject {
     const ipInt = ((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]) >>> 0;
     const mask = ((0xFFFFFFFF << (32 - this.virtualPrefix)) >>> 0);
     return ((ipInt & mask) >>> 0) === this.virtualBase;
+  }
+
+  // ============ server-ping ============
+
+  // 每 30 秒向所有 session 发 server_ping。
+  // 客户端收到立即回 server_pong。
+  // 若客户端 90 秒内无任何消息，客户端会主动重连。
+  private startServerPing(): void {
+    if (this.serverPingTimer !== null) return;
+
+    this.serverPingTimer = setInterval(() => {
+      if (this.sessions.size === 0) return;
+      const data = JSON.stringify({ type: "server_ping", ts: Date.now() });
+      for (const [id, ws] of this.sessions) {
+        try {
+          ws.send(data);
+        } catch (e) {
+          console.log(`[Room] server_ping 发送失败 ${id}，清理 session`);
+          this.sessions.delete(id);
+        }
+      }
+    }, SERVER_PING_INTERVAL_MS);
+  }
+
+  private stopServerPing(): void {
+    if (this.serverPingTimer !== null) {
+      clearInterval(this.serverPingTimer);
+      this.serverPingTimer = null;
+    }
   }
 
   // ============ 从 Storage 恢复 ============
@@ -239,18 +263,14 @@ export class Room extends DurableObject {
             multiExit: !!p.multiExit,
           });
 
-          // ★ 回填 ipToClient 时过滤网段：旧网段的 VIP 不进映射表
-          //   否则老 VIP → clientId 一直有效，会误导 handleBinary 的查表
           if (p.virtualIp && p.online && this.isInVirtualNetwork(p.virtualIp)) {
             this.ipToClient.set(p.virtualIp, id);
 
-            // ★ 从 VIP 反推 host offset，更新 ipCounter
             const octets = String(p.virtualIp).split(".").map((s) => parseInt(s, 10));
             if (octets.length === 4 && !octets.some((n) => isNaN(n))) {
               const ipInt =
                 ((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]) >>> 0;
               const offset = (ipInt - this.virtualBase) >>> 0;
-              // ★ 修复 off-by-one：hostMax 是最大主机 offset，不是 hostMax+1
               if (offset >= this.ipCounter && offset <= this.virtualHostMax) {
                 this.ipCounter = offset + 1;
               }
@@ -334,6 +354,7 @@ export class Room extends DurableObject {
       for (const [_, ws] of this.sessions) { try { ws.close(1000, "Admin cleanup"); } catch {} }
       await new Promise((r) => setTimeout(r, 300));
       this.sessions.clear();
+      this.stopServerPing();  // ★
       this.peers.clear();
       this.ipToClient.clear();
       try {
@@ -429,11 +450,6 @@ export class Room extends DurableObject {
       peer.disconnectedAt = undefined;
       peer._publicIp = publicIp;
 
-      // ★ 新增：VIP 不在当前网段 → 强制重分配
-      //   场景：服务端从 10.64.0.0/24 切到 172.16.0.0/20，DO 重启后
-      //   ensureLoaded 恢复出的老 peer 还带 10.64.0.x。若不重分配：
-      //   客户端重连 → 拿到旧 VIP → 配置 TUN → 发往 10.64.0.x 的包
-      //   在 handleBinary 被 isInVirtualNetwork 拦下 → 静默丢包。
       if (peer.virtualIp && !this.isInVirtualNetwork(peer.virtualIp)) {
         const oldVip = peer.virtualIp;
         this.ipToClient.delete(oldVip);
@@ -444,7 +460,6 @@ export class Room extends DurableObject {
         );
       }
 
-      // ★ 检测 VIP 冲突：其他在线 peer 是否也占用了同一个 VIP
       const conflict = Array.from(this.peers.values()).find(
         (p) => p.clientId !== clientId && p.online && p.virtualIp === peer!.virtualIp
       );
@@ -475,6 +490,9 @@ export class Room extends DurableObject {
     this.ipToClient.set(peer.virtualIp, clientId);
     this.sessions.set(clientId, server);
 
+    // ★ 启动 server-ping 定时器（首次）
+    this.startServerPing();
+
     await this.reportToRegistry(true);
     await this.setupSaveAlarm();
     await this.saveStateNow();
@@ -485,7 +503,7 @@ export class Room extends DurableObject {
         id: clientId,
         virtualIp: peer.virtualIp,
         yourPublicIp: publicIp,
-        virtualNetwork: this.virtualCidr,   // ★ 把网段告诉客户端
+        virtualNetwork: this.virtualCidr,
         peers: onlinePeersForClient,
       },
     }));
@@ -507,6 +525,10 @@ export class Room extends DurableObject {
     if (peer) peer.lastSeen = Date.now();
 
     switch (msg.type) {
+      // ★ 客户端对 server_ping 的回应
+      case "server_pong":
+        return;
+
       case "ping":
         try { ws.send(JSON.stringify({ type: "pong", from, t: msg.ts || Date.now() })); } catch {}
         return;
@@ -634,7 +656,6 @@ export class Room extends DurableObject {
     if (data.length < 20) return;
     if (data[0] >> 4 !== 4) return;
 
-    // 只处理目标网段内的 IPv4 包
     const dstIP =
       `${data[16]}.${data[17]}.${data[18]}.${data[19]}`;
     if (!this.isInVirtualNetwork(dstIP)) return;
@@ -673,6 +694,11 @@ export class Room extends DurableObject {
       this.broadcast(clientId, { type: "left", from: clientId });
       await this.reportToRegistry(true);
       await this.saveStateNow();
+
+      // 房间空则停 ping
+      if (this.sessions.size === 0) {
+        this.stopServerPing();
+      }
     }
   }
 
@@ -782,7 +808,7 @@ export class Room extends DurableObject {
 
     return new Response(JSON.stringify({
       community: this.community,
-      virtualNetwork: this.virtualCidr,   // ★ 把网段暴露给面板
+      virtualNetwork: this.virtualCidr,
       peerCount: peers.length,
       onlineCount: onlineCnt,
       offlineCount: offlineCnt,
@@ -884,16 +910,6 @@ export class Room extends DurableObject {
 
   // ============ IP 分配 ============
 
-  // allocateIp 从虚拟网段分配一个空闲 IP。
-  //
-  // ipCounter 语义是 host offset：
-  //   0       网络地址（保留）
-  //   1       网关（保留）
-  //   2..max  可用主机
-  //   max+1   广播地址（不可用）
-  //
-  // hostMax = 2^hostBits - 2 本身就是最后一个可用主机 offset，
-  // 所以判断上界是 <= hostMax，不是 hostMax + 1。
   private allocateIp(): string {
     const used = new Set<string>();
     for (const p of this.peers.values()) {
@@ -903,10 +919,8 @@ export class Room extends DurableObject {
       used.add(ip);
     }
 
-    // 循环 hostMax 次足以覆盖 offset 2..hostMax
     const cycles = Math.max(1, this.virtualHostMax - 1);
     for (let i = 0; i < cycles; i++) {
-      // ★ 修复 off-by-one：上界是 hostMax，不能到 hostMax+1（广播地址）
       if (this.ipCounter < 2 || this.ipCounter > this.virtualHostMax) {
         this.ipCounter = 2;
       }
