@@ -1,5 +1,5 @@
-const POLL_INTERVAL_MS = 30000;         // ★ 5 秒 → 30 秒
-const POLL_INTERVAL_HIDDEN_MS = 0;      // ★ 页面隐藏时停止
+const POLL_INTERVAL_MS = 30000;
+const POLL_INTERVAL_HIDDEN_MS = 0;
 const POLL_BACKOFF_BASE_MS = 5000;
 const POLL_BACKOFF_MULTIPLIER = 2;
 const POLL_BACKOFF_MAX_MS = 300000;
@@ -52,19 +52,22 @@ function natBadge(natType) {
   return `<span class="badge unknown">${esc(natType)}</span>`;
 }
 
+// ★ 已更新：识别 p2p-avail
 function formatConnStatus(connections) {
   if (!connections || Object.keys(connections).length === 0) {
     return `<span style="color:#64748b">--</span>`;
   }
-  const p2pList = [], turnList = [], relayList = [];
+  const p2pList = [], turnList = [], relayList = [], availList = [];
   for (const [code, type] of Object.entries(connections)) {
     if (type === "p2p") p2pList.push(code);
+    else if (type === "p2p-avail") availList.push(code);
     else if (type === "turn") turnList.push(code);
     else if (type === "relay") relayList.push(code);
   }
-  p2pList.sort(); turnList.sort(); relayList.sort();
+  p2pList.sort(); availList.sort(); turnList.sort(); relayList.sort();
   const parts = [];
   if (p2pList.length > 0) parts.push(`<span class="badge p2p">p2p-${p2pList.join("")}</span>`);
+  if (availList.length > 0) parts.push(`<span class="badge p2p-avail" title="打洞握手成功，数据面未验证，实际走中继">p2p-avail-${availList.join("")}</span>`);
   if (turnList.length > 0) parts.push(`<span class="badge turn">TURN-${turnList.join("")}</span>`);
   if (relayList.length > 0) parts.push(`<span class="badge relay">ws-${relayList.join("")}</span>`);
   return parts.join(" ");
