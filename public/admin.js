@@ -28,7 +28,6 @@ function logout() {
   showPrompt();
 }
 
-// ★ 新增：拉取 TURN 配置并渲染
 async function loadTURNInfo() {
   const el = document.getElementById("turnInfo");
   if (!el) return;
@@ -54,7 +53,6 @@ async function loadTURNInfo() {
       return;
     }
 
-    // custom
     const urls = info.servers.map(s => s.url).join(", ");
     el.className = "turn-info custom";
     el.innerHTML = `<span class="label">TURN</span> ${esc(urls)}`;
@@ -65,7 +63,6 @@ async function loadTURNInfo() {
   }
 }
 
-// token 走 Header
 async function apiCall(path, options = {}) {
   const url = new URL(path, location.origin);
   const resp = await fetch(url.toString(), {
@@ -260,17 +257,22 @@ async function refreshDetail() {
   }
 }
 
+// ★ 已更新：识别 p2p-avail（打洞握手成功但数据面未验证）
 function formatConnStatus(connections) {
-  if (!connections || Object.keys(connections).length === 0) return `<span style="color:#64748b">--</span>`;
-  const p2pList = [], turnList = [], relayList = [];
+  if (!connections || Object.keys(connections).length === 0) {
+    return `<span style="color:#64748b">--</span>`;
+  }
+  const p2pList = [], turnList = [], relayList = [], availList = [];
   for (const [code, type] of Object.entries(connections)) {
     if (type === "p2p") p2pList.push(code);
+    else if (type === "p2p-avail") availList.push(code);
     else if (type === "turn") turnList.push(code);
     else if (type === "relay") relayList.push(code);
   }
-  p2pList.sort(); turnList.sort(); relayList.sort();
+  p2pList.sort(); availList.sort(); turnList.sort(); relayList.sort();
   const parts = [];
   if (p2pList.length > 0) parts.push(`<span class="badge p2p">p2p-${p2pList.join("")}</span>`);
+  if (availList.length > 0) parts.push(`<span class="badge p2p-avail" title="打洞握手成功，数据面未验证，实际走中继">p2p-avail-${availList.join("")}</span>`);
   if (turnList.length > 0) parts.push(`<span class="badge turn">TURN-${turnList.join("")}</span>`);
   if (relayList.length > 0) parts.push(`<span class="badge relay">ws-${relayList.join("")}</span>`);
   return parts.join(" ");
