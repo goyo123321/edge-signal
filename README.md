@@ -4,15 +4,59 @@
 
 通过 Cloudflare 全球边缘网络提供 WebSocket 信令服务，支持 NAT 打洞协调、TURN 中继和 WebSocket 中继回退，实现**零运维**的异地组网。
 
+---
+
+## 🌐 四端协同全景
+
+`edge-signal` 是整个系统的**信令中枢**，配合三个客户端实现跨平台异地组网：
+
+```
+              ┌───────────────────────────────────────────┐
+              │      edge-signal (Cloudflare Worker)      │
+              │                                           │
+              │  ├─ 信令路由（WebSocket）                 │
+              │  ├─ NAT 打洞协调（coordinator.js）        │
+              │  ├─ TURN 凭证下发                         │
+              │  ├─ 房间/peer 状态存储（Durable Objects） │
+              │  └─ WS 中继（最后兜底）                   │
+              └──────────────┬────────────────────────────┘
+                             │
+         ┌───────────────────┼───────────────────┐
+         │                   │                   │
+         ▼                   ▼                   ▼
+   n2n-go-client       n2n-termux          n2n-android
+   (TUN 模式)          (SOCKS5 模式)        (VpnService)
+   Linux/macOS         Android              Android
+   Windows/路由器      Termux                APK
+   需 root             无 root              无 root
+
+              LAN / P2P / TURN / WS  --  完全互通
+```
+
+### 服务端在各降级级中的作用
+
+| 降级级 | 服务端角色 | 消耗 |
+|:---|:---|:---|
+| **LAN 直连** | 仅信令（交换 LAN 候选） | 极少 |
+| **P2P 打洞** | 信令 + 打洞协调（下发指令） | 极少 |
+| **TURN 中继** | 仅下发 TURN 凭证 | 极少 |
+| **WS 中继** | **实际转发每个数据包** | 高（消耗 Worker 配额） |
+
+**核心设计**：服务端**主动避免**数据面流量，尽量让客户端走 P2P 或 TURN。
+
+---
+
 ## ✨ 特性
 
 - **零运维** — 无需自建服务器，部署到 Cloudflare 即可
 - **全球加速** — 利用 Cloudflare Anycast 网络，就近接入
 - **P2P 打洞** — 移植 FRP 行为阶梯，提升打洞成功率
 - **三级降级** — `P2P → TURN → WS`，保证连接永远可用
-- **同 CGNAT 处理** — 同 STUN 出口 IP 时首次允许 hairpin 尝试，失败后强制降级
-- **强制降级** — 同 STUN IP 时下发 `force_fallback` 指令
+- **LAN 直连** — 客户端上报 LAN 候选，同 WiFi 场景直接内网通信
+- **同 CGNAT 处理** — 同 STUN 出口 IP 时首次允许 hairpin 尝试，失败后下发 `force_fallback`
+- **强制降级** — 同 STUN IP 已失败时下发 `force_fallback` 指令
 - **动态端口范围** — 扫描范围按两端端口差动态计算
+- **多端点扫描** — assisted + LAN + raddr 同时下发，提升命中率
 - **Cloudflare TURN 支持** — 原生集成 Cloudflare Calls TURN，1000GB/月免费
 - **自定义 TURN** — 支持自建 coturn（UDP/TCP transport）
 - **双面板** — 公开面板 + 管理面板（Token 保护）
@@ -22,6 +66,8 @@
 - **虚拟网段可配** — 通过 `VIRTUAL_NETWORK` 配置任意 IPv4 CIDR
 - **状态持久化** — peers 写入 DO Storage，抗 evict
 - **自动清理** — 离线设备保留 30 分钟后清理，房间 1 小时无活动清理
+
+---
 
 ## 🏗️ 架构
 
@@ -47,6 +93,8 @@
             └─ 优先级 3: WebSocket 中继（最后兜底）
                Edge A ──→ Worker ──→ Edge B
 ```
+
+---
 
 ## 🚀 快速开始
 
@@ -79,7 +127,17 @@ SIGNALING_URL="wss://edge-signal.<你的子域>.workers.dev" \
   ./n2n-client-linux-amd64 ...
 ```
 
-客户端参见 [n2n-go-client](https://github.com/goyo123321/n2n-go-client)（PC）或 [n2n-android](https://github.com/goyo123321/n2n-android)（Android）。
+**三端客户端**：
+
+| 客户端 | 平台 | 数据面 | 说明 |
+|:---|:---|:---|:---|
+| [n2n-go-client](https://github.com/goyo123321/n2n-go-client) | Linux/macOS/Windows/路由器 | TUN | 需 root/管理员 |
+| [n2n-termux](https://github.com/goyo123321/n2n-termux) | Android Termux | SOCKS5 | 无 root |
+| [n2n-android](https://github.com/goyo123321/n2n-android) | Android APK | VpnService | 无 root |
+
+**三者完全互通**——同一房间内，任意两端可直接互访虚拟 IP。
+
+---
 
 ## 🚀 通过 GitHub Actions 部署（推荐）
 
@@ -176,6 +234,8 @@ jobs:
 GitHub → Actions → Deploy edge-signal → Run workflow
 ```
 
+---
+
 ## 🔐 Token 配置
 
 ### ADMIN_TOKEN（管理面板）
@@ -193,7 +253,9 @@ npx wrangler secret put ADMIN_TOKEN
 npx wrangler secret put CONNECT_TOKEN
 ```
 
-配置后，客户端必须带 `CONNECT_TOKEN=xxx` 才能连接。
+配置后，客户端必须带 `CONNECT_TOKEN=xxx` 才能连接。三端客户端都支持。
+
+---
 
 ## 📡 TURN 中继配置
 
@@ -407,6 +469,8 @@ curl -s "https://edge-signal.xxx.workers.dev/api/public/turn-config" | jq
 }
 ```
 
+---
+
 ## 📊 面板
 
 ### 公开面板
@@ -443,6 +507,19 @@ https://edge-signal.<子域>.workers.dev/admin?token=<ADMIN_TOKEN>
 - **清空房间**（有在线设备时被拒绝）
 - **清空全部**（自动跳过有在线设备的房间）
 
+### 连接类型徽章
+
+服务端面板和 Android App 使用同一套徽章：
+
+| 徽章 | 颜色 | 含义 |
+|:---|:---|:---|
+| `p2p-A` | 🟢 绿底 | P2P 直连（数据面已验证） |
+| `p2p-avail-A` | 🟡 黄底虚线 | P2PAvailable 中间态（握手成功，数据面未验证） |
+| `TURN-A` | 🔵 蓝底 | TURN 中继 |
+| `ws-A` | 🟡 黄底 | WS 中继（最后兜底） |
+
+---
+
 ## 🔧 监控端点
 
 | 端点 | 说明 | 需 token |
@@ -457,6 +534,8 @@ https://edge-signal.<子域>.workers.dev/admin?token=<ADMIN_TOKEN>
 | `/api/admin/kick?room=X&cid=Y` | 踢出设备 | ✅ |
 | `/api/admin/clear?room=X` | 清空房间 | ✅ |
 | `/api/admin/clear-all` | 清空全部 | ✅ |
+
+---
 
 ## ⚙️ 环境变量
 
@@ -487,6 +566,8 @@ https://edge-signal.<子域>.workers.dev/admin?token=<ADMIN_TOKEN>
 
 见上文「Token 配置」和「TURN 中继配置」。
 
+---
+
 ## 📁 项目结构
 
 ```
@@ -510,6 +591,8 @@ edge-signal/
 └── tsconfig.json
 ```
 
+---
+
 ## 🔄 数据生命周期
 
 | 事件 | 行为 |
@@ -520,6 +603,8 @@ edge-signal/
 | 房间 1 小时无活动 | 从 registry 中清理 |
 | DO 被 evict | peers 从 storage 恢复，代号不变 |
 | 客户端重连 | 复用旧记录，虚拟 IP 不变，清空该 peer 的打洞状态 |
+
+---
 
 ## 🧠 NAT 打洞协调
 
@@ -558,6 +643,28 @@ edge-signal/
 |:---|:---|
 | **同 STUN IP + 首次** | 允许一次 hairpin 尝试（部分 CGNAT 支持） |
 | **同 STUN IP + 已失败过** | 下发 `force_fallback` 强制降级到 TURN/WS |
+
+**实现逻辑**（`coordinator.js`）：
+
+```javascript
+const aIp = extractIP(a.pubSocket);
+const bIp = extractIP(b.pubSocket);
+if (aIp && bIp && aIp === bIp) {
+  const alreadyFailed =
+    (prevPunch && (prevPunch.aState === 2 || prevPunch.bState === 2)) ||
+    (this.failCounts.get(key) || 0) > 0;
+
+  if (alreadyFailed) {
+    // 下发 force_fallback
+    forceFallbacks.set(aKey, new Set([bKey]));
+    forceFallbacks.set(bKey, new Set([aKey]));
+    continue;
+  }
+  // 首次允许 hairpin
+}
+```
+
+**客户端行为**：三端收到 `force_fallback` 后立即 `ForceFallback` → TURN/WS，不再重复打洞。
 
 ### 单向 P2P 的处理
 
@@ -605,6 +712,17 @@ if (halfWidth > 100) halfWidth = 100;
 - 端口差大（±100）：第 6 层碰运气，**~1.8s**
 - 完全失败：跑满 6 层，**~1.8s** 后放弃，走 TURN
 
+### 多端点扫描
+
+打洞指令同时下发四类候选：
+
+1. **`targetAssistedEndpoints`** — STUN 反射的多个公网映射
+2. **`targetLanEndpoints`** — 对端上报的 LAN 地址（同 WiFi 场景）
+3. **`targetPubSocket`** — 对端上报的主公网地址
+4. **raddr** — 客户端观测到的对端源地址（本机侧）
+
+客户端按 **LAN → assisted → raddr → pubSocket** 的顺序扫描，命中即停。
+
 ### 调试端点
 
 ```
@@ -615,6 +733,8 @@ GET /api/admin/nathole/<room>?token=<ADMIN_TOKEN>
 - `backoff`：所有 pair 的退避窗口
 - `punch`：所有 pair 的打洞状态
 - `inflight`：所有 in-flight 条目
+
+---
 
 ## 🚨 限制
 
@@ -636,12 +756,16 @@ GET /api/admin/nathole/<room>?token=<ADMIN_TOKEN>
 - **Cloudflare TURN：1000GB/月**
 - 超出后 $0.05/GB
 
+---
+
 ## 🔐 安全建议
 
 - **务必**配置 `ADMIN_TOKEN`（不要用默认 `12332100`）
 - 生产环境建议配置 `CONNECT_TOKEN`
 - TURN 凭证含密码时，**必须**用 Secret 类型存储
 - 定期轮换 token
+
+---
 
 ## ❓ 常见问题
 
@@ -724,6 +848,16 @@ GET /api/admin/nathole/<room>?token=<ADMIN_TOKEN>
 **CGNAT 端口漂移**。客户端上报的 `pubSocket` 端口在打洞时已经过期。
 
 **修复**：客户端**启用 UDP 保活**（每 5 秒刷新 STUN 映射）。检查客户端版本。
+
+**服务端对应处理**：`room.ts` 里只在**出口 IP 变化**时清空打洞状态，端口变化不清：
+
+```typescript
+const oldIp = this.extractIp(oldPubSocket);
+const newIp = this.extractIp(publicEndpoint);
+if (oldIp && newIp && oldIp !== newIp) {
+  this.coordinator.clearPairStateFor(from);
+}
+```
 
 ### Q: 房间清理不掉？
 
@@ -879,11 +1013,67 @@ DO 被 evict 后，从 storage 恢复 → 代号保持。
 - 设备超过 30 分钟离线被清理
 - 房间被手动清空
 
+---
+
+## 🌐 三端客户端协同说明
+
+服务端对**所有客户端平等对待**——无论 PC、Termux 还是 Android APK，都通过同一套 WebSocket 协议通信。
+
+### 三端差异对照
+
+| 维度 | n2n-go-client | n2n-termux | n2n-android |
+|:---|:---|:---|:---|
+| 运行环境 | Linux/macOS/Windows/路由器 | Android Termux | Android APK |
+| 数据面 | TUN | SOCKS5 | VpnService |
+| 权限 | root/管理员 | 无 root | 无 root |
+| 上报 `lanEndpoints` | ✅ | ✅ | ✅ |
+| 上报 `assistedEndpoints` | ✅ | ✅ | ✅ |
+| 支持 UDP/ICMP | ✅ | ❌（仅 TCP） | ✅ |
+| 支持 N2NS 流协议 | ✅ | ✅ | ✅ |
+| 支持 WS 应用层隧道 | ✅ | ✅ | ✅ |
+
+### 服务端配置对三端的影响
+
+| 配置 | PC | Termux | Android |
+|:---|:---|:---|:---|
+| `VIRTUAL_NETWORK` | ✅ 自动适配 | ✅ | ✅ |
+| `CONNECT_TOKEN` | ✅ 支持 | ✅ | ✅ |
+| `ADMIN_TOKEN` | 不影响 | 不影响 | 不影响 |
+| `TURN_KEY_ID` / `TURN_KEY_API_TOKEN` | ✅ 通过 API 获取 | ✅ | ✅ |
+| `TURN_SERVERS` | ✅ | ✅ | ✅ |
+| `NAT_PUNCH_STAGGER_MS` | 服务端控制 | 同 | 同 |
+| `NAT_SENDER_DISPATCH_DELAY_MS` | 服务端控制 | 同 | 同 |
+
+### 互访矩阵（三端 × 三端）
+
+| 主动方 → 被动方 | 服务端行为 | 数据面 |
+|:---|:---|:---|
+| PC → Termux | 打洞协调 | N2NS 帧（PC 侧 TUN 发出） |
+| PC → Android | 打洞协调 | N2NS 帧 |
+| Termux → PC | 打洞协调 | N2NS 帧（Termux 侧 SOCKS5 触发） |
+| Termux → Android | 打洞协调 | N2NS 帧 |
+| Android → PC | 打洞协调 | N2NS 帧（Android 侧 TUN 发出） |
+| Android → Termux | 打洞协调 | N2NS 帧 |
+
+**所有 6 种组合完全互通**。
+
+### WS 中继路径的兼容
+
+当打洞和 TURN 都失败时，三端降级到 **WS 中继**。此路径使用两套协议：
+
+1. **`SendBinary`** — 原始 IPv4 包（用于 TUN ↔ TUN 的纯数据面转发）
+2. **`app_stream_*`** — 应用层 TCP 隧道（用于 SOCKS5 ↔ TUN 或跨类型访问）
+
+**三端都实现了这两套协议**，所以 WS 中继路径也完全互通。
+
+---
+
 ## 📄 License
 
 MIT
 
 ## 🔗 相关项目
 
-- [n2n-android](https://github.com/goyo123321/n2n-android) — Android 客户端
-- [n2n-go-client](https://github.com/goyo123321/n2n-go-client) — 跨平台客户端
+- [n2n-go-client](https://github.com/goyo123321/n2n-go-client) — 跨平台客户端（桌面 / 路由器 / 服务器）
+- [n2n-termux](https://github.com/goyo123321/n2n-termux) — Android Termux SOCKS5 客户端
+- [n2n-android](https://github.com/goyo123321/n2n-android) — Android APK 客户端（VpnService）
