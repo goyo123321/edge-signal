@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { NatHoleCoordinator } from "./nathole/coordinator.js";
 
-type ConnType = "p2p" | "turn" | "relay" | "unknown";
+type ConnType = "p2p" | "p2p-avail" | "turn" | "relay" | "unknown";
 
 interface PeerRecord {
   clientId: string;
@@ -205,18 +205,12 @@ export class Room extends DurableObject {
     }, SERVER_PING_INTERVAL_MS);
   }
 
-  // detectStalePeers 检测长期没有消息的 online peer。
-  //
-  // 场景：客户端网络断了（TCP 半死），server_ping 发不出去也收不到响应，
-  // 但 ws.send() 表面成功、webSocketClose 也不触发 → peer 一直显示
-  // online，其他客户端永远不知道它掉了。
   private detectStalePeers(): void {
     const now = Date.now();
 
     for (const [id, p] of this.peers) {
       if (!p.online) continue;
 
-      // 情况 A：session 丢失但 peer 还标记 online
       const ws = this.sessions.get(id);
       if (!ws) {
         p.online = false;
@@ -232,7 +226,6 @@ export class Room extends DurableObject {
         continue;
       }
 
-      // 情况 B：lastSeen 超时
       const idleMs = now - (p.lastSeen || 0);
       if (idleMs > PEER_STALE_MS) {
         console.log(
@@ -296,7 +289,7 @@ export class Room extends DurableObject {
             registeredAt: p.registeredAt || now,
             lastSeen: p.lastSeen || now,
             disconnectedAt: p.disconnectedAt,
-            connections: new Map(Object.entries(p.connections || {})),
+            connections: new Map(Object.entries(p.connections || {})) as Map<string, ConnType>,
             pubSocket: p.pubSocket || "",
             p2pEndpoint: p.p2pEndpoint || "",
             publicEndpoint: p.publicEndpoint || "",
@@ -588,7 +581,7 @@ export class Room extends DurableObject {
         return;
 
       case "connection_status":
-        if (peer) peer.connections = new Map(Object.entries(msg.payload?.connections || {}));
+        if (peer) peer.connections = new Map(Object.entries(msg.payload?.connections || {})) as Map<string, ConnType>;
         return;
 
       case "p2p_metadata":
@@ -771,20 +764,6 @@ export class Room extends DurableObject {
 
   // ============ 打洞协调 ============
 
-  // runCoordination 遍历所有在线 peer，让 coordinator 决定哪些 pair 需要下发
-  // nat_hole_instruction，然后**按 role 分阶段下发**。
-  //
-  // 分阶段下发的理由（FRP parity）：
-  //   frps 把 receiver 的 NatHoleResp 立即发出，sender 的延迟 1 秒
-  //   （pkg/nathole/controller.go:229-240）。receiver 先发探测包会在
-  //   它的 NAT 上打开映射，sender 稍后才有包出去时，对端才能收到。
-  //   两端同时发时，sender 的第一个包往往因为对端 NAT 尚未打开而丢失。
-  //
-  // 实现要点：
-  //   1. 按 role（0=sender / 1=receiver）分组
-  //   2. receiver 组立即下发
-  //   3. sender 组延迟 `senderDelayMs`（默认 1000ms，ladder entry 可覆盖）
-  //   4. sender 延迟期间 await，DO 存活期内可靠
   private async runCoordination(): Promise<void> {
     const onlinePeers = Array.from(this.peers.values()).filter((p) => p.online);
     if (onlinePeers.length < 2) return;
@@ -812,7 +791,6 @@ export class Room extends DurableObject {
 
     if (instructions.size === 0) return;
 
-    // 按 role 分组
     const receivers: Array<[string, any]> = [];
     const senders: Array<[string, any]> = [];
     for (const [mac, instr] of instructions) {
@@ -835,16 +813,13 @@ export class Room extends DurableObject {
       }
     };
 
-    // receiver 立即
     for (const [mac, instr] of receivers) sendOne(mac, instr);
 
-    // sender 延迟
     if (senders.length > 0) {
       let delayMs = (this.coordinator as any).getSenderDelayMs
         ? (this.coordinator as any).getSenderDelayMs()
         : 1000;
 
-      // ladder entry 可以覆盖（entry 6-9 带 sendDelayMs 5000/10000）
       for (const [, instr] of senders) {
         if (instr.sendDelayMs && instr.sendDelayMs > 0) {
           delayMs = instr.sendDelayMs;
@@ -880,12 +855,17 @@ export class Room extends DurableObject {
         const targetCode = codeMap.get(cid);
         if (targetCode) connectionsByCode[targetCode] = type;
       }
-      let p2pCount = 0, relayCount = 0, turnCount = 0;
+
+      // ★ 加 availCount 分支
+      let p2pCount = 0, relayCount = 0, turnCount = 0, availCount = 0;
       for (const t of p.connections.values()) {
         if (t === "p2p") p2pCount++;
-        else if (t === "relay") relayCount++;
+        else if (t === "p2p-avail") availCount++;
         else if (t === "turn") turnCount++;
+        else if (t === "relay") relayCount++;
       }
+      const totalConnections = p2pCount + availCount + turnCount + relayCount;
+
       const relayBytesIn = p.relayBytesIn, relayBytesOut = p.relayBytesOut;
 
       if (publicOnly) {
@@ -895,8 +875,8 @@ export class Room extends DurableObject {
           onlineFor: now - p.connectedAt,
           offlineFor: p.online ? 0 : (p.disconnectedAt ? now - p.disconnectedAt : 0),
           idleFor: now - p.lastSeen,
-          p2pCount, relayCount, turnCount,
-          connectionsTotal: p2pCount + relayCount + turnCount,
+          p2pCount, relayCount, turnCount, availCount,
+          connectionsTotal: totalConnections,
           connections: connectionsByCode,
           natType: p.natType || "unknown",
           relayBytesIn, relayBytesOut, relayBytesTotal: relayBytesIn + relayBytesOut,
@@ -917,7 +897,8 @@ export class Room extends DurableObject {
         offlineFor: p.online ? 0 : (p.disconnectedAt ? now - p.disconnectedAt : 0),
         idleFor: now - p.lastSeen,
         connections: connectionsByCode,
-        p2pCount, relayCount, turnCount,
+        p2pCount, relayCount, turnCount, availCount,
+        connectionsTotal: totalConnections,
         relayBytesIn, relayBytesOut,
         relayPacketsIn: p.relayPacketsIn, relayPacketsOut: p.relayPacketsOut,
       };
