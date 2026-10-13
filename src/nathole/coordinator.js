@@ -18,6 +18,8 @@ const CONN_P2P = "p2p";
 const P2P_AVAILABLE = 2;
 const P2P_FULLDUPLEX = 3;
 
+// 端口扫描范围的固定缓冲与上限。范围 = max(natDiff, portGap) + NARROW，
+// 夹在 [NARROW, MAX] 之间。
 const PORTS_RANGE_NARROW = 100;
 const PORTS_RANGE_MAX = 10000;
 
@@ -64,6 +66,10 @@ function isIPv6Sock(sock) {
   return colonCount > 1;
 }
 
+// shouldRetireSuccess：判断"曾经记录的成功"是否已经不再描述一个活跃隧道。
+//
+// 双方都不在 P2P 且超过 SUCCESS_GRACE_MS 宽限期时返回 true，
+// 让调用方清空成功记录、重新协调。
 function shouldRetireSuccess(prev, a, b, now) {
   if (!prev) return false;
   if (prev.aState !== 3 && prev.bState !== 3) return false;
@@ -120,6 +126,8 @@ export class NatHoleCoordinator {
     );
   }
 
+  // getSenderDelayMs 暴露 sender 延迟给 room.ts 使用。
+  // senderDelayMs 是实例私有惯例，room.ts 通过此 getter 读取。
   getSenderDelayMs() {
     return this.senderDelayMs;
   }
@@ -143,6 +151,7 @@ export class NatHoleCoordinator {
     let state = typeof result.state === "number" ? result.state : 0;
     if (state === 0) return;
 
+    // InProgress：刷新 in-flight 窗口，阻止服务端重复派发
     if (state === 1) {
       const flight = this.inFlight.get(key);
       if (flight) {
@@ -180,19 +189,17 @@ export class NatHoleCoordinator {
       entry.bP2PStatus = selfP2PStatus;
     }
 
-    // ★ 修复：放宽 everValidated 判定。
+    // ★ 首次成功的交叉校验：放宽到接受 p2pStatus >= P2PAvailable(2)。
     //
     // 客户端只在 executeNatHole 的 hasTrafficFromTarget 通过时才设
-    // PunchStateSucceeded —— 也就是说客户端收到了对端的包，这本身
-    // 就是"打洞握手成功"的硬证据。
+    // PunchStateSucceeded —— 客户端确实收到了对端的包，这本身是
+    // "打洞握手成功"的硬证据。数据面能否承载业务流量，由客户端后续
+    // 在收到 N2NS 帧时自行升级到 FullDuplex(3)。
     //
     // 早先只接受 P2P_FULLDUPLEX(3) 会导致死循环：
     //   客户端上报 state=3 + p2pStatus=2（P2PAvailable）
     //   → 服务端拒绝，降级为失败，重发指令
     //   → 客户端再次打洞成功再次上报，无限重复
-    //
-    // 数据面能否承载真实业务流量，由客户端后续在收到 P2P 帧时自行
-    // 升级到 FullDuplex(3)，不必由服务端在此处强制要求。
     if (state === 3) {
       if (!entry.everValidated) {
         const otherP2PStatus = isA ? entry.bP2PStatus : entry.aP2PStatus;
@@ -242,6 +249,7 @@ export class NatHoleCoordinator {
       this.failCounts.set(key, (this.failCounts.get(key) || 0) + 1);
     }
 
+    // 只有 state=2/3 才上报给 analyzer 打分；InProgress 不算成绩。
     if (behaviorIndex != null && (state === 2 || state === 3)) {
       this.analyzer.report(key, behaviorIndex, state === 3);
     }
@@ -291,6 +299,7 @@ export class NatHoleCoordinator {
 
         const key = pairKeyFor(aKey, bKey);
 
+        // 任一端成功即视为已建立，进入退役判定或跳过
         const prevPunch = this.punchState.get(key);
         const anySucceeded = prevPunch &&
           (prevPunch.aState === 3 || prevPunch.bState === 3);
@@ -349,6 +358,8 @@ export class NatHoleCoordinator {
         const signature = `${senderKey}->${receiverKey}@${rung}`;
         const candidate = { rung, signature };
 
+        // in-flight 去重：同 rung 同 signature 时，若上次已派发且未超时，
+        // 或已收到失败/成功判决，则清掉 in-flight 条目
         const flightEntry = this.inFlight.get(key);
         if (
           flightEntry &&
@@ -383,6 +394,7 @@ export class NatHoleCoordinator {
           this.backoff.delete(key);
         }
 
+        // 首轮错峰：给最新注册的 peer 留 NAT 映射建立时间
         const fc = this.failCounts.get(key) || 0;
         if (fc === 0) {
           const regA = a.registeredAt || a.connectedAt || 0;
@@ -403,6 +415,7 @@ export class NatHoleCoordinator {
           }
         }
 
+        // 同 signature 的退避窗口内，抑制重复派发
         if (
           backoffEntry &&
           backoffEntry.signature === signature &&
@@ -417,6 +430,11 @@ export class NatHoleCoordinator {
         const senderBeh = behavior.sender || {};
         const receiverBeh = behavior.receiver || {};
 
+        // 端口扫描范围 = max(NAT 行为差异, 两端端口差) + 缓冲。
+        //
+        // 直接写死 ±10000 太宽：HardNAT 场景下客户端会按 tier 分阶段扫，
+        // 服务端给的范围只是上界。两端端口差本身不大时收窄范围，
+        // 让客户端的 tier 递进更快命中。
         const natDiff = Math.abs(
           (senderFeature.portsDifference || 0) - (receiverFeature.portsDifference || 0)
         );
@@ -439,15 +457,18 @@ export class NatHoleCoordinator {
           senderNatType: senderFeature.natType,
           senderBehavior: senderFeature.behavior,
           senderAssistedEndpoints: sender.assistedSockets || [],
+          senderLanEndpoints: sender.lanEndpoints || [],       // ★ 新增
           receiverMac: receiverKey,
           receiverP2pEndpoint: receiver.p2pEndpoint || "",
           receiverPubSocket: receiver.pubSocket || "",
           receiverNatType: receiverFeature.natType,
           receiverAssistedEndpoints: receiver.assistedSockets || [],
+          receiverLanEndpoints: receiver.lanEndpoints || [],   // ★ 新增
           portsDifference: 0,
           regularPortsChange: false,
         };
 
+        // sender 指令：target 是 receiver
         const senderInstr = {
           role: DetectRoleSender,
           ttl: senderBeh.ttl || 0,
@@ -458,9 +479,11 @@ export class NatHoleCoordinator {
           targetVirtualIp: receiver.virtualIp,
           targetPubSocket: receiver.pubSocket || "",
           targetAssistedEndpoints: receiver.assistedSockets || [],
+          targetLanEndpoints: receiver.lanEndpoints || [],     // ★ 新增
           ...shared,
         };
 
+        // receiver 指令：target 是 sender
         const receiverInstr = {
           role: DetectRoleReceiver,
           ttl: receiverBeh.ttl || 0,
@@ -471,6 +494,7 @@ export class NatHoleCoordinator {
           targetVirtualIp: sender.virtualIp,
           targetPubSocket: sender.pubSocket || "",
           targetAssistedEndpoints: sender.assistedSockets || [],
+          targetLanEndpoints: sender.lanEndpoints || [],       // ★ 新增
           ...shared,
         };
 
@@ -506,7 +530,8 @@ export class NatHoleCoordinator {
           `[NAT] ${key} 生成指令 (rung ${rung}), ` +
           `sender=${sender.pubSocket} receiver=${receiver.pubSocket} ` +
           `halfWidth=±${halfWidth} ` +
-          `assisted=${(receiver.assistedSockets || []).length}/${(sender.assistedSockets || []).length}`
+          `assisted=${(receiver.assistedSockets || []).length}/${(sender.assistedSockets || []).length} ` +
+          `lan=${(receiver.lanEndpoints || []).length}/${(sender.lanEndpoints || []).length}`
         );
 
         break;
