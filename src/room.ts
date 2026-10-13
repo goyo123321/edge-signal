@@ -189,7 +189,6 @@ export class Room extends DurableObject {
     this.serverPingTimer = setInterval(() => {
       if (this.sessions.size === 0 && this.peers.size === 0) return;
 
-      // 1. 发 server_ping（心跳）
       if (this.sessions.size > 0) {
         const data = JSON.stringify({ type: "server_ping", ts: Date.now() });
         for (const [id, ws] of this.sessions) {
@@ -202,21 +201,15 @@ export class Room extends DurableObject {
         }
       }
 
-      // 2. 检测 stale peer（僵尸连接）
       this.detectStalePeers();
     }, SERVER_PING_INTERVAL_MS);
   }
 
   // detectStalePeers 检测长期没有消息的 online peer。
   //
-  // 场景：客户端网络断了（TCP 半死），服务端的 server_ping 发不出去也
-  // 收不到响应，但 ws.send() 表面成功、webSocketClose 也不触发 → peer
-  // 一直显示 online，其他客户端永远不知道它掉了。
-  //
-  // 修复：检查 peer.lastSeen，超过 PEER_STALE_MS 主动：
-  //   1. 关闭 ws（触发 webSocketClose）
-  //   2. 标记 offline
-  //   3. broadcast left 给所有其他在线 peer
+  // 场景：客户端网络断了（TCP 半死），server_ping 发不出去也收不到响应，
+  // 但 ws.send() 表面成功、webSocketClose 也不触发 → peer 一直显示
+  // online，其他客户端永远不知道它掉了。
   private detectStalePeers(): void {
     const now = Date.now();
 
@@ -246,7 +239,6 @@ export class Room extends DurableObject {
           `[Room] ${id} 心跳超时 ${Math.round(idleMs / 1000)}s（阈值 ${PEER_STALE_MS / 1000}s），` +
           `主动关闭 ws 并广播 left`
         );
-        // 先标记 offline，避免 webSocketClose 重复处理
         p.online = false;
         p.disconnectedAt = now;
         p.connections = new Map();
@@ -256,14 +248,12 @@ export class Room extends DurableObject {
         if (p.virtualIp) this.ipToClient.delete(p.virtualIp);
         this.coordinator.clearPairStateFor(id);
 
-        // 关闭 ws（后续 webSocketClose 会走一遍 cleanup，幂等）
         try {
           ws.close(1000, "Stale: no heartbeat");
         } catch (e) {}
 
         this.sessions.delete(id);
 
-        // 广播 left，让其他客户端立刻清掉这个 peer
         this.broadcast(id, { type: "left", from: id });
       }
     }
@@ -751,8 +741,6 @@ export class Room extends DurableObject {
     const clientId = this.findClientId(ws);
     if (clientId) {
       const peer = this.peers.get(clientId);
-      // 如果 detectStalePeers 已经处理过（peer.online=false 且 sessions 里没这个 ws）
-      //   就不再重复广播
       const alreadyHandled = peer && !peer.online && !this.sessions.has(clientId);
       if (peer && !alreadyHandled) {
         peer.online = false;
@@ -841,7 +829,7 @@ export class Room extends DurableObject {
           from: "server",
           payload: instr,
         }));
-        console.log(`[Room] → ${mac} 下发 nat_hole_instruction role=${instr.role} target=${instr.targetPubSocket}`);
+        console.log(`[Room] → ${mac} 下发 nat_hole_instruction role=${instr.role} target=${instr.targetPubSocket} lan=${(instr.targetLanEndpoints || []).length}`);
       } catch (e) {
         console.error(`[Room] 发送给 ${mac} 失败:`, e);
       }
@@ -852,8 +840,8 @@ export class Room extends DurableObject {
 
     // sender 延迟
     if (senders.length > 0) {
-      let delayMs = this.coordinator.getSenderDelayMs
-        ? this.coordinator.getSenderDelayMs()
+      let delayMs = (this.coordinator as any).getSenderDelayMs
+        ? (this.coordinator as any).getSenderDelayMs()
         : 1000;
 
       // ladder entry 可以覆盖（entry 6-9 带 sendDelayMs 5000/10000）
