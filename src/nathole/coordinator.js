@@ -15,11 +15,10 @@ const INFLIGHT_TIMEOUT_MS = 10000;
 const SUCCESS_GRACE_MS = 30000;
 
 const CONN_P2P = "p2p";
+const P2P_AVAILABLE = 2;
 const P2P_FULLDUPLEX = 3;
 
-// PORTS_RANGE_NARROW：两侧端口差之上的固定缓冲。
 const PORTS_RANGE_NARROW = 100;
-// 上限：超过这个值说明两端根本不可能是同一个 CGNAT，全端口扫描没有意义。
 const PORTS_RANGE_MAX = 10000;
 
 function classifyNat(peer) {
@@ -121,10 +120,6 @@ export class NatHoleCoordinator {
     );
   }
 
-  // getSenderDelayMs 暴露 sender 延迟给 room.ts 使用。
-  //
-  // senderDelayMs 是实例私有惯例，room.ts 里访问会有点绕；用 getter
-  // 让外部通过明确定义的接口读取，而不是直接触碰 `this.coordinator.senderDelayMs`。
   getSenderDelayMs() {
     return this.senderDelayMs;
   }
@@ -185,17 +180,30 @@ export class NatHoleCoordinator {
       entry.bP2PStatus = selfP2PStatus;
     }
 
+    // ★ 修复：放宽 everValidated 判定。
+    //
+    // 客户端只在 executeNatHole 的 hasTrafficFromTarget 通过时才设
+    // PunchStateSucceeded —— 也就是说客户端收到了对端的包，这本身
+    // 就是"打洞握手成功"的硬证据。
+    //
+    // 早先只接受 P2P_FULLDUPLEX(3) 会导致死循环：
+    //   客户端上报 state=3 + p2pStatus=2（P2PAvailable）
+    //   → 服务端拒绝，降级为失败，重发指令
+    //   → 客户端再次打洞成功再次上报，无限重复
+    //
+    // 数据面能否承载真实业务流量，由客户端后续在收到 P2P 帧时自行
+    // 升级到 FullDuplex(3)，不必由服务端在此处强制要求。
     if (state === 3) {
       if (!entry.everValidated) {
         const otherP2PStatus = isA ? entry.bP2PStatus : entry.aP2PStatus;
         const corroborated =
-          selfP2PStatus === P2P_FULLDUPLEX ||
-          otherP2PStatus === P2P_FULLDUPLEX;
+          selfP2PStatus >= P2P_AVAILABLE ||
+          otherP2PStatus >= P2P_AVAILABLE;
 
         if (!corroborated) {
           console.log(
             `[NAT] ${key} 拒绝未证实的首次成功：` +
-            `self=${selfP2PStatus} other=${otherP2PStatus}（降级为失败）`
+            `self=${selfP2PStatus} other=${otherP2PStatus}（双方都未达到 P2PAvailable，降级为失败）`
           );
           state = 2;
           result = {
@@ -206,7 +214,7 @@ export class NatHoleCoordinator {
           entry.everValidated = true;
           console.log(
             `[NAT] ${key} 首次成功通过交叉校验 ` +
-            `(self=${selfP2PStatus} other=${otherP2PStatus})，后续不再重复校验`
+            `(self=${selfP2PStatus} other=${otherP2PStatus}，≥P2PAvailable 即通过)`
           );
         }
       }
@@ -283,8 +291,6 @@ export class NatHoleCoordinator {
 
         const key = pairKeyFor(aKey, bKey);
 
-        // 一边成功就停：客户端只有在「收到对端 probe 并回 5 轮」后才上报，
-        // 任一端 state=3 即代表双向通道已建立。
         const prevPunch = this.punchState.get(key);
         const anySucceeded = prevPunch &&
           (prevPunch.aState === 3 || prevPunch.bState === 3);
@@ -411,12 +417,6 @@ export class NatHoleCoordinator {
         const senderBeh = behavior.sender || {};
         const receiverBeh = behavior.receiver || {};
 
-        // 端口扫描范围 = max(NAT 行为差异, 两端端口差) + 缓冲。
-        //
-        // 直接写死 ±10000 太宽：HardNAT 场景下客户端会按 tier 分阶段扫，
-        // 服务端给的范围只是一个上界。但如果两端端口差本身就不大（比如
-        // 都在同一个 CGNAT 后、端口相差几十），扫描范围应该收窄，让客户端
-        // 的 tier 递进更快命中。
         const natDiff = Math.abs(
           (senderFeature.portsDifference || 0) - (receiverFeature.portsDifference || 0)
         );
