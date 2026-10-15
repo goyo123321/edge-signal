@@ -54,7 +54,7 @@ function parsePort(sock) {
   return i < 0 ? 0 : parseInt(sock.slice(i + 1), 10) || 0;
 }
 
-// ★ 新增：从 "ip:port" 提取 IP 部分。
+// 从 "ip:port" 提取 IP 部分。
 function extractIP(sock) {
   if (!sock) return "";
   const i = sock.lastIndexOf(":");
@@ -327,30 +327,33 @@ export class NatHoleCoordinator {
           continue;
         }
 
-        // ★★★ 新增：同 STUN 出口 IP 检测 ★★★
+        // ★ 同 STUN 出口 IP 检测
         //
         // 场景：两端在同一 CGNAT 后面，STUN 出口 IP 相同。hairpin NAT
         // 大部分运营商不支持，但仍有一小部分支持。策略：
         //   1. 首次遇到：允许一次 hairpin 尝试
         //   2. 已失败过（任一端 state=2 或 failCounts>0）：下发
         //      force_fallback 强制降级到 TURN/WS
+        //
+        // 注：state=3（已成功）的情况不会进入本检测——
+        //     上方 anySucceeded 分支要么已 continue（不退役），
+        //     要么已删除 punchState 记录（退役，此时 prevPunch 局部变量
+        //     虽仍持有引用，但 alreadySucceeded 会拦截，走空分支）。
+        //     因此 alreadyFailed 里无需包含 === 3 判断。
         const aIp = extractIP(a.pubSocket);
         const bIp = extractIP(b.pubSocket);
         if (aIp && bIp && aIp === bIp) {
           const alreadyFailed =
             (prevPunch &&
-              (prevPunch.aState === 2 ||
-                prevPunch.bState === 2 ||
-                prevPunch.aState === 3 ||
-                prevPunch.bState === 3)) ||
+              (prevPunch.aState === 2 || prevPunch.bState === 2)) ||
             (this.failCounts.get(key) || 0) > 0;
 
-          // 已成功过的不需要降级
           const alreadySucceeded = prevPunch &&
             (prevPunch.aState === 3 || prevPunch.bState === 3);
 
           if (alreadySucceeded) {
-            // 上面 anySucceeded 分支已处理过，这里不会进来
+            // 上方 anySucceeded 分支已处理，这里不会进来
+            // （保留此分支仅为语义清晰，防御未来逻辑改动）
           } else if (alreadyFailed) {
             if (!forceFallbacks.has(aKey)) forceFallbacks.set(aKey, new Set());
             if (!forceFallbacks.has(bKey)) forceFallbacks.set(bKey, new Set());
@@ -370,7 +373,6 @@ export class NatHoleCoordinator {
             // fall through 到正常打洞流程
           }
         }
-        // ★★★ 新增结束 ★★★
 
         const aPort = parsePort(a.pubSocket);
         const bPort = parsePort(b.pubSocket);
