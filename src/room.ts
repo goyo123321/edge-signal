@@ -98,8 +98,15 @@ function onlineCount(peers: Map<string, PeerRecord>): number {
   return n;
 }
 
+function lanListKey(lan: string[] | undefined): string {
+  if (!lan || lan.length === 0) return "";
+  return [...lan].sort().join(",");
+}
+
 export class Room extends DurableObject {
   private sessions: Map<string, WebSocket> = new Map();
+  // ★ S2 修复：WS → clientId 反向表，O(1) 查找
+  private wsToClient: WeakMap<WebSocket, string> = new WeakMap();
   private peers: Map<string, PeerRecord> = new Map();
   private ipToClient: Map<string, string> = new Map();
   private ipCounter = 2;
@@ -240,6 +247,9 @@ export class Room extends DurableObject {
           `[Room] ${id} 心跳超时 ${Math.round(idleMs / 1000)}s（阈值 ${PEER_STALE_MS / 1000}s），` +
           `主动关闭 ws 并广播 left`
         );
+
+        // ★ S7 修复：先标记 offline，再关闭 ws
+        //   这样 webSocketClose 里的 alreadyHandled 检查能正确识别
         p.online = false;
         p.disconnectedAt = now;
         p.connections = new Map();
@@ -249,11 +259,11 @@ export class Room extends DurableObject {
         if (p.virtualIp) this.ipToClient.delete(p.virtualIp);
         this.coordinator.clearPairStateFor(id);
 
+        this.sessions.delete(id);
+
         try {
           ws.close(1000, "Stale: no heartbeat");
         } catch (e) {}
-
-        this.sessions.delete(id);
 
         this.broadcast(id, { type: "left", from: id });
       }
@@ -412,7 +422,6 @@ export class Room extends DurableObject {
       this.stopServerPing();
       this.peers.clear();
       this.ipToClient.clear();
-      // ★ 直接用 new 而不是 (this.coordinator as any).constructor
       this.coordinator = new NatHoleCoordinator(this.env || {});
       try { await this.ctx.storage.deleteAll(); } catch (e) {}
       this.ipCounter = this.minIpOffset();
@@ -545,6 +554,8 @@ export class Room extends DurableObject {
     }
     this.ipToClient.set(peer.virtualIp, clientId);
     this.sessions.set(clientId, server);
+    // ★ S2 修复：登记反向表
+    this.wsToClient.set(server, clientId);
 
     this.startServerPing();
 
@@ -594,6 +605,13 @@ export class Room extends DurableObject {
       case "p2p_metadata":
         if (peer) {
           const p = msg.payload || {};
+
+          // ★ S4 修复：保存旧值，判断是否需广播
+          const oldPubSocket = peer.pubSocket;
+          const oldNatType = peer.natType;
+          const oldLanKey = lanListKey(peer.lanEndpoints);
+          const oldAssistedKey = lanListKey(peer.assistedSockets);
+
           if (typeof p.name === "string" && p.name) peer.name = p.name;
           peer.natType = p.natType || peer.natType;
           peer.portsDifference = p.portsDifference || 0;
@@ -618,10 +636,9 @@ export class Room extends DurableObject {
 
           if (typeof p.p2pEndpoint === "string" && p.p2pEndpoint) peer.p2pEndpoint = p.p2pEndpoint;
 
+          let pubChanged = false;
           const publicEndpoint = typeof p.publicEndpoint === "string" ? p.publicEndpoint : "";
           if (publicEndpoint && publicEndpoint !== "") {
-            // ★ 已修复：只在"出口 IP 变化"时清空打洞状态，端口变化不清
-            const oldPubSocket = peer.pubSocket;
             const oldIp = this.extractIp(oldPubSocket);
             const newIp = this.extractIp(publicEndpoint);
             if (oldIp && newIp && oldIp !== newIp) {
@@ -630,6 +647,7 @@ export class Room extends DurableObject {
                 `[Room] ${from} 出口 IP 变化: ${oldIp} → ${newIp}，清空打洞状态`
               );
             }
+            if (oldPubSocket !== publicEndpoint) pubChanged = true;
             peer.publicEndpoint = publicEndpoint;
             peer.pubSocket = publicEndpoint;
           } else {
@@ -640,26 +658,37 @@ export class Room extends DurableObject {
 
           this.saveStateThrottled();
 
+          // ★ S4 修复：只在关键信息变化时广播
+          const newLanKey = lanListKey(peer.lanEndpoints);
+          const newAssistedKey = lanListKey(peer.assistedSockets);
+          const natTypeChanged = peer.natType !== oldNatType;
+          const lanChanged = newLanKey !== oldLanKey;
+          const assistedChanged = newAssistedKey !== oldAssistedKey;
+          const needBroadcast = pubChanged || natTypeChanged || lanChanged || assistedChanged;
+
           const addr = this.peerPublicAddr(peer);
           console.log(
             `[Room] p2p_metadata from ${from}: natType=${peer.natType} ` +
             `pub=${addr.ip}:${addr.port} (pubSocket=${peer.pubSocket || "<empty>"}) ` +
-            `lan=${(peer.lanEndpoints || []).length} multiExit=${peer.multiExit || false} assisted=${peer.assistedSockets.length}`
+            `lan=${(peer.lanEndpoints || []).length} multiExit=${peer.multiExit || false} assisted=${peer.assistedSockets.length} ` +
+            `broadcast=${needBroadcast ? "yes" : "no"}`
           );
 
-          this.broadcast(from, {
-            type: "joined", from,
-            payload: {
-              id: from,
-              virtualIp: peer.virtualIp,
-              publicIp: addr.ip,
-              publicPort: addr.port,
-              natType: peer.natType || "unknown",
-              turnRelayAddr: peer.turnRelayAddr || "",
-              assistedEndpoints: peer.assistedSockets || [],
-              lanEndpoints: peer.lanEndpoints || [],
-            },
-          });
+          if (needBroadcast) {
+            this.broadcast(from, {
+              type: "joined", from,
+              payload: {
+                id: from,
+                virtualIp: peer.virtualIp,
+                publicIp: addr.ip,
+                publicPort: addr.port,
+                natType: peer.natType || "unknown",
+                turnRelayAddr: peer.turnRelayAddr || "",
+                assistedEndpoints: peer.assistedSockets || [],
+                lanEndpoints: peer.lanEndpoints || [],
+              },
+            });
+          }
         }
         await this.runCoordination();
         await this.setupSaveAlarm();
@@ -698,7 +727,15 @@ export class Room extends DurableObject {
           if (id === from || !p.online) continue;
           const targetWs = this.sessions.get(id);
           if (!targetWs) continue;
-          try { targetWs.send(JSON.stringify({ type: "turn_peer_info", edgeMac: from, relayAddr })); } catch {}
+          try {
+            // ★ S5 修复：同时发 from 和 edgeMac，兼容新旧客户端
+            targetWs.send(JSON.stringify({
+              type: "turn_peer_info",
+              from: from,
+              edgeMac: from,
+              relayAddr,
+            }));
+          } catch {}
         }
         return;
       }
@@ -737,8 +774,18 @@ export class Room extends DurableObject {
       targetWs.send(buffer);
       const fromPeer = this.peers.get(from);
       const toPeer = this.peers.get(targetClientId);
-      if (fromPeer) { fromPeer.relayBytesOut += data.length; fromPeer.relayPacketsOut += 1; }
-      if (toPeer) { toPeer.relayBytesIn += data.length; toPeer.relayPacketsIn += 1; }
+      if (fromPeer) {
+        // ★ S3 修复：更新 lastSeen，避免被误踢
+        fromPeer.lastSeen = Date.now();
+        fromPeer.relayBytesOut += data.length;
+        fromPeer.relayPacketsOut += 1;
+      }
+      if (toPeer) {
+        // 接收方也刷新（对端在发数据说明还在用）
+        toPeer.lastSeen = Date.now();
+        toPeer.relayBytesIn += data.length;
+        toPeer.relayPacketsIn += 1;
+      }
     } catch {}
   }
 
@@ -756,6 +803,7 @@ export class Room extends DurableObject {
         peer.publicEndpoint = "";
       }
       this.sessions.delete(clientId);
+      // ★ S2 修复：WeakMap 会在 ws 被 GC 时自动清理，无需手动 delete
       if (peer?.virtualIp) this.ipToClient.delete(peer.virtualIp);
       if (!alreadyHandled) {
         this.coordinator.clearPairStateFor(clientId);
@@ -842,9 +890,25 @@ export class Room extends DurableObject {
       if (delayMs <= 0) {
         for (const [mac, instr] of senders) sendOne(mac, instr);
       } else {
-        await new Promise((r) => setTimeout(r, delayMs));
-        for (const [mac, instr] of senders) sendOne(mac, instr);
-        console.log(`[Room] sender 指令延迟 ${delayMs}ms 后下发（${senders.length} 个）`);
+        // ★ S1 修复：用 ctx.waitUntil 异步延迟，不阻塞 DO 主线程
+        //
+        // 旧版 await new Promise(setTimeout(1000)) 会阻塞整个 DO 事件循环
+        // 1 秒——期间的 WS 消息、二进制中继全部排队，客户端看到 1 秒延迟。
+        //
+        // 新版用 waitUntil 异步执行，DO 立即返回，1 秒后异步发送。
+        const sendersCopy = senders.map(([mac, instr]) => [mac, instr] as [string, any]);
+        const delayCopy = delayMs;
+        this.ctx.waitUntil(
+          (async () => {
+            try {
+              await new Promise((r) => setTimeout(r, delayCopy));
+              for (const [mac, instr] of sendersCopy) sendOne(mac, instr);
+              console.log(`[Room] sender 指令延迟 ${delayCopy}ms 后下发（${sendersCopy.length} 个）`);
+            } catch (e) {
+              console.error(`[Room] sender 延迟下发失败:`, e);
+            }
+          })()
+        );
       }
     }
   }
@@ -977,6 +1041,10 @@ export class Room extends DurableObject {
           purged++;
         }
       }
+      // ★ S6 修复：打印清理日志
+      if (purged > 0) {
+        console.log(`[Room] alarm: 清理 ${purged} 个过期离线 peer`);
+      }
       await this.runCoordination();
       await this.setupSaveAlarm();
       await this.saveStateNow();
@@ -992,9 +1060,9 @@ export class Room extends DurableObject {
     }
   }
 
+  // ★ S2 修复：从 WeakMap 直接查，O(1)
   private findClientId(ws: WebSocket): string | undefined {
-    for (const [id, socket] of this.sessions) if (socket === ws) return id;
-    return undefined;
+    return this.wsToClient.get(ws);
   }
 
   private closeDuplicate(clientId: string) {
@@ -1014,7 +1082,7 @@ export class Room extends DurableObject {
     }
   }
 
-  // ★ 已修复：支持 /30 网段（从 offset 1 开始）
+  // ★ 支持 /30 网段（从 offset 1 开始）
   private allocateIp(): string {
     const used = new Set<string>();
     for (const p of this.peers.values()) {
