@@ -113,7 +113,6 @@ export class Room extends DurableObject {
   private lastReport = 0;
   private lastRegistryRefresh = 0;
   private coordinator: NatHoleCoordinator;
-  private pendingStaggerAt: number | null = null;
   private saveAlarmScheduled = false;
   private loadedFromStorage = false;
   private lastSaveAt = 0;
@@ -136,10 +135,19 @@ export class Room extends DurableObject {
     this.virtualHostMax = parsed.hostMax;
     this.virtualCidr = parsed.cidr;
 
+    // ★ /30 从 offset 1 开始；其他从 2 开始（跳过网关）
+    this.ipCounter = this.minIpOffset();
+
     console.log(
       `[Room] 虚拟网段: ${this.virtualCidr} ` +
-      `(prefix=/${this.virtualPrefix}, 最大主机 offset=${this.virtualHostMax})`
+      `(prefix=/${this.virtualPrefix}, 最大主机 offset=${this.virtualHostMax}, ` +
+      `起始 offset=${this.ipCounter})`
     );
+  }
+
+  // ★ /30 只有 2 个可用主机，从 offset 1 开始；其他网段跳过 offset 1（网关）
+  private minIpOffset(): number {
+    return this.virtualPrefix >= 30 ? 1 : 2;
   }
 
   // ============ 网络地址工具 ============
@@ -404,11 +412,10 @@ export class Room extends DurableObject {
       this.stopServerPing();
       this.peers.clear();
       this.ipToClient.clear();
-      try {
-        this.coordinator = new (this.coordinator as any).constructor(this.env || {});
-      } catch (e) {}
+      // ★ 直接用 new 而不是 (this.coordinator as any).constructor
+      this.coordinator = new NatHoleCoordinator(this.env || {});
       try { await this.ctx.storage.deleteAll(); } catch (e) {}
-      this.ipCounter = 2;
+      this.ipCounter = this.minIpOffset();
       this.lastSaveAt = 0;
       return new Response(JSON.stringify({ ok: true, room: this.community }), {
         headers: { "Content-Type": "application/json" },
@@ -613,10 +620,15 @@ export class Room extends DurableObject {
 
           const publicEndpoint = typeof p.publicEndpoint === "string" ? p.publicEndpoint : "";
           if (publicEndpoint && publicEndpoint !== "") {
+            // ★ 已修复：只在"出口 IP 变化"时清空打洞状态，端口变化不清
             const oldPubSocket = peer.pubSocket;
-            if (oldPubSocket && oldPubSocket !== publicEndpoint) {
+            const oldIp = this.extractIp(oldPubSocket);
+            const newIp = this.extractIp(publicEndpoint);
+            if (oldIp && newIp && oldIp !== newIp) {
               this.coordinator.clearPairStateFor(from);
-              console.log(`[Room] ${from} pubSocket 变化: ${oldPubSocket} → ${publicEndpoint}，清空打洞状态`);
+              console.log(
+                `[Room] ${from} 出口 IP 变化: ${oldIp} → ${newIp}，清空打洞状态`
+              );
             }
             peer.publicEndpoint = publicEndpoint;
             peer.pubSocket = publicEndpoint;
@@ -856,7 +868,6 @@ export class Room extends DurableObject {
         if (targetCode) connectionsByCode[targetCode] = type;
       }
 
-      // ★ 加 availCount 分支
       let p2pCount = 0, relayCount = 0, turnCount = 0, availCount = 0;
       for (const t of p.connections.values()) {
         if (t === "p2p") p2pCount++;
@@ -955,8 +966,6 @@ export class Room extends DurableObject {
   }
 
   async alarm(): Promise<void> {
-    const pending = this.pendingStaggerAt;
-    this.pendingStaggerAt = null;
     try {
       await this.ensureLoaded();
       const now = Date.now();
@@ -979,7 +988,6 @@ export class Room extends DurableObject {
       }
     } catch (e) {
       console.error("[Alarm] failed:", e);
-      if (pending != null && this.pendingStaggerAt == null) this.pendingStaggerAt = pending;
       try { await this.setupSaveAlarm(); } catch {}
     }
   }
@@ -1006,6 +1014,7 @@ export class Room extends DurableObject {
     }
   }
 
+  // ★ 已修复：支持 /30 网段（从 offset 1 开始）
   private allocateIp(): string {
     const used = new Set<string>();
     for (const p of this.peers.values()) {
@@ -1015,10 +1024,13 @@ export class Room extends DurableObject {
       used.add(ip);
     }
 
-    const cycles = Math.max(1, this.virtualHostMax - 1);
-    for (let i = 0; i < cycles; i++) {
-      if (this.ipCounter < 2 || this.ipCounter > this.virtualHostMax) {
-        this.ipCounter = 2;
+    const minOffset = this.minIpOffset();
+    const maxOffset = this.virtualHostMax;
+    const poolSize = Math.max(1, maxOffset - minOffset + 1);
+
+    for (let i = 0; i < poolSize; i++) {
+      if (this.ipCounter < minOffset || this.ipCounter > maxOffset) {
+        this.ipCounter = minOffset;
       }
       const candidate = intToIP(this.virtualBase + this.ipCounter);
       this.ipCounter++;
