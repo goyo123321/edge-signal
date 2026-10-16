@@ -7,7 +7,6 @@ const POLL_BACKOFF_MAX_MS = 300000;
 const state = { token: "", rooms: [], selectedRoom: null };
 let pollTimer = null;
 let consecutiveFailures = 0;
-let turnInfoLoaded = false;
 
 function loadToken() {
   const params = new URLSearchParams(location.search);
@@ -257,7 +256,6 @@ async function refreshDetail() {
   }
 }
 
-// ★ 已更新：识别 p2p-avail（打洞握手成功但数据面未验证）
 function formatConnStatus(connections) {
   if (!connections || Object.keys(connections).length === 0) {
     return `<span style="color:#64748b">--</span>`;
@@ -325,10 +323,6 @@ function showContent() {
   document.getElementById("tokenPrompt").style.display = "none";
   document.getElementById("content").style.display = "block";
   (async () => {
-    if (!turnInfoLoaded) {
-      turnInfoLoaded = true;
-      loadTURNInfo();
-    }
     try { await refreshAll(); consecutiveFailures = 0; }
     catch (e) { consecutiveFailures++; }
     schedulePoll();
@@ -342,6 +336,9 @@ async function refreshAll() {
   document.getElementById("roomCount").textContent = state.rooms.length;
   document.getElementById("status").textContent = `更新于 ${new Date().toLocaleTimeString()}`;
   if (state.selectedRoom) await refreshDetail();
+
+  // ★ 隐患 4 修复：每次刷新都更新 TURN 徽章，服务端 TURN 配置变更能及时反映。
+  loadTURNInfo().catch(() => {});
 }
 
 function getPollDelay() {
