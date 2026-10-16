@@ -105,7 +105,6 @@ function lanListKey(lan: string[] | undefined): string {
 
 export class Room extends DurableObject {
   private sessions: Map<string, WebSocket> = new Map();
-  // ★ S2 修复：WS → clientId 反向表，O(1) 查找
   private wsToClient: WeakMap<WebSocket, string> = new WeakMap();
   private peers: Map<string, PeerRecord> = new Map();
   private ipToClient: Map<string, string> = new Map();
@@ -142,7 +141,6 @@ export class Room extends DurableObject {
     this.virtualHostMax = parsed.hostMax;
     this.virtualCidr = parsed.cidr;
 
-    // ★ /30 从 offset 1 开始；其他从 2 开始（跳过网关）
     this.ipCounter = this.minIpOffset();
 
     console.log(
@@ -152,7 +150,6 @@ export class Room extends DurableObject {
     );
   }
 
-  // ★ /30 只有 2 个可用主机，从 offset 1 开始；其他网段跳过 offset 1（网关）
   private minIpOffset(): number {
     return this.virtualPrefix >= 30 ? 1 : 2;
   }
@@ -248,8 +245,6 @@ export class Room extends DurableObject {
           `主动关闭 ws 并广播 left`
         );
 
-        // ★ S7 修复：先标记 offline，再关闭 ws
-        //   这样 webSocketClose 里的 alreadyHandled 检查能正确识别
         p.online = false;
         p.disconnectedAt = now;
         p.connections = new Map();
@@ -433,11 +428,20 @@ export class Room extends DurableObject {
 
     if (url.pathname === "/_kick" && request.method === "POST") {
       const cid = url.searchParams.get("cid");
-      if (!cid) return new Response(JSON.stringify({ error: "Missing cid" }), { status: 400, headers: { "Content-Type": "application/json" } });
+      if (!cid) {
+        return new Response(JSON.stringify({ error: "Missing cid" }), {
+          status: 400, headers: { "Content-Type": "application/json" },
+        });
+      }
       const ws = this.sessions.get(cid);
       const peer = this.peers.get(cid);
-      if (!ws && !peer) return new Response(JSON.stringify({ error: "Peer not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
-      if (ws) { try { ws.close(1000, "Admin kicked"); } catch {} }
+      if (!ws && !peer) {
+        return new Response(JSON.stringify({ error: "Peer not found" }), {
+          status: 404, headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      // ★ Bug 9 修复：先改状态再关 ws，避免 webSocketClose 抢跑重复处理。
       if (peer) {
         peer.online = false;
         peer.disconnectedAt = Date.now();
@@ -445,14 +449,27 @@ export class Room extends DurableObject {
         peer.pubSocket = "";
         peer.p2pEndpoint = "";
         peer.publicEndpoint = "";
+        if (peer.virtualIp) this.ipToClient.delete(peer.virtualIp);
       }
       this.sessions.delete(cid);
-      if (peer?.virtualIp) this.ipToClient.delete(peer.virtualIp);
       this.coordinator.clearPairStateFor(cid);
+
+      if (ws) {
+        try { ws.close(1000, "Admin kicked"); } catch {}
+      }
+
       this.broadcast(cid, { type: "left", from: cid });
-      await this.reportToRegistry(true);
-      await this.saveStateNow();
-      return new Response(JSON.stringify({ ok: true, kicked: cid }), { headers: { "Content-Type": "application/json" } });
+
+      // ws 存在时，webSocketClose 会异步触发并持久化；
+      // ws 不存在（peer 已离线）时，需要显式持久化。
+      if (!ws) {
+        await this.reportToRegistry(true);
+        await this.saveStateNow();
+      }
+
+      return new Response(JSON.stringify({ ok: true, kicked: cid }), {
+        headers: { "Content-Type": "application/json" },
+      });
     }
 
     if (url.pathname === "/_status") {
@@ -516,7 +533,10 @@ export class Room extends DurableObject {
 
       if (peer.virtualIp && !this.isInVirtualNetwork(peer.virtualIp)) {
         const oldVip = peer.virtualIp;
-        this.ipToClient.delete(oldVip);
+        // ★ Bug 3 修复：只在映射属于本 client 时才删除
+        if (this.ipToClient.get(oldVip) === clientId) {
+          this.ipToClient.delete(oldVip);
+        }
         peer.virtualIp = this.allocateIp();
         console.log(
           `[Room] ${clientId} 旧 VIP ${oldVip} 不在网段 ${this.virtualCidr}，` +
@@ -529,7 +549,10 @@ export class Room extends DurableObject {
       );
       if (conflict) {
         const oldVip = peer.virtualIp;
-        this.ipToClient.delete(oldVip);
+        // ★ Bug 3 修复
+        if (this.ipToClient.get(oldVip) === clientId) {
+          this.ipToClient.delete(oldVip);
+        }
         peer.virtualIp = this.allocateIp();
         console.log(
           `[Room] ${clientId} VIP 冲突：${oldVip} 已被 ${conflict.clientId} 占用，` +
@@ -554,7 +577,6 @@ export class Room extends DurableObject {
     }
     this.ipToClient.set(peer.virtualIp, clientId);
     this.sessions.set(clientId, server);
-    // ★ S2 修复：登记反向表
     this.wsToClient.set(server, clientId);
 
     this.startServerPing();
@@ -606,7 +628,6 @@ export class Room extends DurableObject {
         if (peer) {
           const p = msg.payload || {};
 
-          // ★ S4 修复：保存旧值，判断是否需广播
           const oldPubSocket = peer.pubSocket;
           const oldNatType = peer.natType;
           const oldLanKey = lanListKey(peer.lanEndpoints);
@@ -658,7 +679,6 @@ export class Room extends DurableObject {
 
           this.saveStateThrottled();
 
-          // ★ S4 修复：只在关键信息变化时广播
           const newLanKey = lanListKey(peer.lanEndpoints);
           const newAssistedKey = lanListKey(peer.assistedSockets);
           const natTypeChanged = peer.natType !== oldNatType;
@@ -699,7 +719,8 @@ export class Room extends DurableObject {
           for (const t of msg.payload.to) {
             if (!t || !t.macAddr) continue;
             if (t.observedRaddr) {
-              const target = this.peers.get(t.macAddr);
+              // ★ Bug 4 修复：大小写不敏感查找
+              const target = this.findPeerCI(t.macAddr);
               if (target) target.observedRaddr = t.observedRaddr;
             }
             if (t.punchResult && t.punchResultPeerMac) {
@@ -728,7 +749,6 @@ export class Room extends DurableObject {
           const targetWs = this.sessions.get(id);
           if (!targetWs) continue;
           try {
-            // ★ S5 修复：同时发 from 和 edgeMac，兼容新旧客户端
             targetWs.send(JSON.stringify({
               type: "turn_peer_info",
               from: from,
@@ -741,12 +761,20 @@ export class Room extends DurableObject {
       }
 
       default:
-        if (msg.to) {
+        // ★ Bug 2 修复：转发分支加 try/catch
+        if (typeof msg.to === "string" && msg.to) {
           const target = this.sessions.get(msg.to);
-          if (target) target.send(JSON.stringify({ ...msg, from }));
+          if (target) {
+            try {
+              target.send(JSON.stringify({ ...msg, from }));
+            } catch (e) {
+              console.error(`[Room] forward to ${msg.to} failed:`, e);
+            }
+          }
         } else {
           this.broadcast(from, { ...msg, from });
         }
+        return;
     }
   }
 
@@ -759,8 +787,7 @@ export class Room extends DurableObject {
     if (data.length < 20) return;
     if (data[0] >> 4 !== 4) return;
 
-    const dstIP =
-      `${data[16]}.${data[17]}.${data[18]}.${data[19]}`;
+    const dstIP = `${data[16]}.${data[17]}.${data[18]}.${data[19]}`;
     if (!this.isInVirtualNetwork(dstIP)) return;
 
     const from = this.findClientId(ws);
@@ -775,13 +802,11 @@ export class Room extends DurableObject {
       const fromPeer = this.peers.get(from);
       const toPeer = this.peers.get(targetClientId);
       if (fromPeer) {
-        // ★ S3 修复：更新 lastSeen，避免被误踢
         fromPeer.lastSeen = Date.now();
         fromPeer.relayBytesOut += data.length;
         fromPeer.relayPacketsOut += 1;
       }
       if (toPeer) {
-        // 接收方也刷新（对端在发数据说明还在用）
         toPeer.lastSeen = Date.now();
         toPeer.relayBytesIn += data.length;
         toPeer.relayPacketsIn += 1;
@@ -791,30 +816,38 @@ export class Room extends DurableObject {
 
   async webSocketClose(ws: WebSocket): Promise<void> {
     const clientId = this.findClientId(ws);
-    if (clientId) {
-      const peer = this.peers.get(clientId);
-      const alreadyHandled = peer && !peer.online && !this.sessions.has(clientId);
-      if (peer && !alreadyHandled) {
-        peer.online = false;
-        peer.disconnectedAt = Date.now();
-        peer.connections = new Map();
-        peer.pubSocket = "";
-        peer.p2pEndpoint = "";
-        peer.publicEndpoint = "";
-      }
-      this.sessions.delete(clientId);
-      // ★ S2 修复：WeakMap 会在 ws 被 GC 时自动清理，无需手动 delete
-      if (peer?.virtualIp) this.ipToClient.delete(peer.virtualIp);
-      if (!alreadyHandled) {
-        this.coordinator.clearPairStateFor(clientId);
-        this.broadcast(clientId, { type: "left", from: clientId });
-      }
-      await this.reportToRegistry(true);
-      await this.saveStateNow();
+    if (!clientId) return;
 
-      if (this.sessions.size === 0) {
-        this.stopServerPing();
-      }
+    // ★ 附加修复：如果这个 ws 不是 session 表里当前注册的连接，
+    //   说明它是被 closeDuplicate 替换掉的旧连接，忽略本次关闭事件，
+    //   避免误杀新连接。
+    const currentSession = this.sessions.get(clientId);
+    if (currentSession && currentSession !== ws) {
+      console.log(`[Room] ${clientId} 旧连接关闭（已被新连接替换），忽略`);
+      return;
+    }
+
+    const peer = this.peers.get(clientId);
+    const alreadyHandled = peer && !peer.online && !this.sessions.has(clientId);
+    if (peer && !alreadyHandled) {
+      peer.online = false;
+      peer.disconnectedAt = Date.now();
+      peer.connections = new Map();
+      peer.pubSocket = "";
+      peer.p2pEndpoint = "";
+      peer.publicEndpoint = "";
+    }
+    this.sessions.delete(clientId);
+    if (peer?.virtualIp) this.ipToClient.delete(peer.virtualIp);
+    if (!alreadyHandled) {
+      this.coordinator.clearPairStateFor(clientId);
+      this.broadcast(clientId, { type: "left", from: clientId });
+    }
+    await this.reportToRegistry(true);
+    await this.saveStateNow();
+
+    if (this.sessions.size === 0) {
+      this.stopServerPing();
     }
   }
 
@@ -890,12 +923,6 @@ export class Room extends DurableObject {
       if (delayMs <= 0) {
         for (const [mac, instr] of senders) sendOne(mac, instr);
       } else {
-        // ★ S1 修复：用 ctx.waitUntil 异步延迟，不阻塞 DO 主线程
-        //
-        // 旧版 await new Promise(setTimeout(1000)) 会阻塞整个 DO 事件循环
-        // 1 秒——期间的 WS 消息、二进制中继全部排队，客户端看到 1 秒延迟。
-        //
-        // 新版用 waitUntil 异步执行，DO 立即返回，1 秒后异步发送。
         const sendersCopy = senders.map(([mac, instr]) => [mac, instr] as [string, any]);
         const delayCopy = delayMs;
         this.ctx.waitUntil(
@@ -1021,10 +1048,22 @@ export class Room extends DurableObject {
     });
   }
 
+  // ★ Bug 1 修复：只在新的 wakeAt 早于已存在的 alarm 时才覆盖。
   private async setupSaveAlarm(): Promise<void> {
     let wakeAt = Date.now() + STAGGER_FALLBACK_SAVE_MS;
     const coordAt = this.coordinator.nextWakeDeadline();
     if (coordAt != null && coordAt < wakeAt) wakeAt = coordAt;
+
+    try {
+      const current = await this.ctx.storage.getAlarm();
+      if (current !== null && current <= wakeAt) {
+        this.saveAlarmScheduled = true;
+        return;
+      }
+    } catch (e) {
+      // getAlarm 失败时保守地重新设置
+    }
+
     await this.ctx.storage.setAlarm(wakeAt);
     this.saveAlarmScheduled = true;
   }
@@ -1041,7 +1080,6 @@ export class Room extends DurableObject {
           purged++;
         }
       }
-      // ★ S6 修复：打印清理日志
       if (purged > 0) {
         console.log(`[Room] alarm: 清理 ${purged} 个过期离线 peer`);
       }
@@ -1060,9 +1098,20 @@ export class Room extends DurableObject {
     }
   }
 
-  // ★ S2 修复：从 WeakMap 直接查，O(1)
   private findClientId(ws: WebSocket): string | undefined {
     return this.wsToClient.get(ws);
+  }
+
+  // ★ Bug 4 修复：大小写不敏感的 peer 查找
+  private findPeerCI(id: string): PeerRecord | undefined {
+    if (!id) return undefined;
+    const direct = this.peers.get(id);
+    if (direct) return direct;
+    const needle = id.toLowerCase();
+    for (const [k, p] of this.peers) {
+      if (k.toLowerCase() === needle) return p;
+    }
+    return undefined;
   }
 
   private closeDuplicate(clientId: string) {
@@ -1082,7 +1131,6 @@ export class Room extends DurableObject {
     }
   }
 
-  // ★ 支持 /30 网段（从 offset 1 开始）
   private allocateIp(): string {
     const used = new Set<string>();
     for (const p of this.peers.values()) {
@@ -1110,22 +1158,29 @@ export class Room extends DurableObject {
     );
   }
 
+  // ★ Bug 5 + Bug 6 修复：
+  //   - lastReport 只在成功时更新（失败不会被 5 秒节流抑制重试）
+  //   - onlineCount 只计算一次
   private async reportToRegistry(force = false): Promise<void> {
     const now = Date.now();
     if (!force && now - this.lastReport < 5000) return;
-    this.lastReport = now;
+
     try {
       const env = this.env as any;
       const reg = env.REGISTRY.get(env.REGISTRY.idFromName("global"));
+      const oc = onlineCount(this.peers);
       await reg.fetch(new Request("http://internal/register", {
         method: "POST",
         body: JSON.stringify({
           roomName: this.community,
           peerCount: this.peers.size,
-          onlineCount: onlineCount(this.peers),
-          offlineCount: this.peers.size - onlineCount(this.peers),
+          onlineCount: oc,
+          offlineCount: this.peers.size - oc,
         }),
       }));
-    } catch {}
+      this.lastReport = now;
+    } catch (e) {
+      // 失败时不更新 lastReport，让下次调用可以立即重试
+    }
   }
 }
