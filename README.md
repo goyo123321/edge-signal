@@ -25,13 +25,29 @@
          │                   │                   │
          ▼                   ▼                   ▼
    n2n-go-client       n2n-termux          n2n-android
-   (TUN 模式)          (SOCKS5 模式)        (VpnService)
+   (TUN 模式)          (SOCKS5 + 包转发)    (VpnService)
    Linux/macOS         Android              Android
    Windows/路由器      Termux                APK
    需 root             无 root              无 root
 
               LAN / P2P / TURN / WS  --  完全互通
 ```
+
+### 三端能力对比
+
+| 维度 | n2n-go-client | n2n-termux | n2n-android |
+|:---|:---|:---|:---|
+| **平台** | Linux / macOS / Windows / 路由器 | Android Termux | Android APK |
+| **数据面** | TUN | SOCKS5 + 包转发器 | VpnService + SOCKS5 |
+| **主动访问（TCP）** | ✅ | ✅ | ✅ |
+| **主动访问（UDP）** | ✅ | ❌ | ✅ |
+| **主动访问（ICMP）** | ✅ | ❌ | ✅ |
+| **被动接受（TCP）** | ✅ | ✅ | ✅ |
+| **被动接受（UDP）** | ✅ | ✅ | ✅ |
+| **被动接受（ICMP）** | ✅ | ✅ | ✅ |
+| **权限** | root | 无 root | 无 root |
+
+**服务端对三端平等对待**——同一套 WebSocket 协议，同一套打洞协调逻辑，同一个 TURN 凭证分发。
 
 ### 服务端在各降级级中的作用
 
@@ -132,7 +148,7 @@ SIGNALING_URL="wss://edge-signal.<你的子域>.workers.dev" \
 | 客户端 | 平台 | 数据面 | 说明 |
 |:---|:---|:---|:---|
 | [n2n-go-client](https://github.com/goyo123321/n2n-go-client) | Linux/macOS/Windows/路由器 | TUN | 需 root/管理员 |
-| [n2n-termux](https://github.com/goyo123321/n2n-termux) | Android Termux | SOCKS5 | 无 root |
+| [n2n-termux](https://github.com/goyo123321/n2n-termux) | Android Termux | SOCKS5 + 包转发 | 无 root，**双向互通** |
 | [n2n-android](https://github.com/goyo123321/n2n-android) | Android APK | VpnService | 无 root |
 
 **三者完全互通**——同一房间内，任意两端可直接互访虚拟 IP。
@@ -673,6 +689,7 @@ if (aIp && bIp && aIp === bIp) {
 **修复**：
 - **客户端侧**：`hasTrafficFromTarget(peerID, since)` 只检查目标 peer 的 `lastRecvAt`
 - **服务端侧**：`coordinate()` 的 `anySucceeded` 允许任一端成功即停止协调
+- **已 P2P 时**：客户端主动上报 `p2p_status=3`，让服务端 `punchState` 记录成功状态，停止重发指令
 
 ### 端口扫描范围
 
@@ -786,8 +803,9 @@ GET /api/admin/nathole/<room>?token=<ADMIN_TOKEN>
 **单向打洞成功**——A 的 probe 命中 B，但 B 回发给 A 的 probe 丢包了。
 
 **修复**：
-- 客户端用 `hasTrafficFromTarget` 替代 `hasTrafficFromAny`
+- 客户端用 `hasTrafficFromTarget` 替代 `hasTrafficAny`
 - 服务端用 `anySucceeded` 替代 `bothSucceeded`
+- 已 P2P 一端主动上报 `p2p_status=3`，让服务端记录成功
 
 ### Q: 同 STUN 出口 IP 时疯狂打洞？
 
@@ -822,6 +840,23 @@ GET /api/admin/nathole/<room>?token=<ADMIN_TOKEN>
 2. **Worker 日志搜 `[Room] → xxx 下发 nat_hole_instruction`** —— 有就是服务端发出去了
 
 **如果服务端发了、客户端没收到** → 客户端 WS 断线或版本问题。
+
+### Q: 客户端每 15 秒收到一次 `nat_hole_instruction`（重复指令）？
+
+**客户端已 P2P 但没告诉服务端**。
+
+**原因**：客户端收到指令前已经通过 PING/PONG 建立了 P2P，直接 `return`，服务端 `punchState.aState/bState` 一直是 0，`anySucceeded=false`，每 15 秒重发一次。
+
+**修复**：客户端在跳过指令时**主动上报** `p2p_status=3`：
+
+```go
+if e.relayMgr.GetState(instr.TargetMac) == ConnP2P {
+    e.reportP2PStatus(instr.TargetMac, 3)
+    return
+}
+```
+
+**验证**：客户端日志 `[NAT-HOLE] 跳过指令 target=xxx（已 P2P），上报 p2p_status=3` **只出现一次**。
 
 ### Q: TURN 服务器额度用尽？
 
@@ -1024,13 +1059,16 @@ DO 被 evict 后，从 storage 恢复 → 代号保持。
 | 维度 | n2n-go-client | n2n-termux | n2n-android |
 |:---|:---|:---|:---|
 | 运行环境 | Linux/macOS/Windows/路由器 | Android Termux | Android APK |
-| 数据面 | TUN | SOCKS5 | VpnService |
+| 数据面 | TUN | SOCKS5 + 包转发 | VpnService |
 | 权限 | root/管理员 | 无 root | 无 root |
+| **主动 TCP** | ✅ | ✅ | ✅ |
+| **主动 UDP** | ✅ | ❌ | ✅ |
+| **主动 ICMP** | ✅ | ❌ | ✅ |
+| **被动 TCP** | ✅ | ✅ | ✅ |
+| **被动 UDP** | ✅ | ✅ | ✅ |
+| **被动 ICMP** | ✅ | ✅ | ✅ |
 | 上报 `lanEndpoints` | ✅ | ✅ | ✅ |
 | 上报 `assistedEndpoints` | ✅ | ✅ | ✅ |
-| 支持 UDP/ICMP | ✅ | ❌（仅 TCP） | ✅ |
-| 支持 N2NS 流协议 | ✅ | ✅ | ✅ |
-| 支持 WS 应用层隧道 | ✅ | ✅ | ✅ |
 
 ### 服务端配置对三端的影响
 
@@ -1049,11 +1087,11 @@ DO 被 evict 后，从 storage 恢复 → 代号保持。
 | 主动方 → 被动方 | 服务端行为 | 数据面 |
 |:---|:---|:---|
 | PC → Termux | 打洞协调 | N2NS 帧（PC 侧 TUN 发出） |
-| PC → Android | 打洞协调 | N2NS 帧 |
+| PC → Android | 打洞协调 | 裸 IPv4 包（双 TUN） |
 | Termux → PC | 打洞协调 | N2NS 帧（Termux 侧 SOCKS5 触发） |
 | Termux → Android | 打洞协调 | N2NS 帧 |
-| Android → PC | 打洞协调 | N2NS 帧（Android 侧 TUN 发出） |
-| Android → Termux | 打洞协调 | N2NS 帧 |
+| Android → PC | 打洞协调 | 裸 IPv4 包（双 TUN） |
+| Android → Termux | 打洞协调 | 裸 IPv4 包 + packet_forwarder |
 
 **所有 6 种组合完全互通**。
 
@@ -1061,10 +1099,12 @@ DO 被 evict 后，从 storage 恢复 → 代号保持。
 
 当打洞和 TURN 都失败时，三端降级到 **WS 中继**。此路径使用两套协议：
 
-1. **`SendBinary`** — 原始 IPv4 包（用于 TUN ↔ TUN 的纯数据面转发）
+1. **`SendBinary`** — 原始 IPv4 包（用于 TUN ↔ TUN / TUN ↔ packet_forwarder 的纯数据面转发）
 2. **`app_stream_*`** — 应用层 TCP 隧道（用于 SOCKS5 ↔ TUN 或跨类型访问）
 
 **三端都实现了这两套协议**，所以 WS 中继路径也完全互通。
+
+**ICMP 特殊处理**：由于单向 P2P 常见（CGNAT 打洞后 A→B 通、B→A 断），Termux 端将 **ICMP 响应强制走 WS 中继**（牺牲延迟换可靠），确保 ping 稳定。
 
 ---
 
@@ -1075,5 +1115,5 @@ MIT
 ## 🔗 相关项目
 
 - [n2n-go-client](https://github.com/goyo123321/n2n-go-client) — 跨平台客户端（桌面 / 路由器 / 服务器）
-- [n2n-termux](https://github.com/goyo123321/n2n-termux) — Android Termux SOCKS5 客户端
+- [n2n-termux](https://github.com/goyo123321/n2n-termux) — Android Termux SOCKS5 客户端（双向互通）
 - [n2n-android](https://github.com/goyo123321/n2n-android) — Android APK 客户端（VpnService）
