@@ -105,6 +105,7 @@ function lanListKey(lan: string[] | undefined): string {
 
 export class Room extends DurableObject {
   private sessions: Map<string, WebSocket> = new Map();
+  // ★ S2 修复：WS → clientId 反向表，O(1) 查找
   private wsToClient: WeakMap<WebSocket, string> = new WeakMap();
   private peers: Map<string, PeerRecord> = new Map();
   private ipToClient: Map<string, string> = new Map();
@@ -141,6 +142,7 @@ export class Room extends DurableObject {
     this.virtualHostMax = parsed.hostMax;
     this.virtualCidr = parsed.cidr;
 
+    // ★ /30 从 offset 1 开始；其他从 2 开始（跳过网关）
     this.ipCounter = this.minIpOffset();
 
     console.log(
@@ -150,6 +152,7 @@ export class Room extends DurableObject {
     );
   }
 
+  // ★ /30 只有 2 个可用主机，从 offset 1 开始；其他网段跳过 offset 1（网关）
   private minIpOffset(): number {
     return this.virtualPrefix >= 30 ? 1 : 2;
   }
@@ -441,7 +444,6 @@ export class Room extends DurableObject {
         });
       }
 
-      // ★ Bug 9 修复：先改状态再关 ws，避免 webSocketClose 抢跑重复处理。
       if (peer) {
         peer.online = false;
         peer.disconnectedAt = Date.now();
@@ -460,8 +462,6 @@ export class Room extends DurableObject {
 
       this.broadcast(cid, { type: "left", from: cid });
 
-      // ws 存在时，webSocketClose 会异步触发并持久化；
-      // ws 不存在（peer 已离线）时，需要显式持久化。
       if (!ws) {
         await this.reportToRegistry(true);
         await this.saveStateNow();
@@ -533,7 +533,6 @@ export class Room extends DurableObject {
 
       if (peer.virtualIp && !this.isInVirtualNetwork(peer.virtualIp)) {
         const oldVip = peer.virtualIp;
-        // ★ Bug 3 修复：只在映射属于本 client 时才删除
         if (this.ipToClient.get(oldVip) === clientId) {
           this.ipToClient.delete(oldVip);
         }
@@ -549,7 +548,6 @@ export class Room extends DurableObject {
       );
       if (conflict) {
         const oldVip = peer.virtualIp;
-        // ★ Bug 3 修复
         if (this.ipToClient.get(oldVip) === clientId) {
           this.ipToClient.delete(oldVip);
         }
@@ -719,7 +717,6 @@ export class Room extends DurableObject {
           for (const t of msg.payload.to) {
             if (!t || !t.macAddr) continue;
             if (t.observedRaddr) {
-              // ★ Bug 4 修复：大小写不敏感查找
               const target = this.findPeerCI(t.macAddr);
               if (target) target.observedRaddr = t.observedRaddr;
             }
@@ -761,7 +758,6 @@ export class Room extends DurableObject {
       }
 
       default:
-        // ★ Bug 2 修复：转发分支加 try/catch
         if (typeof msg.to === "string" && msg.to) {
           const target = this.sessions.get(msg.to);
           if (target) {
@@ -784,6 +780,37 @@ export class Room extends DurableObject {
     else buffer = await (message as Blob).arrayBuffer();
 
     const data = new Uint8Array(buffer);
+    
+    // ============================================================
+    // ★ 拦截 AppStream 二进制包 (N2NW)
+    // ============================================================
+    if (data.length >= 6 && data[0] === 0x4E && data[1] === 0x32 && data[2] === 0x4E && data[3] === 0x57) {
+      const peerLen = data[5];
+      if (data.length < 6 + peerLen) return;
+      
+      const targetClientId = new TextDecoder().decode(data.subarray(6, 6 + peerLen));
+      const targetWs = this.sessions.get(targetClientId);
+      
+      if (targetWs) {
+        try {
+          targetWs.send(buffer);
+          
+          // 刷新两端的 lastSeen
+          const from = this.findClientId(ws);
+          if (from) {
+            const fromPeer = this.peers.get(from);
+            if (fromPeer) fromPeer.lastSeen = Date.now();
+          }
+          const toPeer = this.peers.get(targetClientId);
+          if (toPeer) toPeer.lastSeen = Date.now();
+        } catch {}
+      }
+      return;
+    }
+
+    // ============================================================
+    // 原有的裸 IPv4 包路由
+    // ============================================================
     if (data.length < 20) return;
     if (data[0] >> 4 !== 4) return;
 
@@ -818,9 +845,6 @@ export class Room extends DurableObject {
     const clientId = this.findClientId(ws);
     if (!clientId) return;
 
-    // ★ 附加修复：如果这个 ws 不是 session 表里当前注册的连接，
-    //   说明它是被 closeDuplicate 替换掉的旧连接，忽略本次关闭事件，
-    //   避免误杀新连接。
     const currentSession = this.sessions.get(clientId);
     if (currentSession && currentSession !== ws) {
       console.log(`[Room] ${clientId} 旧连接关闭（已被新连接替换），忽略`);
@@ -1048,7 +1072,6 @@ export class Room extends DurableObject {
     });
   }
 
-  // ★ Bug 1 修复：只在新的 wakeAt 早于已存在的 alarm 时才覆盖。
   private async setupSaveAlarm(): Promise<void> {
     let wakeAt = Date.now() + STAGGER_FALLBACK_SAVE_MS;
     const coordAt = this.coordinator.nextWakeDeadline();
@@ -1060,9 +1083,7 @@ export class Room extends DurableObject {
         this.saveAlarmScheduled = true;
         return;
       }
-    } catch (e) {
-      // getAlarm 失败时保守地重新设置
-    }
+    } catch (e) {}
 
     await this.ctx.storage.setAlarm(wakeAt);
     this.saveAlarmScheduled = true;
@@ -1102,7 +1123,6 @@ export class Room extends DurableObject {
     return this.wsToClient.get(ws);
   }
 
-  // ★ Bug 4 修复：大小写不敏感的 peer 查找
   private findPeerCI(id: string): PeerRecord | undefined {
     if (!id) return undefined;
     const direct = this.peers.get(id);
@@ -1158,9 +1178,6 @@ export class Room extends DurableObject {
     );
   }
 
-  // ★ Bug 5 + Bug 6 修复：
-  //   - lastReport 只在成功时更新（失败不会被 5 秒节流抑制重试）
-  //   - onlineCount 只计算一次
   private async reportToRegistry(force = false): Promise<void> {
     const now = Date.now();
     if (!force && now - this.lastReport < 5000) return;
