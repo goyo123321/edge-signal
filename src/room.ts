@@ -774,42 +774,97 @@ export class Room extends DurableObject {
     }
   }
 
+  // ============================================================
+  // 二进制消息分发
+  //
+  // 帧类型：
+  //   1. N2NW 帧（magic "N2NW"）：WS 中继数据面
+  //      客户端 → 服务端：peerId = 目标 clientId
+  //      服务端 → 客户端：peerId = 发送方 clientId（服务端重写）
+  //   2. 裸 IPv4 包：按 dstIP 查 ipToClient 映射转发（兼容旧客户端）
+  //
+  // 修复点（vs 旧版）：
+  //   - N2NW 转发时重写帧头 peerId → 发送方 clientId
+  //     （旧版原样转发，接收方看到的"目标 ID"是自己，无法识别发送方）
+  //   - N2NW 分支补流量统计（relayBytesIn/Out, relayPacketsIn/Out）
+  //   - N2NW 分支补 lastSeen 刷新（避免长时间打洞失败被误判 stale）
+  //   - 自发自收过滤
+  //   - 大 peerId / 未知名异常可见性（console.error）
+  // ============================================================
   private async handleBinary(ws: WebSocket, message: ArrayBuffer | Blob): Promise<void> {
     let buffer: ArrayBuffer;
     if (message instanceof ArrayBuffer) buffer = message;
     else buffer = await (message as Blob).arrayBuffer();
 
     const data = new Uint8Array(buffer);
-    
+    if (data.length === 0) return;
+
+    const from = this.findClientId(ws);
+    if (!from) return;
+    const fromPeer = this.peers.get(from);
+    if (fromPeer) fromPeer.lastSeen = Date.now();
+
     // ============================================================
-    // ★ 拦截 AppStream 二进制包 (N2NW)
+    // 1. N2NW 帧
+    //    格式：magic("N2NW",4B) + flags(1B) + peerIdLen(1B) + peerId(N) + payload
     // ============================================================
-    if (data.length >= 6 && data[0] === 0x4E && data[1] === 0x32 && data[2] === 0x4E && data[3] === 0x57) {
+    if (
+      data.length >= 6 &&
+      data[0] === 0x4E && data[1] === 0x32 &&
+      data[2] === 0x4E && data[3] === 0x57
+    ) {
       const peerLen = data[5];
       if (data.length < 6 + peerLen) return;
-      
-      const targetClientId = new TextDecoder().decode(data.subarray(6, 6 + peerLen));
+
+      const targetClientId = new TextDecoder().decode(
+        data.subarray(6, 6 + peerLen)
+      );
+      if (!targetClientId || targetClientId === from) return;
+
       const targetWs = this.sessions.get(targetClientId);
-      
-      if (targetWs) {
-        try {
-          targetWs.send(buffer);
-          
-          // 刷新两端的 lastSeen
-          const from = this.findClientId(ws);
-          if (from) {
-            const fromPeer = this.peers.get(from);
-            if (fromPeer) fromPeer.lastSeen = Date.now();
-          }
-          const toPeer = this.peers.get(targetClientId);
-          if (toPeer) toPeer.lastSeen = Date.now();
-        } catch {}
+      if (!targetWs) {
+        // 目标不在线：静默丢弃（客户端有超时机制负责降级）
+        return;
+      }
+
+      const fromBytes = new TextEncoder().encode(from);
+      if (fromBytes.length > 255) {
+        console.warn(`[Room] N2NW 发送方 ID 过长 (${fromBytes.length}B)，丢弃`);
+        return;
+      }
+
+      // ★ 重写帧头 peerId：目标 → 发送方
+      const payload = data.subarray(6 + peerLen);
+      const newFrame = new Uint8Array(6 + fromBytes.length + payload.length);
+      newFrame[0] = 0x4E;
+      newFrame[1] = 0x32;
+      newFrame[2] = 0x4E;
+      newFrame[3] = 0x57;
+      newFrame[4] = data[4];                       // 保留原 flags
+      newFrame[5] = fromBytes.length;
+      newFrame.set(fromBytes, 6);
+      newFrame.set(payload, 6 + fromBytes.length);
+
+      try {
+        targetWs.send(newFrame.buffer);
+        const toPeer = this.peers.get(targetClientId);
+        if (fromPeer) {
+          fromPeer.relayBytesOut += data.length;
+          fromPeer.relayPacketsOut += 1;
+        }
+        if (toPeer) {
+          toPeer.lastSeen = Date.now();
+          toPeer.relayBytesIn += data.length;
+          toPeer.relayPacketsIn += 1;
+        }
+      } catch (e) {
+        console.error(`[Room] N2NW 转发失败 ${from}->${targetClientId}:`, e);
       }
       return;
     }
 
     // ============================================================
-    // 原有的裸 IPv4 包路由
+    // 2. 裸 IPv4 包：按 dstIP 查 ipToClient 映射转发
     // ============================================================
     if (data.length < 20) return;
     if (data[0] >> 4 !== 4) return;
@@ -817,19 +872,15 @@ export class Room extends DurableObject {
     const dstIP = `${data[16]}.${data[17]}.${data[18]}.${data[19]}`;
     if (!this.isInVirtualNetwork(dstIP)) return;
 
-    const from = this.findClientId(ws);
-    if (!from) return;
     const targetClientId = this.ipToClient.get(dstIP);
-    if (!targetClientId) return;
+    if (!targetClientId || targetClientId === from) return;
     const targetWs = this.sessions.get(targetClientId);
     if (!targetWs) return;
 
     try {
       targetWs.send(buffer);
-      const fromPeer = this.peers.get(from);
       const toPeer = this.peers.get(targetClientId);
       if (fromPeer) {
-        fromPeer.lastSeen = Date.now();
         fromPeer.relayBytesOut += data.length;
         fromPeer.relayPacketsOut += 1;
       }
@@ -838,7 +889,9 @@ export class Room extends DurableObject {
         toPeer.relayBytesIn += data.length;
         toPeer.relayPacketsIn += 1;
       }
-    } catch {}
+    } catch (e) {
+      console.error(`[Room] IPv4 转发失败 ${from}->${targetClientId}:`, e);
+    }
   }
 
   async webSocketClose(ws: WebSocket): Promise<void> {
