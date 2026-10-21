@@ -54,7 +54,6 @@ function parsePort(sock) {
   return i < 0 ? 0 : parseInt(sock.slice(i + 1), 10) || 0;
 }
 
-// 从 "ip:port" 提取 IP 部分。
 function extractIP(sock) {
   if (!sock) return "";
   const i = sock.lastIndexOf(":");
@@ -136,8 +135,11 @@ export class NatHoleCoordinator {
   clearPairStateFor(mac) {
     if (!mac) return;
     const needle = String(mac).toLowerCase();
-    const touches = (key) =>
-      key.split("|").some((m) => m.toLowerCase() === needle);
+    const touches = (key) => {
+      // key 可能是 "a|b" 也可能是 "a@r"（instructions 用），统一检查
+      const base = key.includes("@") ? key.split("@")[0] : key;
+      return base.split("|").some((m) => m.toLowerCase() === needle);
+    };
     for (const k of [...this.backoff.keys()]) if (touches(k)) this.backoff.delete(k);
     for (const k of [...this.punchState.keys()]) if (touches(k)) this.punchState.delete(k);
     for (const k of [...this.failCounts.keys()]) if (touches(k)) this.failCounts.delete(k);
@@ -264,8 +266,7 @@ export class NatHoleCoordinator {
   }
 
   coordinate(community) {
-    // ★ Bug 7 修复：定期清理过期的 analyzer 记录，
-    //   否则 records 会随 pair 数量不断增长。
+    // 定期清理过期的 analyzer 记录
     this.analyzer.clean();
 
     const instructions = new Map();
@@ -331,13 +332,7 @@ export class NatHoleCoordinator {
           continue;
         }
 
-        // ★ 同 STUN 出口 IP 检测
-        //
-        // 场景：两端在同一 CGNAT 后面，STUN 出口 IP 相同。hairpin NAT
-        // 大部分运营商不支持，但仍有一小部分支持。策略：
-        //   1. 首次遇到：允许一次 hairpin 尝试
-        //   2. 已失败过（任一端 state=2 或 failCounts>0）：下发
-        //      force_fallback 强制降级到 TURN/WS
+        // 同 STUN 出口 IP 检测
         const aIp = extractIP(a.pubSocket);
         const bIp = extractIP(b.pubSocket);
         if (aIp && bIp && aIp === bIp) {
@@ -350,7 +345,7 @@ export class NatHoleCoordinator {
             (prevPunch.aState === 3 || prevPunch.bState === 3);
 
           if (alreadySucceeded) {
-            // 上方 anySucceeded 分支已处理，这里不会进来
+            // 上方 anySucceeded 分支已处理
           } else if (alreadyFailed) {
             if (!forceFallbacks.has(aKey)) forceFallbacks.set(aKey, new Set());
             if (!forceFallbacks.has(bKey)) forceFallbacks.set(bKey, new Set());
@@ -546,15 +541,62 @@ export class NatHoleCoordinator {
           at: now,
         });
 
-        instructions.set(senderKey, senderInstr);
-        instructions.set(receiverKey, receiverInstr);
+        // ============================================================
+        // ★ P0-1 打洞并行化
+        //
+        // 首次打洞（fc === 0）：一次派发 3 个 rung（rung, rung+1, rung+2）
+        //   - 客户端并行执行，任一成功即停
+        //   - 首次命中时间从 15s（等退避）降到 500ms 内
+        //
+        // 重试（fc > 0）：只派发当前推荐的 1 组
+        //   - 避免浪费，因为已经知道这个 rung 不行
+        //
+        // instructions 的 key 用 `${mac}@${r}` 后缀，允许同一 peer 多 rung 并存
+        // room.ts 的 runCoordination 会解析 @r 后缀取真实 clientId
+        // ============================================================
+        const isFirstAttempt = fc === 0;
+        const rungsToDispatch = isFirstAttempt
+          ? [
+              rung,
+              Math.min(rung + 1, ladder.length - 1),
+              Math.min(rung + 2, ladder.length - 1),
+            ]
+          : [rung];
+
+        const seenRungs = new Set();
+        for (const r of rungsToDispatch) {
+          if (seenRungs.has(r)) continue;
+          seenRungs.add(r);
+
+          const behR = ladder[Math.min(r, ladder.length - 1)] || ladder[0];
+          const senderBehR = behR.sender || {};
+          const receiverBehR = behR.receiver || {};
+
+          const senderInstrR = {
+            ...senderInstr,
+            behaviorIndex: r,
+            ttl: senderBehR.ttl || 0,
+            sendDelayMs: senderBehR.sendDelayMs || 0,
+          };
+
+          const receiverInstrR = {
+            ...receiverInstr,
+            behaviorIndex: r,
+            ttl: receiverBehR.ttl || 0,
+            sendDelayMs: 0,
+          };
+
+          instructions.set(`${senderKey}@${r}`, senderInstrR);
+          instructions.set(`${receiverKey}@${r}`, receiverInstrR);
+        }
+
         paired.add(senderKey);
         paired.add(receiverKey);
         noteWake(now + backoffMs);
 
         console.log(
-          `[NAT] ${key} 生成指令 (rung ${rung}), ` +
-          `sender=${sender.pubSocket} receiver=${receiver.pubSocket} ` +
+          `[NAT] ${key} 生成指令 (rung ${rung}, 派发 ${rungsToDispatch.length} 组)` +
+          `, sender=${sender.pubSocket} receiver=${receiver.pubSocket} ` +
           `halfWidth=±${halfWidth} ` +
           `assisted=${(receiver.assistedSockets || []).length}/${(sender.assistedSockets || []).length} ` +
           `lan=${(receiver.lanEndpoints || []).length}/${(sender.lanEndpoints || []).length}`
