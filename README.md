@@ -79,6 +79,7 @@
 - **设备代号** — 按上线顺序自动分配 A/B/C/D
 - **在线/离线统计** — 区分当前在线和断线的设备
 - **状态可视化** — `p2p-BD TURN-C ws-D` 格式直观展示连接方式
+- **协议能力协商** — 客户端上报 `features`，服务端自动协商 WS 中继帧格式（N2NW / N2NA / 文本），**新旧客户端混合房间零丢包**
 - **虚拟网段可配** — 通过 `VIRTUAL_NETWORK` 配置任意 IPv4 CIDR
 - **状态持久化** — peers 写入 DO Storage，抗 evict
 - **自动清理** — 离线设备保留 30 分钟后清理，房间 1 小时无活动清理
@@ -487,6 +488,54 @@ curl -s "https://edge-signal.xxx.workers.dev/api/public/turn-config" | jq
 
 ---
 
+## 🔌 协议能力协商（features）
+
+客户端在 `p2p_metadata` 里上报 `features` 数组，服务端据此决定 WS 中继的帧格式。
+
+| feature | 含义 | 引入版本 |
+|:---|:---|:---|
+| `n2nw` | 支持 IPv4 二进制数据面（N2NW 帧） | v1.0 |
+| `n2na` | 支持 app_stream 二进制数据面（N2NA 帧） | 最新 |
+
+### 混合房间行为
+
+服务端按**目标端**是否支持 `n2na` 决定转发格式：
+
+| 发送方 | 接收方 | 服务端行为 |
+|:---|:---|:---|
+| 新 | 新 | 二进制转发（N2NA，节省 ~27% 带宽） |
+| 新 | 旧 | 解码转 `app_stream_data` 文本 |
+| 旧 | 新 | 文本（新客户端兼容） |
+| 旧 | 旧 | 文本 |
+
+**零丢包**——新旧客户端可在同一房间通信，服务端自动协商。
+
+### 向后兼容保证
+
+- 旧客户端不上报 `features` → 服务端视为 `[]` → 全走文本降级，**行为与升级前完全一致**
+- 服务端**不需要等待任何客户端先升级**——部署后即生效
+- 新旧客户端可以在同一房间共存，互不影响
+
+### 验证 features 上报
+
+```bash
+curl -s "https://<worker>/api/admin/status/<room>?token=<ADMIN_TOKEN>" | jq '.peers[] | {code, features}'
+```
+
+**新客户端**返回：
+
+```json
+{"code": "A", "features": ["n2na", "n2nw"]}
+```
+
+**旧客户端**返回：
+
+```json
+{"code": "B", "features": []}
+```
+
+---
+
 ## 📊 面板
 
 ### 公开面板
@@ -502,7 +551,7 @@ https://edge-signal.<子域>.workers.dev/
 - NAT 类型、连接状态（`p2p-BD TURN-C ws-D`）
 - 中继流量
 
-**不显示**：设备名、Client ID、公网地址、操作按钮
+**不显示**：设备名、Client ID、公网地址、操作按钮、features
 
 ### 管理面板
 
@@ -515,6 +564,7 @@ https://edge-signal.<子域>.workers.dev/admin?token=<ADMIN_TOKEN>
 - **Client ID**
 - **HTTP 源 IP / UDP 打洞地址 / 虚拟 IP**（三行）
 - **TURN 中继地址**
+- **协议能力 chips**（NAT 类型列下方显示 `n2na` / `n2nw`）
 - 完整连接对端列表
 - 中继流量明细
 
@@ -534,6 +584,14 @@ https://edge-signal.<子域>.workers.dev/admin?token=<ADMIN_TOKEN>
 | `TURN-A` | 🔵 蓝底 | TURN 中继 |
 | `ws-A` | 🟡 黄底 | WS 中继（最后兜底） |
 
+### 协议能力徽章（管理面板专属）
+
+| 徽章 | 颜色 | 含义 |
+|:---|:---|:---|
+| `n2na` | 🟢 绿底 | 支持 app_stream 二进制数据面 |
+| `n2nw` | 🔵 蓝底 | 支持 IPv4 二进制数据面 |
+| `无能力上报` | 灰色 | 旧客户端未上报 features |
+
 ---
 
 ## 🔧 监控端点
@@ -545,7 +603,7 @@ https://edge-signal.<子域>.workers.dev/admin?token=<ADMIN_TOKEN>
 | `/api/public/turn-config` | TURN 配置（脱敏） | ❌ |
 | `/api/turn-credentials` | 生成 TURN 凭证 | ❌ |
 | `/api/admin/rooms` | 管理房间列表 | ✅ |
-| `/api/admin/status/<room>` | 完整房间详情 | ✅ |
+| `/api/admin/status/<room>` | 完整房间详情（含 features） | ✅ |
 | `/api/admin/nathole/<room>` | 打洞协调器状态 | ✅ |
 | `/api/admin/kick?room=X&cid=Y` | 踢出设备 | ✅ |
 | `/api/admin/clear?room=X` | 清空房间 | ✅ |
@@ -590,7 +648,7 @@ https://edge-signal.<子域>.workers.dev/admin?token=<ADMIN_TOKEN>
 edge-signal/
 ├── src/
 │   ├── index.ts              # Worker 入口 + TURN 凭证端点 + 公开 API
-│   ├── room.ts               # Durable Object: 房间状态 + 打洞协调
+│   ├── room.ts               # Durable Object: 房间状态 + 打洞协调 + N2NA 转发
 │   ├── registry.ts           # Durable Object: 房间注册表
 │   └── nathole/
 │       ├── ladder.js         # FRP 行为阶梯
@@ -617,7 +675,7 @@ edge-signal/
 | 客户端断开 | 标记 `online: false`，保留 30 分钟 |
 | 30 分钟无活动 | 从 storage 中清理 |
 | 房间 1 小时无活动 | 从 registry 中清理 |
-| DO 被 evict | peers 从 storage 恢复，代号不变 |
+| DO 被 evict | peers 从 storage 恢复，代号不变，features 保持 |
 | 客户端重连 | 复用旧记录，虚拟 IP 不变，清空该 peer 的打洞状态 |
 
 ---
@@ -929,7 +987,7 @@ https://dash.cloudflare.com/
 **关键日志**：
 
 ```
-[Room] p2p_metadata from xxx: natType=... pub=... multiExit=...
+[Room] p2p_metadata from xxx: natType=... pub=... multiExit=... features=["n2na","n2nw"]
 [NAT] xxx 同 STUN 出口 IP (120.239.134.13)，允许一次 hairpin 尝试
 [NAT] xxx 跳过：同 STUN 出口 IP 已尝试失败，标记强制降级
 [Room] → xxx 下发 force_fallback (1 peers)
@@ -1048,6 +1106,26 @@ DO 被 evict 后，从 storage 恢复 → 代号保持。
 - 设备超过 30 分钟离线被清理
 - 房间被手动清空
 
+### Q: 管理面板为什么有的设备显示 `无能力上报`？
+
+**旧客户端**（升级 features 之前的版本）不上报 `features` 字段。
+
+- **不影响功能**：服务端自动降级到文本 `app_stream_data`，连接正常
+- **升级后消失**：客户端升级到支持 `features` 的版本后，会正常显示 `n2na` / `n2nw` chips
+
+### Q: 混合房间（新老客户端共存）会丢数据吗？
+
+**不会**。
+
+**服务端按目标端协商**：
+
+- 发送方新、接收方新 → N2NA 二进制
+- 发送方新、接收方旧 → 自动解码转文本 `app_stream_data`
+- 发送方旧、接收方新 → 文本转发（新客户端兼容）
+- 双方都旧 → 文本
+
+**旧客户端完全无感知**，新客户端自动获得二进制优化。
+
 ---
 
 ## 🌐 三端客户端协同说明
@@ -1069,6 +1147,7 @@ DO 被 evict 后，从 storage 恢复 → 代号保持。
 | **被动 ICMP** | ✅ | ✅ | ✅ |
 | 上报 `lanEndpoints` | ✅ | ✅ | ✅ |
 | 上报 `assistedEndpoints` | ✅ | ✅ | ✅ |
+| 上报 `features` | ✅ `["n2na","n2nw"]` | ✅ `["n2na","n2nw"]` | ✅ `["n2na","n2nw"]` |
 
 ### 服务端配置对三端的影响
 
@@ -1097,12 +1176,13 @@ DO 被 evict 后，从 storage 恢复 → 代号保持。
 
 ### WS 中继路径的兼容
 
-当打洞和 TURN 都失败时，三端降级到 **WS 中继**。此路径使用两套协议：
+当打洞和 TURN 都失败时，三端降级到 **WS 中继**。此路径使用三套协议：
 
-1. **`SendBinary`** — 原始 IPv4 包（用于 TUN ↔ TUN / TUN ↔ packet_forwarder 的纯数据面转发）
-2. **`app_stream_*`** — 应用层 TCP 隧道（用于 SOCKS5 ↔ TUN 或跨类型访问）
+1. **`SendBinary` N2NW** — 原始 IPv4 包（用于 TUN ↔ TUN / TUN ↔ packet_forwarder 的纯数据面转发）
+2. **`SendBinary` N2NA** — app_stream 二进制（`features` 协商通过时）
+3. **`app_stream_*` 文本** — 应用层 TCP 隧道（`features` 协商降级时）
 
-**三端都实现了这两套协议**，所以 WS 中继路径也完全互通。
+**三端都实现了这三套协议**，所以 WS 中继路径也完全互通。
 
 **ICMP 特殊处理**：由于单向 P2P 常见（CGNAT 打洞后 A→B 通、B→A 断），Termux 端将 **ICMP 响应强制走 WS 中继**（牺牲延迟换可靠），确保 ping 稳定。
 
