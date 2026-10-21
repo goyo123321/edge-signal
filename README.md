@@ -494,7 +494,7 @@ curl -s "https://edge-signal.xxx.workers.dev/api/public/turn-config" | jq
 
 | feature | 含义 | 引入版本 |
 |:---|:---|:---|
-| `n2nw` | 支持 IPv4 二进制数据面（N2NW 帧） | v1.0 |
+| `n2nw` | 支持 IPv4 二进制数据面（N2NW 帧） | v1.0.24 |
 | `n2na` | 支持 app_stream 二进制数据面（N2NA 帧） | 最新 |
 
 ### 混合房间行为
