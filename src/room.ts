@@ -105,7 +105,6 @@ function lanListKey(lan: string[] | undefined): string {
 
 export class Room extends DurableObject {
   private sessions: Map<string, WebSocket> = new Map();
-  // ★ S2 修复：WS → clientId 反向表，O(1) 查找
   private wsToClient: WeakMap<WebSocket, string> = new WeakMap();
   private peers: Map<string, PeerRecord> = new Map();
   private ipToClient: Map<string, string> = new Map();
@@ -142,7 +141,6 @@ export class Room extends DurableObject {
     this.virtualHostMax = parsed.hostMax;
     this.virtualCidr = parsed.cidr;
 
-    // ★ /30 从 offset 1 开始；其他从 2 开始（跳过网关）
     this.ipCounter = this.minIpOffset();
 
     console.log(
@@ -152,12 +150,9 @@ export class Room extends DurableObject {
     );
   }
 
-  // ★ /30 只有 2 个可用主机，从 offset 1 开始；其他网段跳过 offset 1（网关）
   private minIpOffset(): number {
     return this.virtualPrefix >= 30 ? 1 : 2;
   }
-
-  // ============ 网络地址工具 ============
 
   private extractIp(endpoint: string): string {
     if (!endpoint) return "";
@@ -195,8 +190,6 @@ export class Room extends DurableObject {
     const mask = ((0xFFFFFFFF << (32 - this.virtualPrefix)) >>> 0);
     return ((ipInt & mask) >>> 0) === this.virtualBase;
   }
-
-  // ============ server-ping + stale 检测 ============
 
   private startServerPing(): void {
     if (this.serverPingTimer !== null) return;
@@ -275,8 +268,6 @@ export class Room extends DurableObject {
     }
   }
 
-  // ============ 从 Storage 恢复 ============
-
   private async ensureLoaded(): Promise<void> {
     if (this.loadedFromStorage) return;
     this.loadedFromStorage = true;
@@ -352,8 +343,6 @@ export class Room extends DurableObject {
     }
   }
 
-  // ============ 状态持久化 ============
-
   private async saveStateNow(): Promise<void> {
     try {
       const peersData: Record<string, any> = {};
@@ -397,8 +386,6 @@ export class Room extends DurableObject {
       this.saveStateNow().catch(() => {});
     }, delay);
   }
-
-  // ============ HTTP 路由 ============
 
   async fetch(request: Request): Promise<Response> {
     await this.ensureLoaded();
@@ -693,6 +680,7 @@ export class Room extends DurableObject {
           );
 
           if (needBroadcast) {
+            // ★ P0-2 预连接：joined 广播带 initialProbe
             this.broadcast(from, {
               type: "joined", from,
               payload: {
@@ -704,6 +692,11 @@ export class Room extends DurableObject {
                 turnRelayAddr: peer.turnRelayAddr || "",
                 assistedEndpoints: peer.assistedSockets || [],
                 lanEndpoints: peer.lanEndpoints || [],
+                initialProbe: {
+                  pubSocket: addr.ip && addr.port > 0 ? `${addr.ip}:${addr.port}` : "",
+                  lanEndpoints: peer.lanEndpoints || [],
+                  assistedEndpoints: peer.assistedSockets || [],
+                },
               },
             });
           }
@@ -774,23 +767,6 @@ export class Room extends DurableObject {
     }
   }
 
-  // ============================================================
-  // 二进制消息分发
-  //
-  // 帧类型：
-  //   1. N2NW 帧（magic "N2NW"）：WS 中继数据面
-  //      客户端 → 服务端：peerId = 目标 clientId
-  //      服务端 → 客户端：peerId = 发送方 clientId（服务端重写）
-  //   2. 裸 IPv4 包：按 dstIP 查 ipToClient 映射转发（兼容旧客户端）
-  //
-  // 修复点（vs 旧版）：
-  //   - N2NW 转发时重写帧头 peerId → 发送方 clientId
-  //     （旧版原样转发，接收方看到的"目标 ID"是自己，无法识别发送方）
-  //   - N2NW 分支补流量统计（relayBytesIn/Out, relayPacketsIn/Out）
-  //   - N2NW 分支补 lastSeen 刷新（避免长时间打洞失败被误判 stale）
-  //   - 自发自收过滤
-  //   - 大 peerId / 未知名异常可见性（console.error）
-  // ============================================================
   private async handleBinary(ws: WebSocket, message: ArrayBuffer | Blob): Promise<void> {
     let buffer: ArrayBuffer;
     if (message instanceof ArrayBuffer) buffer = message;
@@ -804,10 +780,7 @@ export class Room extends DurableObject {
     const fromPeer = this.peers.get(from);
     if (fromPeer) fromPeer.lastSeen = Date.now();
 
-    // ============================================================
     // 1. N2NW 帧
-    //    格式：magic("N2NW",4B) + flags(1B) + peerIdLen(1B) + peerId(N) + payload
-    // ============================================================
     if (
       data.length >= 6 &&
       data[0] === 0x4E && data[1] === 0x32 &&
@@ -822,10 +795,7 @@ export class Room extends DurableObject {
       if (!targetClientId || targetClientId === from) return;
 
       const targetWs = this.sessions.get(targetClientId);
-      if (!targetWs) {
-        // 目标不在线：静默丢弃（客户端有超时机制负责降级）
-        return;
-      }
+      if (!targetWs) return;
 
       const fromBytes = new TextEncoder().encode(from);
       if (fromBytes.length > 255) {
@@ -833,14 +803,13 @@ export class Room extends DurableObject {
         return;
       }
 
-      // ★ 重写帧头 peerId：目标 → 发送方
       const payload = data.subarray(6 + peerLen);
       const newFrame = new Uint8Array(6 + fromBytes.length + payload.length);
       newFrame[0] = 0x4E;
       newFrame[1] = 0x32;
       newFrame[2] = 0x4E;
       newFrame[3] = 0x57;
-      newFrame[4] = data[4];                       // 保留原 flags
+      newFrame[4] = data[4];
       newFrame[5] = fromBytes.length;
       newFrame.set(fromBytes, 6);
       newFrame.set(payload, 6 + fromBytes.length);
@@ -863,9 +832,7 @@ export class Room extends DurableObject {
       return;
     }
 
-    // ============================================================
-    // 2. 裸 IPv4 包：按 dstIP 查 ipToClient 映射转发
-    // ============================================================
+    // 2. 裸 IPv4 包
     if (data.length < 20) return;
     if (data[0] >> 4 !== 4) return;
 
@@ -932,8 +899,6 @@ export class Room extends DurableObject {
     await this.webSocketClose(ws);
   }
 
-  // ============ 打洞协调 ============
-
   private async runCoordination(): Promise<void> {
     const onlinePeers = Array.from(this.peers.values()).filter((p) => p.online);
     if (onlinePeers.length < 2) return;
@@ -961,9 +926,16 @@ export class Room extends DurableObject {
 
     if (instructions.size === 0) return;
 
+    // ============================================================
+    // ★ P0-1 打洞并行化：instructions 的 key 可能是 "mac@r" 形式
+    //   split("@")[0] 取出真实 clientId
+    // ============================================================
     const receivers: Array<[string, any]> = [];
     const senders: Array<[string, any]> = [];
-    for (const [mac, instr] of instructions) {
+
+    for (const [key, instr] of instructions) {
+      // ★ 去掉 @r 后缀（兼容旧的无后缀 key）
+      const mac = key.includes("@") ? key.split("@")[0] : key;
       if (instr.role === 0) senders.push([mac, instr]);
       else receivers.push([mac, instr]);
     }
@@ -977,7 +949,11 @@ export class Room extends DurableObject {
           from: "server",
           payload: instr,
         }));
-        console.log(`[Room] → ${mac} 下发 nat_hole_instruction role=${instr.role} target=${instr.targetPubSocket} lan=${(instr.targetLanEndpoints || []).length}`);
+        console.log(
+          `[Room] → ${mac} 下发 nat_hole_instruction role=${instr.role} ` +
+          `rung=${instr.behaviorIndex} target=${instr.targetPubSocket} ` +
+          `lan=${(instr.targetLanEndpoints || []).length}`
+        );
       } catch (e) {
         console.error(`[Room] 发送给 ${mac} 失败:`, e);
       }
@@ -1007,7 +983,9 @@ export class Room extends DurableObject {
             try {
               await new Promise((r) => setTimeout(r, delayCopy));
               for (const [mac, instr] of sendersCopy) sendOne(mac, instr);
-              console.log(`[Room] sender 指令延迟 ${delayCopy}ms 后下发（${sendersCopy.length} 个）`);
+              console.log(
+                `[Room] sender 指令延迟 ${delayCopy}ms 后下发（${sendersCopy.length} 个）`
+              );
             } catch (e) {
               console.error(`[Room] sender 延迟下发失败:`, e);
             }
@@ -1016,8 +994,6 @@ export class Room extends DurableObject {
       }
     }
   }
-
-  // ============ 状态查询 ============
 
   private getStatusResponse(publicOnly = false): Response {
     const now = Date.now();
