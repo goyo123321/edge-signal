@@ -172,6 +172,26 @@ function renderRooms() {
   });
 }
 
+// ★ 新增：渲染 features chips
+//
+// 颜色约定：
+//   n2na  → 绿色（新能力：app_stream 二进制）
+//   n2nw  → 蓝色（已有能力：IPv4 数据面二进制）
+//   其他  → 灰色
+function renderFeatureChips(features) {
+  const list = Array.isArray(features) ? features : [];
+  if (list.length === 0) {
+    return `<div class="feature-empty" title="旧客户端或未上报 features">无能力上报</div>`;
+  }
+  const chips = list.map((f) => {
+    let cls = "feature-chip";
+    if (f === "n2na") cls += " feature-binary";
+    else if (f === "n2nw") cls += " feature-ipv4";
+    return `<span class="${cls}" title="${esc(f)}">${esc(f)}</span>`;
+  }).join("");
+  return `<div class="feature-chips">${chips}</div>`;
+}
+
 async function refreshDetail() {
   if (!state.selectedRoom) return;
   const sec = document.getElementById("detailSection");
@@ -213,12 +233,19 @@ async function refreshDetail() {
       const actionCell = p.online
         ? `<button class="small danger" data-action="kick" data-cid="${esc(p.clientId)}">踢出</button>`
         : `<span style="color:#64748b;font-size:11px">--</span>`;
+
+      // ★ NAT 列里嵌入 features chips
+      const natAndFeaturesCell = `
+        <div>${natBadge(p.natType)}</div>
+        ${renderFeatureChips(p.features)}
+      `;
+
       return `
         <tr style="${p.online ? "" : "opacity:0.6"}">
           <td>${codeNameCell}</td>
           <td class="mono" style="font-size:11px;color:#94a3b8">${esc(p.clientId)}</td>
           <td>${ipCell}</td>
-          <td>${natBadge(p.natType)}</td>
+          <td>${natAndFeaturesCell}</td>
           <td>${statusBadge}</td>
           <td>${connStr}</td>
           <td>${turnCell}</td>
@@ -237,7 +264,7 @@ async function refreshDetail() {
             <th>代号/设备名</th>
             <th>Client ID</th>
             <th>HTTP / UDP / 虚拟IP</th>
-            <th>NAT 类型</th>
+            <th>NAT / 能力</th>
             <th>状态</th>
             <th>连接状态</th>
             <th>TURN 中继</th>
@@ -337,7 +364,6 @@ async function refreshAll() {
   document.getElementById("status").textContent = `更新于 ${new Date().toLocaleTimeString()}`;
   if (state.selectedRoom) await refreshDetail();
 
-  // ★ 隐患 4 修复：每次刷新都更新 TURN 徽章，服务端 TURN 配置变更能及时反映。
   loadTURNInfo().catch(() => {});
 }
 
