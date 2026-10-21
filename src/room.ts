@@ -31,6 +31,7 @@ interface PeerRecord {
   relayPacketsOut: number;
   _publicIp?: string;
   multiExit?: boolean;
+  features: string[];   // ★ 新增：["n2na", "n2nw", ...]
 }
 
 const STAGGER_FALLBACK_SAVE_MS = 300 * 1000;
@@ -43,6 +44,10 @@ const SERVER_PING_INTERVAL_MS = 30 * 1000;
 const PEER_STALE_MS = 90 * 1000;
 
 const DEFAULT_VIRTUAL_NETWORK = "10.64.0.0/24";
+
+const MAX_FEATURES = 16;
+const MAX_FEATURE_LEN = 32;
+const MAX_PEER_ID_LEN = 255;
 
 interface ParsedCIDR {
   base: number;
@@ -101,6 +106,35 @@ function onlineCount(peers: Map<string, PeerRecord>): number {
 function lanListKey(lan: string[] | undefined): string {
   if (!lan || lan.length === 0) return "";
   return [...lan].sort().join(",");
+}
+
+// ★ 新增：Uint8Array → base64（分块避免 String.fromCharCode 栈溢出）
+function uint8ArrayToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunk = 8192;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+// ★ 新增：过滤客户端上报的 features
+function sanitizeFeatures(raw: any): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const f of raw) {
+    if (typeof f === "string" && f.length > 0 && f.length <= MAX_FEATURE_LEN) {
+      out.push(f);
+    }
+    if (out.length >= MAX_FEATURES) break;
+  }
+  return out;
+}
+
+// ★ 新增：判断 target 是否支持某 feature
+function peerHasFeature(p: PeerRecord | undefined, feature: string): boolean {
+  if (!p || !Array.isArray(p.features)) return false;
+  return p.features.includes(feature);
 }
 
 export class Room extends DurableObject {
@@ -314,6 +348,7 @@ export class Room extends DurableObject {
             relayPacketsOut: p.relayPacketsOut || 0,
             _publicIp: p._publicIp || "",
             multiExit: !!p.multiExit,
+            features: sanitizeFeatures(p.features),   // ★ 新增：恢复 features
           });
 
           if (p.virtualIp && p.online && this.isInVirtualNetwork(p.virtualIp)) {
@@ -361,6 +396,7 @@ export class Room extends DurableObject {
           relayBytesOut: p.relayBytesOut, relayPacketsIn: p.relayPacketsIn,
           relayPacketsOut: p.relayPacketsOut, _publicIp: p._publicIp,
           multiExit: p.multiExit,
+          features: p.features || [],   // ★ 新增：持久化 features
         };
       }
       await this.ctx.storage.put(PEERS_STORAGE_KEY, peersData);
@@ -506,6 +542,7 @@ export class Room extends DurableObject {
           turnRelayAddr: p.turnRelayAddr || "",
           assistedEndpoints: p.assistedSockets || [],
           lanEndpoints: p.lanEndpoints || [],
+          features: p.features || [],   // ★ 新增：下发对端 features
         };
       });
 
@@ -517,6 +554,7 @@ export class Room extends DurableObject {
       peer.lastSeen = now;
       peer.disconnectedAt = undefined;
       peer._publicIp = publicIp;
+      // features 保留旧值：客户端连接后会重新上报 p2p_metadata 覆盖
 
       if (peer.virtualIp && !this.isInVirtualNetwork(peer.virtualIp)) {
         const oldVip = peer.virtualIp;
@@ -557,6 +595,7 @@ export class Room extends DurableObject {
         turnRelayAddr: "", relayBytesIn: 0, relayBytesOut: 0, relayPacketsIn: 0, relayPacketsOut: 0,
         _publicIp: publicIp,
         multiExit: false,
+        features: [],   // ★ 新增：新 peer 初始空数组
       };
       this.peers.set(clientId, peer);
     }
@@ -624,6 +663,11 @@ export class Room extends DurableObject {
           peer.regularPortsChange = !!p.regularPortsChange;
           peer.behavior = p.behavior || peer.behavior;
 
+          // ★ 新增：处理 features
+          if (Array.isArray(p.features)) {
+            peer.features = sanitizeFeatures(p.features);
+          }
+
           if (Array.isArray(p.assistedEndpoints)) {
             peer.assistedSockets = p.assistedEndpoints.filter(
               (s: any) => typeof s === "string" && s
@@ -675,12 +719,12 @@ export class Room extends DurableObject {
           console.log(
             `[Room] p2p_metadata from ${from}: natType=${peer.natType} ` +
             `pub=${addr.ip}:${addr.port} (pubSocket=${peer.pubSocket || "<empty>"}) ` +
-            `lan=${(peer.lanEndpoints || []).length} multiExit=${peer.multiExit || false} assisted=${peer.assistedSockets.length} ` +
+            `lan=${(peer.lanEndpoints || []).length} multiExit=${peer.multiExit || false} ` +
+            `assisted=${peer.assistedSockets.length} features=${JSON.stringify(peer.features)} ` +
             `broadcast=${needBroadcast ? "yes" : "no"}`
           );
 
           if (needBroadcast) {
-            // ★ P0-2 预连接：joined 广播带 initialProbe
             this.broadcast(from, {
               type: "joined", from,
               payload: {
@@ -692,6 +736,7 @@ export class Room extends DurableObject {
                 turnRelayAddr: peer.turnRelayAddr || "",
                 assistedEndpoints: peer.assistedSockets || [],
                 lanEndpoints: peer.lanEndpoints || [],
+                features: peer.features || [],   // ★ 新增：下发 features
                 initialProbe: {
                   pubSocket: addr.ip && addr.port > 0 ? `${addr.ip}:${addr.port}` : "",
                   lanEndpoints: peer.lanEndpoints || [],
@@ -780,7 +825,7 @@ export class Room extends DurableObject {
     const fromPeer = this.peers.get(from);
     if (fromPeer) fromPeer.lastSeen = Date.now();
 
-    // 1. N2NW 帧
+    // 1. N2NW 帧（IPv4 数据面）
     if (
       data.length >= 6 &&
       data[0] === 0x4E && data[1] === 0x32 &&
@@ -798,7 +843,7 @@ export class Room extends DurableObject {
       if (!targetWs) return;
 
       const fromBytes = new TextEncoder().encode(from);
-      if (fromBytes.length > 255) {
+      if (fromBytes.length > MAX_PEER_ID_LEN) {
         console.warn(`[Room] N2NW 发送方 ID 过长 (${fromBytes.length}B)，丢弃`);
         return;
       }
@@ -832,7 +877,17 @@ export class Room extends DurableObject {
       return;
     }
 
-    // 2. 裸 IPv4 包
+    // 2. N2NA 帧（★ 新增：app_stream 二进制数据面）
+    if (
+      data.length >= 7 &&
+      data[0] === 0x4E && data[1] === 0x32 &&
+      data[2] === 0x4E && data[3] === 0x41
+    ) {
+      this.forwardN2NA(from, fromPeer, data);
+      return;
+    }
+
+    // 3. 裸 IPv4 包
     if (data.length < 20) return;
     if (data[0] >> 4 !== 4) return;
 
@@ -858,6 +913,96 @@ export class Room extends DurableObject {
       }
     } catch (e) {
       console.error(`[Room] IPv4 转发失败 ${from}->${targetClientId}:`, e);
+    }
+  }
+
+  // ★ 新增：N2NA 转发（含 features 协商 + 文本降级）
+  //
+  // 帧格式（客户端 → 服务端）：
+  //   magic(4)="N2NA" | flags(1) | peerLen(1) | peerId(N) | streamIdLen(1) | streamId(M) | rawTCPData
+  //
+  // 服务端行为：
+  //   - 目标 features 含 "n2na"  → 二进制转发（重写 peerId 为 senderId）
+  //   - 目标不含 "n2na"          → 解码转 app_stream_data 文本（旧客户端兼容）
+  private forwardN2NA(
+    from: string,
+    fromPeer: PeerRecord | undefined,
+    data: Uint8Array
+  ): void {
+    try {
+      if (data.length < 7) return;
+      const peerLen = data[5];
+      if (peerLen === 0) return;
+      if (data.length < 6 + peerLen + 1) return;
+
+      const targetClientId = new TextDecoder().decode(
+        data.subarray(6, 6 + peerLen)
+      );
+      if (!targetClientId || targetClientId === from) return;
+
+      const targetWs = this.sessions.get(targetClientId);
+      const targetPeer = this.peers.get(targetClientId);
+      if (!targetWs) return;
+
+      const streamIdLen = data[6 + peerLen];
+      if (streamIdLen === 0) return;
+      if (data.length < 7 + peerLen + streamIdLen) return;
+
+      const streamIdBytes = data.subarray(
+        7 + peerLen,
+        7 + peerLen + streamIdLen
+      );
+      const payload = data.subarray(7 + peerLen + streamIdLen);
+
+      const fromBytes = new TextEncoder().encode(from);
+      if (fromBytes.length === 0 || fromBytes.length > MAX_PEER_ID_LEN) {
+        console.warn(`[Room] N2NA 发送方 ID 长度非法 (${fromBytes.length}B)`);
+        return;
+      }
+
+      // ★ features 协商
+      const targetSupportsBinary = peerHasFeature(targetPeer, "n2na");
+
+      if (targetSupportsBinary) {
+        // 二进制转发：重写 peerId 为 senderId
+        const newFrame = new Uint8Array(
+          7 + fromBytes.length + streamIdLen + payload.length
+        );
+        newFrame[0] = 0x4E;   // 'N'
+        newFrame[1] = 0x32;   // '2'
+        newFrame[2] = 0x4E;   // 'N'
+        newFrame[3] = 0x41;   // 'A'
+        newFrame[4] = data[4]; // flags
+        newFrame[5] = fromBytes.length;
+        newFrame.set(fromBytes, 6);
+        newFrame[6 + fromBytes.length] = streamIdLen;
+        newFrame.set(streamIdBytes, 7 + fromBytes.length);
+        newFrame.set(payload, 7 + fromBytes.length + streamIdLen);
+        targetWs.send(newFrame.buffer);
+      } else {
+        // ★ 文本降级：解码 streamId + base64 payload，转成 app_stream_data
+        const streamId = new TextDecoder().decode(streamIdBytes);
+        const dataB64 = uint8ArrayToBase64(payload);
+        targetWs.send(JSON.stringify({
+          type: "app_stream_data",
+          from,
+          streamId,
+          data: dataB64,
+        }));
+      }
+
+      // 流量统计
+      if (fromPeer) {
+        fromPeer.relayBytesOut += data.length;
+        fromPeer.relayPacketsOut += 1;
+      }
+      if (targetPeer) {
+        targetPeer.lastSeen = Date.now();
+        targetPeer.relayBytesIn += data.length;
+        targetPeer.relayPacketsIn += 1;
+      }
+    } catch (e) {
+      console.error(`[Room] N2NA 转发失败 ${from}:`, e);
     }
   }
 
@@ -926,15 +1071,10 @@ export class Room extends DurableObject {
 
     if (instructions.size === 0) return;
 
-    // ============================================================
-    // ★ P0-1 打洞并行化：instructions 的 key 可能是 "mac@r" 形式
-    //   split("@")[0] 取出真实 clientId
-    // ============================================================
     const receivers: Array<[string, any]> = [];
     const senders: Array<[string, any]> = [];
 
     for (const [key, instr] of instructions) {
-      // ★ 去掉 @r 后缀（兼容旧的无后缀 key）
       const mac = key.includes("@") ? key.split("@")[0] : key;
       if (instr.role === 0) senders.push([mac, instr]);
       else receivers.push([mac, instr]);
@@ -1047,6 +1187,7 @@ export class Room extends DurableObject {
         multiExit: !!p.multiExit,
         assistedSockets: p.assistedSockets || [],
         lanEndpoints: p.lanEndpoints || [],
+        features: p.features || [],   // ★ 新增：管理面板展示 features
         online: p.online, connectedAt: p.connectedAt, lastSeen: p.lastSeen, disconnectedAt: p.disconnectedAt,
         onlineFor: now - p.connectedAt,
         offlineFor: p.online ? 0 : (p.disconnectedAt ? now - p.disconnectedAt : 0),
