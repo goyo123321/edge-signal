@@ -55,6 +55,13 @@ tbody tr:hover { background: #263449; }
 .badge.online { background: #065f46; color: #6ee7b7; }
 .badge.turn { background: #1e40af; color: #93c5fd; }
 
+/* ★ LAN 直连徽章 */
+.badge.lan {
+  background: #065f46;
+  color: #34d399;
+  border: 1px solid #10b981;
+}
+
 /* 打洞握手成功但数据面未验证（实际走中继） */
 .badge.p2p-avail {
   background: #78350f;
@@ -70,7 +77,6 @@ tbody tr:hover { background: #263449; }
 a { color: #60a5fa; text-decoration: none; }
 a:hover { text-decoration: underline; }
 
-/* 管理面板入口按钮 */
 .admin-btn {
   background: #475569;
   color: white;
@@ -92,7 +98,6 @@ a:hover { text-decoration: underline; }
   color: white;
 }
 
-/* ★ 能力 chips（管理面板 NAT 列下方） */
 .feature-chips {
   display: flex;
   flex-wrap: wrap;
