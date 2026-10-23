@@ -376,4 +376,175 @@ export default {
       if (!roomId) return jsonResp({ error: "Missing roomId" }, 400);
       const id = env.ROOM.idFromName(roomId);
       return env.ROOM.get(id).fetch(
-        new
+        new Request(`http://internal/_status?public=1&community=${encodeURIComponent(roomId)}`)
+      );
+    }
+
+    const isAdminRoute =
+      pathname.startsWith("/api/admin/") ||
+      pathname === "/api/rooms" ||
+      pathname.startsWith("/api/status/") ||
+      pathname.startsWith("/api/nathole/");
+
+    if (isAdminRoute) {
+      if (!checkAdmin(request, env)) {
+        return jsonResp({ error: "Unauthorized" }, 401);
+      }
+
+      if (pathname === "/api/admin/rooms" || pathname === "/api/rooms") {
+        const reg = env.REGISTRY.get(env.REGISTRY.idFromName("global"));
+        return reg.fetch(new Request("http://internal/rooms"));
+      }
+
+      const statusMatch = pathname.match(/^\/api\/(admin\/)?status\/(.+)$/);
+      if (statusMatch) {
+        const roomId = decodeURIComponent(statusMatch[2]);
+        const id = env.ROOM.idFromName(roomId);
+        return env.ROOM.get(id).fetch(
+          new Request(`http://internal/_status?community=${encodeURIComponent(roomId)}`)
+        );
+      }
+
+      const natholeMatch = pathname.match(/^\/api\/(admin\/)?nathole\/(.+)$/);
+      if (natholeMatch) {
+        const roomId = decodeURIComponent(natholeMatch[2]);
+        const id = env.ROOM.idFromName(roomId);
+        return env.ROOM.get(id).fetch(
+          new Request(`http://internal/_nathole?community=${encodeURIComponent(roomId)}`)
+        );
+      }
+
+      if (pathname === "/api/admin/clear" && request.method === "POST") {
+        const room = url.searchParams.get("room");
+        const force = url.searchParams.get("force") === "1";
+        if (!room) return jsonResp({ error: "Missing room" }, 400);
+
+        let clearResp: Response;
+        try {
+          const id = env.ROOM.idFromName(room);
+          const clearUrl = force ? "http://internal/_clear?force=1" : "http://internal/_clear";
+          clearResp = await env.ROOM.get(id).fetch(new Request(clearUrl));
+        } catch (e) {
+          console.error(`[admin] clear room DO ${room} failed:`, e);
+          return jsonResp({ error: "Failed to clear room" }, 500);
+        }
+
+        if (clearResp.status === 409) {
+          const body: any = await clearResp.json().catch(() => ({}));
+          return jsonResp({
+            error: "Room has online peers",
+            room,
+            onlineCount: body.onlineCount || 0,
+            onlinePeers: body.onlinePeers || [],
+          }, 409);
+        }
+
+        if (!clearResp.ok) return jsonResp({ error: "Clear failed" }, 500);
+
+        try {
+          const reg = env.REGISTRY.get(env.REGISTRY.idFromName("global"));
+          await reg.fetch(new Request(
+            `http://internal/_clear-one?room=${encodeURIComponent(room)}`,
+            { method: "POST" }
+          ));
+        } catch (e) {
+          console.error(`[admin] clear registry ${room} failed:`, e);
+        }
+
+        return jsonResp({ ok: true, room });
+      }
+
+      if (pathname === "/api/admin/kick" && request.method === "POST") {
+        const room = url.searchParams.get("room");
+        const cid = url.searchParams.get("cid");
+        if (!room || !cid) return jsonResp({ error: "Missing room or cid" }, 400);
+
+        const id = env.ROOM.idFromName(room);
+        return env.ROOM.get(id).fetch(
+          new Request(`http://internal/_kick?cid=${encodeURIComponent(cid)}`, { method: "POST" })
+        );
+      }
+
+      if (pathname === "/api/admin/clear-all" && request.method === "POST") {
+        const force = url.searchParams.get("force") === "1";
+
+        let rooms: any[] = [];
+        try {
+          const reg = env.REGISTRY.get(env.REGISTRY.idFromName("global"));
+          const resp = await reg.fetch(new Request("http://internal/rooms"));
+          rooms = await resp.json();
+        } catch (e) {
+          console.error("[admin] list rooms failed:", e);
+        }
+
+        const cleared: string[] = [];
+        const skipped: any[] = [];
+        const failed: string[] = [];
+
+        for (const r of rooms) {
+          try {
+            const id = env.ROOM.idFromName(r.name);
+            const clearUrl = force ? "http://internal/_clear?force=1" : "http://internal/_clear";
+            const resp = await env.ROOM.get(id).fetch(new Request(clearUrl));
+
+            if (resp.ok) {
+              cleared.push(r.name);
+            } else if (resp.status === 409) {
+              const body: any = await resp.json().catch(() => ({}));
+              skipped.push({
+                room: r.name,
+                reason: "has online peers",
+                onlineCount: body.onlineCount || 0,
+              });
+            } else {
+              failed.push(r.name);
+            }
+          } catch (e) {
+            console.error(`[admin] clear room ${r.name} failed:`, e);
+            failed.push(r.name);
+          }
+        }
+
+        for (const name of cleared) {
+          try {
+            const reg = env.REGISTRY.get(env.REGISTRY.idFromName("global"));
+            await reg.fetch(new Request(
+              `http://internal/_clear-one?room=${encodeURIComponent(name)}`,
+              { method: "POST" }
+            ));
+          } catch (e) {
+            console.error(`[admin] clear registry ${name} failed:`, e);
+          }
+        }
+
+        return jsonResp({
+          ok: true,
+          cleared,
+          skipped,
+          failed,
+          count: cleared.length,
+          skippedCount: skipped.length,
+          failedCount: failed.length,
+        });
+      }
+
+      return new Response("Not found", { status: 404 });
+    }
+
+    if (pathname.startsWith("/ws/")) {
+      if (env.CONNECT_TOKEN && env.CONNECT_TOKEN.trim() !== "") {
+        const provided = url.searchParams.get("token") || "";
+        if (!safeEqual(provided, env.CONNECT_TOKEN)) {
+          return new Response("Invalid token", { status: 403 });
+        }
+      }
+
+      const roomId = pathname.split("/")[2];
+      if (!roomId) return jsonResp({ error: "Missing roomId" }, 400);
+      const id = env.ROOM.idFromName(roomId);
+      return env.ROOM.get(id).fetch(request);
+    }
+
+    return env.ASSETS.fetch(request);
+  },
+};
