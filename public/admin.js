@@ -172,12 +172,6 @@ function renderRooms() {
   });
 }
 
-// ★ 新增：渲染 features chips
-//
-// 颜色约定：
-//   n2na  → 绿色（新能力：app_stream 二进制）
-//   n2nw  → 蓝色（已有能力：IPv4 数据面二进制）
-//   其他  → 灰色
 function renderFeatureChips(features) {
   const list = Array.isArray(features) ? features : [];
   if (list.length === 0) {
@@ -234,7 +228,6 @@ async function refreshDetail() {
         ? `<button class="small danger" data-action="kick" data-cid="${esc(p.clientId)}">踢出</button>`
         : `<span style="color:#64748b;font-size:11px">--</span>`;
 
-      // ★ NAT 列里嵌入 features chips
       const natAndFeaturesCell = `
         <div>${natBadge(p.natType)}</div>
         ${renderFeatureChips(p.features)}
@@ -283,19 +276,22 @@ async function refreshDetail() {
   }
 }
 
+// ★ 加 lanList
 function formatConnStatus(connections) {
   if (!connections || Object.keys(connections).length === 0) {
     return `<span style="color:#64748b">--</span>`;
   }
-  const p2pList = [], turnList = [], relayList = [], availList = [];
+  const p2pList = [], turnList = [], relayList = [], availList = [], lanList = [];
   for (const [code, type] of Object.entries(connections)) {
-    if (type === "p2p") p2pList.push(code);
+    if (type === "lan") lanList.push(code);
+    else if (type === "p2p") p2pList.push(code);
     else if (type === "p2p-avail") availList.push(code);
     else if (type === "turn") turnList.push(code);
     else if (type === "relay") relayList.push(code);
   }
-  p2pList.sort(); availList.sort(); turnList.sort(); relayList.sort();
+  p2pList.sort(); availList.sort(); turnList.sort(); relayList.sort(); lanList.sort();
   const parts = [];
+  if (lanList.length > 0) parts.push(`<span class="badge lan" title="LAN 直连（同 WiFi）">lan-${lanList.join("")}</span>`);
   if (p2pList.length > 0) parts.push(`<span class="badge p2p">p2p-${p2pList.join("")}</span>`);
   if (availList.length > 0) parts.push(`<span class="badge p2p-avail" title="打洞握手成功，数据面未验证，实际走中继">p2p-avail-${availList.join("")}</span>`);
   if (turnList.length > 0) parts.push(`<span class="badge turn">TURN-${turnList.join("")}</span>`);
