@@ -13,7 +13,7 @@ const FAIL_BACKOFF_BASE_MS = 15000;
 const FAIL_BACKOFF_CAP_MS = 60000;
 const INFLIGHT_TIMEOUT_MS = 10000;
 const SUCCESS_GRACE_MS = 30000;
-// ★ 新增：成功记录超过 2 分钟强制退役，即使 connection_status 没更新
+// ★ 成功记录超过 2 分钟强制退役，即使 connection_status 没更新
 const SUCCESS_HARD_TIMEOUT_MS = 120000;
 
 const CONN_P2P = "p2p";
@@ -75,21 +75,26 @@ function isIPv6Sock(sock) {
 }
 
 // ============================================================
-// ★ 修复：shouldRetireSuccess 加 2 分钟强制退役
+// shouldRetireSuccess 成功记录退役判定
 // ============================================================
 //
-// 问题：客户端 ForceFallback 后如果 connection_status 没及时上报，
-//   服务端看到的 aToB/bToA 还是旧的（lan/p2p），永远不退役
-//   → 不重新协调打洞 → 卡在 TURN/WS 且对端 TURN relay 失效
+// 关键修复：单向 P2P 也退役
 //
-// 修复：成功记录超过 SUCCESS_HARD_TIMEOUT_MS（2 分钟）强制退役，
-//   即使 connection_status 显示还是 p2p/lan。
+// 场景：A 降级到 Unknown（清空连接），B 仍是 p2p。
+//   aToB = undefined (A 没有 B)
+//   bToA = "p2p" (B 认为 A 是 p2p)
+//
+//   旧逻辑：要求双方都不在 p2p/lan 才退役 → 单向 p2p 永远不退役
+//     → punchState 保留旧的"成功"状态 → anySucceeded=true
+//     → 跳过所有打洞指令 → 服务端不下发 nat_hole_instruction
+//
+//   新逻辑：单向 p2p 也退役 → 清空 punchState → 重新协调
 function shouldRetireSuccess(prev, a, b, now) {
   if (!prev) return false;
   if (prev.aState !== 3 && prev.bState !== 3) return false;
   if (now - (prev.at || 0) < SUCCESS_GRACE_MS) return false;
 
-  // ★ 新增：成功记录超过 2 分钟强制退役
+  // 2 分钟强制退役（兜底，防止 connection_status 丢失导致永远不退役）
   if (now - (prev.at || 0) > SUCCESS_HARD_TIMEOUT_MS) {
     console.log(
       `[NAT] 成功记录超时 ${Math.round((now - (prev.at || 0)) / 1000)}s，强制退役`
@@ -107,9 +112,24 @@ function shouldRetireSuccess(prev, a, b, now) {
     ? bConns.get(keyOf(a))
     : undefined;
 
-  // LAN 也算「已建立」，不退役
-  return aToB !== CONN_P2P && aToB !== CONN_LAN
-      && bToA !== CONN_P2P && bToA !== CONN_LAN;
+  const aInP2P = aToB === CONN_P2P || aToB === CONN_LAN;
+  const bInP2P = bToA === CONN_P2P || bToA === CONN_LAN;
+
+  // 双向都不在 p2p/lan → 完全断开，退役
+  if (!aInP2P && !bInP2P) {
+    return true;
+  }
+
+  // ★ 修复：单向 p2p/lan → 也退役，重新协调打洞
+  if (aInP2P !== bInP2P) {
+    console.log(
+      `[NAT] 单向 p2p 检测: aToB=${aToB || "?"} bToA=${bToA || "?"} → 退役重新协调`
+    );
+    return true;
+  }
+
+  // 双方都是 p2p/lan → 正常，不退役
+  return false;
 }
 
 function shouldHoldForInFlight(flight, candidate, now, timeoutMs = INFLIGHT_TIMEOUT_MS) {
@@ -287,7 +307,6 @@ export class NatHoleCoordinator {
   }
 
   coordinate(community) {
-    // 定期清理过期的 analyzer 记录
     this.analyzer.clean();
 
     const instructions = new Map();
@@ -297,7 +316,7 @@ export class NatHoleCoordinator {
 
     const now = Date.now();
 
-    // ★ 修复：pairedPairs（pair 维度）
+    // pairedPairs（pair 维度）
     const pairedPairs = new Set();
     let earliestWake = null;
     const noteWake = (t) => {
@@ -318,7 +337,6 @@ export class NatHoleCoordinator {
         const key = pairKeyFor(aKey, bKey);
         if (pairedPairs.has(key)) continue;
 
-        // 任一端成功即视为已建立
         const prevPunch = this.punchState.get(key);
         const anySucceeded = prevPunch &&
           (prevPunch.aState === 3 || prevPunch.bState === 3);
@@ -329,7 +347,7 @@ export class NatHoleCoordinator {
             this.backoff.delete(key);
             this.inFlight.delete(key);
             console.log(
-              `[NAT] ${key} 成功记录已过期（双方都不在 P2P/LAN），重新协调`
+              `[NAT] ${key} 成功记录已退役，重新协调`
             );
           } else {
             pairedPairs.add(key);
@@ -356,7 +374,7 @@ export class NatHoleCoordinator {
           continue;
         }
 
-        // ★ 新增：如果已是 LAN，跳过同 STUN IP 强制降级
+        // 已是 LAN，跳过同 STUN IP 强制降级
         const aConns = a.connections;
         const bConns = b.connections;
         const aToB = aConns && typeof aConns.get === "function"
@@ -404,7 +422,6 @@ export class NatHoleCoordinator {
             console.log(
               `[NAT] ${key} 同 STUN 出口 IP (${aIp})，允许一次 hairpin 尝试`
             );
-            // fall through 到正常打洞流程
           }
         }
 
@@ -462,7 +479,7 @@ export class NatHoleCoordinator {
           this.backoff.delete(key);
         }
 
-        // 首轮错峰：给最新注册的 peer 留 NAT 映射建立时间
+        // 首轮错峰
         const fc = this.failCounts.get(key) || 0;
         if (fc === 0) {
           const regA = a.registeredAt || a.connectedAt || 0;
@@ -496,7 +513,6 @@ export class NatHoleCoordinator {
         const senderBeh = behavior.sender || {};
         const receiverBeh = behavior.receiver || {};
 
-        // 端口扫描范围 = max(NAT 行为差异, 两端端口差) + 缓冲
         const natDiff = Math.abs(
           (senderFeature.portsDifference || 0) - (receiverFeature.portsDifference || 0)
         );
@@ -580,7 +596,6 @@ export class NatHoleCoordinator {
           at: now,
         });
 
-        // 首次打洞（fc === 0）：一次派发 3 个 rung
         const isFirstAttempt = fc === 0;
         const rungsToDispatch = isFirstAttempt
           ? [
