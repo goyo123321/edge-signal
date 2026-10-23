@@ -27,6 +27,7 @@ function logout() {
   showPrompt();
 }
 
+// ★ 修复：显示「配置 source」和「实际 source」不一致时黄色提示
 async function loadTURNInfo() {
   const el = document.getElementById("turnInfo");
   if (!el) return;
@@ -41,12 +42,19 @@ async function loadTURNInfo() {
       return;
     }
 
+    const mismatch = info.actualSource &&
+      info.actualSource !== "none" &&
+      info.actualSource !== info.source;
+    const mismatchTag = mismatch
+      ? ` <span style="color:#fbbf24;font-size:11px" title="配置层面是 ${info.source}，但最近一次实际成功用的是 ${info.actualSource}">(实际: ${info.actualSource})</span>`
+      : "";
+
     if (info.source === "cloudflare") {
       el.className = "turn-info cloudflare";
       const extra = info.servers.length > 0
         ? ` <span class="label">+</span> ${esc(info.servers.map(s => s.url).join(", "))}`
         : "";
-      el.innerHTML = `<span class="label">TURN</span> Cloudflare (动态)${extra}`;
+      el.innerHTML = `<span class="label">TURN</span> Cloudflare (动态)${extra}${mismatchTag}`;
       el.title = "Cloudflare TURN：凭证动态生成，此处不显示地址\n" +
         (info.servers.length > 0 ? "自定义 TURN 作为 fallback：" + info.servers.map(s => s.url).join(", ") : "");
       return;
@@ -54,7 +62,7 @@ async function loadTURNInfo() {
 
     const urls = info.servers.map(s => s.url).join(", ");
     el.className = "turn-info custom";
-    el.innerHTML = `<span class="label">TURN</span> ${esc(urls)}`;
+    el.innerHTML = `<span class="label">TURN</span> ${esc(urls)}${mismatchTag}`;
     el.title = urls;
   } catch (e) {
     el.className = "turn-info disabled";
@@ -276,7 +284,6 @@ async function refreshDetail() {
   }
 }
 
-// ★ 加 lanList
 function formatConnStatus(connections) {
   if (!connections || Object.keys(connections).length === 0) {
     return `<span style="color:#64748b">--</span>`;
