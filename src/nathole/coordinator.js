@@ -15,10 +15,10 @@ const INFLIGHT_TIMEOUT_MS = 10000;
 const SUCCESS_GRACE_MS = 30000;
 
 const CONN_P2P = "p2p";
+const CONN_LAN = "lan";         // ★ 新增
 const P2P_AVAILABLE = 2;
 const P2P_FULLDUPLEX = 3;
 
-// 端口扫描范围的固定缓冲与上限。
 const PORTS_RANGE_NARROW = 100;
 const PORTS_RANGE_MAX = 10000;
 
@@ -72,6 +72,7 @@ function isIPv6Sock(sock) {
   return colonCount > 1;
 }
 
+// ★ LAN 也算「已建立」，不退役
 function shouldRetireSuccess(prev, a, b, now) {
   if (!prev) return false;
   if (prev.aState !== 3 && prev.bState !== 3) return false;
@@ -87,7 +88,8 @@ function shouldRetireSuccess(prev, a, b, now) {
     ? bConns.get(keyOf(a))
     : undefined;
 
-  return aToB !== CONN_P2P && bToA !== CONN_P2P;
+  return aToB !== CONN_P2P && aToB !== CONN_LAN
+      && bToA !== CONN_P2P && bToA !== CONN_LAN;
 }
 
 function shouldHoldForInFlight(flight, candidate, now, timeoutMs = INFLIGHT_TIMEOUT_MS) {
@@ -153,7 +155,6 @@ export class NatHoleCoordinator {
     let state = typeof result.state === "number" ? result.state : 0;
     if (state === 0) return;
 
-    // InProgress：刷新 in-flight 窗口
     if (state === 1) {
       const flight = this.inFlight.get(key);
       if (flight) {
@@ -191,7 +192,6 @@ export class NatHoleCoordinator {
       entry.bP2PStatus = selfP2PStatus;
     }
 
-    // 首次成功的交叉校验：接受 p2pStatus >= P2PAvailable(2)
     if (state === 3) {
       if (!entry.everValidated) {
         const otherP2PStatus = isA ? entry.bP2PStatus : entry.aP2PStatus;
@@ -265,7 +265,6 @@ export class NatHoleCoordinator {
   }
 
   coordinate(community) {
-    // 定期清理过期的 analyzer 记录
     this.analyzer.clean();
 
     const instructions = new Map();
@@ -274,13 +273,8 @@ export class NatHoleCoordinator {
     if (online.length < 2) return { instructions, forceFallbacks, wakeAt: null };
 
     const now = Date.now();
-    // ★ 修复：paired 改为 pairedPairs（pair 维度，不是 peer 维度）
-    //
-    // 旧版用 paired: Set<peerKey>，语义错误：
-    //   A-B 配对后，B 被标记为「已配对」，A-C 就永远不评估 → N≥3 房间 B-C 永远打不通。
-    //
-    // 新版用 pairedPairs: Set<pairKey>，每轮 coordinate 内每对只评估一次，
-    //   删除所有 break（不再「处理完一对就跳出」）。
+
+    // ★ 修复：pairedPairs（pair 维度）
     const pairedPairs = new Set();
     let earliestWake = null;
     const noteWake = (t) => {
@@ -291,17 +285,16 @@ export class NatHoleCoordinator {
     for (let i = 0; i < online.length; i++) {
       const a = online[i];
       const aKey = peerKey(a);
-      if (!aKey) continue;   // ★ 删除 paired.has(aKey) 短路
+      if (!aKey) continue;
 
       for (let j = i + 1; j < online.length; j++) {
         const b = online[j];
         const bKey = peerKey(b);
-        if (!bKey) continue;   // ★ 删除 paired.has(bKey) 短路
+        if (!bKey) continue;
 
         const key = pairKeyFor(aKey, bKey);
         if (pairedPairs.has(key)) continue;
 
-        // 任一端成功即视为已建立
         const prevPunch = this.punchState.get(key);
         const anySucceeded = prevPunch &&
           (prevPunch.aState === 3 || prevPunch.bState === 3);
@@ -312,7 +305,7 @@ export class NatHoleCoordinator {
             this.backoff.delete(key);
             this.inFlight.delete(key);
             console.log(
-              `[NAT] ${key} 成功记录已过期（双方都不在 P2P），重新协调`
+              `[NAT] ${key} 成功记录已过期（双方都不在 P2P/LAN），重新协调`
             );
           } else {
             pairedPairs.add(key);
@@ -336,6 +329,25 @@ export class NatHoleCoordinator {
 
         if (isIPv6Sock(a.pubSocket) || isIPv6Sock(b.pubSocket)) {
           pairedPairs.add(key);
+          continue;
+        }
+
+        // ★ 新增：如果已是 LAN，跳过同 STUN IP 强制降级
+        const aConns = a.connections;
+        const bConns = b.connections;
+        const aToB = aConns && typeof aConns.get === "function"
+          ? aConns.get(bKey)
+          : undefined;
+        const bToA = bConns && typeof bConns.get === "function"
+          ? bConns.get(aKey)
+          : undefined;
+        const aIsLAN = aToB === CONN_LAN;
+        const bIsLAN = bToA === CONN_LAN;
+        if (aIsLAN || bIsLAN) {
+          pairedPairs.add(key);
+          console.log(
+            `[NAT] ${key} 已是 LAN（aIsLAN=${aIsLAN} bIsLAN=${bIsLAN}），跳过 force_fallback`
+          );
           continue;
         }
 
@@ -368,7 +380,6 @@ export class NatHoleCoordinator {
             console.log(
               `[NAT] ${key} 同 STUN 出口 IP (${aIp})，允许一次 hairpin 尝试`
             );
-            // fall through 到正常打洞流程
           }
         }
 
@@ -426,7 +437,6 @@ export class NatHoleCoordinator {
           this.backoff.delete(key);
         }
 
-        // 首轮错峰
         const fc = this.failCounts.get(key) || 0;
         if (fc === 0) {
           const regA = a.registeredAt || a.connectedAt || 0;
@@ -446,7 +456,6 @@ export class NatHoleCoordinator {
           }
         }
 
-        // 同 signature 的退避窗口内，抑制重复派发
         if (
           backoffEntry &&
           backoffEntry.signature === signature &&
@@ -460,7 +469,6 @@ export class NatHoleCoordinator {
         const senderBeh = behavior.sender || {};
         const receiverBeh = behavior.receiver || {};
 
-        // 端口扫描范围 = max(NAT 行为差异, 两端端口差) + 缓冲
         const natDiff = Math.abs(
           (senderFeature.portsDifference || 0) - (receiverFeature.portsDifference || 0)
         );
@@ -544,7 +552,6 @@ export class NatHoleCoordinator {
           at: now,
         });
 
-        // 首次打洞（fc === 0）：一次派发 3 个 rung（rung, rung+1, rung+2）
         const isFirstAttempt = fc === 0;
         const rungsToDispatch = isFirstAttempt
           ? [
@@ -591,8 +598,6 @@ export class NatHoleCoordinator {
           `assisted=${(receiver.assistedSockets || []).length}/${(sender.assistedSockets || []).length} ` +
           `lan=${(receiver.lanEndpoints || []).length}/${(sender.lanEndpoints || []).length}`
         );
-
-        // ★ 删除原 break —— 允许 i 循环继续处理 a-c、a-d 等
       }
     }
 
