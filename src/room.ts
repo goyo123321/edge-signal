@@ -12,6 +12,7 @@ interface PeerRecord {
   connectedAt: number;
   registeredAt: number;
   lastSeen: number;
+  lastServerPongAt: number;
   disconnectedAt?: number;
   connections: Map<string, ConnType>;
   pubSocket: string;
@@ -23,6 +24,7 @@ interface PeerRecord {
   behavior: string;
   assistedSockets: string[];
   lanEndpoints: string[];
+  lanSubnets: string[];
   observedRaddr: string;
   turnRelayAddr: string;
   relayBytesIn: number;
@@ -31,7 +33,7 @@ interface PeerRecord {
   relayPacketsOut: number;
   _publicIp?: string;
   multiExit?: boolean;
-  features: string[];   // ★ 新增：["n2na", "n2nw", ...]
+  features: string[];
 }
 
 const STAGGER_FALLBACK_SAVE_MS = 300 * 1000;
@@ -48,6 +50,7 @@ const DEFAULT_VIRTUAL_NETWORK = "10.64.0.0/24";
 const MAX_FEATURES = 16;
 const MAX_FEATURE_LEN = 32;
 const MAX_PEER_ID_LEN = 255;
+const MAX_LAN_SUBNETS = 8;
 
 interface ParsedCIDR {
   base: number;
@@ -90,6 +93,50 @@ function intToIP(n: number): string {
   return `${(n >>> 24) & 255}.${(n >>> 16) & 255}.${(n >>> 8) & 255}.${n & 255}`;
 }
 
+// ★ 新增：CIDR 重叠判断
+function cidrOverlaps(a: string, b: string): boolean {
+  const pa = parseCIDR(a);
+  const pb = parseCIDR(b);
+  if (!pa || !pb) return false;
+
+  const maskA = pa.prefix === 0 ? 0 : ((0xFFFFFFFF << (32 - pa.prefix)) >>> 0);
+  const maskB = pb.prefix === 0 ? 0 : ((0xFFFFFFFF << (32 - pb.prefix)) >>> 0);
+
+  // 短前缀网段包含长前缀网段 → 重叠
+  if (pa.prefix <= pb.prefix) {
+    return ((pa.base & maskA) >>> 0) === ((pb.base & maskA) >>> 0);
+  } else {
+    return ((pa.base & maskB) >>> 0) === ((pb.base & maskB) >>> 0);
+  }
+}
+
+// ★ 新增：双重判断是否同 LAN
+//
+// 条件 1：HTTP 连接 IP 相同（cf-connecting-ip）
+// 条件 2：lanSubnets 至少有一对重叠
+//
+// 旧客户端不上报 lanSubnets → 退化为只看 IP（向后兼容）
+function shouldShareLan(a: PeerRecord, b: PeerRecord): boolean {
+  const aIp = a._publicIp || "";
+  const bIp = b._publicIp || "";
+  if (!aIp || !bIp || aIp !== bIp) {
+    return false;
+  }
+
+  const aSubnets = a.lanSubnets || [];
+  const bSubnets = b.lanSubnets || [];
+  if (aSubnets.length === 0 || bSubnets.length === 0) {
+    return true;
+  }
+
+  for (const sa of aSubnets) {
+    for (const sb of bSubnets) {
+      if (cidrOverlaps(sa, sb)) return true;
+    }
+  }
+  return false;
+}
+
 function idxToCode(i: number): string {
   if (i < 26) return String.fromCharCode(65 + i);
   const first = Math.floor(i / 26) - 1;
@@ -108,7 +155,6 @@ function lanListKey(lan: string[] | undefined): string {
   return [...lan].sort().join(",");
 }
 
-// ★ 新增：Uint8Array → base64（分块避免 String.fromCharCode 栈溢出）
 function uint8ArrayToBase64(bytes: Uint8Array): string {
   let binary = "";
   const chunk = 8192;
@@ -118,7 +164,6 @@ function uint8ArrayToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-// ★ 新增：过滤客户端上报的 features
 function sanitizeFeatures(raw: any): string[] {
   if (!Array.isArray(raw)) return [];
   const out: string[] = [];
@@ -131,10 +176,23 @@ function sanitizeFeatures(raw: any): string[] {
   return out;
 }
 
-// ★ 新增：判断 target 是否支持某 feature
 function peerHasFeature(p: PeerRecord | undefined, feature: string): boolean {
   if (!p || !Array.isArray(p.features)) return false;
   return p.features.includes(feature);
+}
+
+// ★ 新增：过滤 lanSubnets（校验格式，限制数量）
+function sanitizeLanSubnets(raw: any): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const s of raw) {
+    if (typeof s !== "string") continue;
+    const parsed = parseCIDR(s);
+    if (!parsed) continue;
+    out.push(parsed.cidr);
+    if (out.length >= MAX_LAN_SUBNETS) break;
+  }
+  return out;
 }
 
 export class Room extends DurableObject {
@@ -291,6 +349,28 @@ export class Room extends DurableObject {
         } catch (e) {}
 
         this.broadcast(id, { type: "left", from: id });
+        continue;
+      }
+
+      // ★ WS 半死检测：lastServerPongAt > 90 秒
+      const lastPong = p.lastServerPongAt || 0;
+      const pongIdleMs = now - lastPong;
+      if (lastPong > 0 && pongIdleMs > PEER_STALE_MS) {
+        console.log(
+          `[Room] ${id} ${Math.round(pongIdleMs / 1000)}s 未回 server_pong，` +
+          `标记离线（WS 半死）`
+        );
+        p.online = false;
+        p.disconnectedAt = now;
+        p.connections = new Map();
+        p.pubSocket = "";
+        p.p2pEndpoint = "";
+        p.publicEndpoint = "";
+        if (p.virtualIp) this.ipToClient.delete(p.virtualIp);
+        this.coordinator.clearPairStateFor(id);
+        this.sessions.delete(id);
+        try { ws.close(1000, "Stale: no server_pong"); } catch (e) {}
+        this.broadcast(id, { type: "left", from: id });
       }
     }
   }
@@ -329,6 +409,7 @@ export class Room extends DurableObject {
             connectedAt: p.connectedAt || now,
             registeredAt: p.registeredAt || now,
             lastSeen: p.lastSeen || now,
+            lastServerPongAt: now,
             disconnectedAt: p.disconnectedAt,
             connections: new Map(Object.entries(p.connections || {})) as Map<string, ConnType>,
             pubSocket: p.pubSocket || "",
@@ -340,6 +421,7 @@ export class Room extends DurableObject {
             behavior: p.behavior || "",
             assistedSockets: Array.isArray(p.assistedSockets) ? p.assistedSockets : [],
             lanEndpoints: Array.isArray(p.lanEndpoints) ? p.lanEndpoints : [],
+            lanSubnets: sanitizeLanSubnets(p.lanSubnets),
             observedRaddr: p.observedRaddr || "",
             turnRelayAddr: p.turnRelayAddr || "",
             relayBytesIn: p.relayBytesIn || 0,
@@ -348,7 +430,7 @@ export class Room extends DurableObject {
             relayPacketsOut: p.relayPacketsOut || 0,
             _publicIp: p._publicIp || "",
             multiExit: !!p.multiExit,
-            features: sanitizeFeatures(p.features),   // ★ 新增：恢复 features
+            features: sanitizeFeatures(p.features),
           });
 
           if (p.virtualIp && p.online && this.isInVirtualNetwork(p.virtualIp)) {
@@ -392,11 +474,12 @@ export class Room extends DurableObject {
           regularPortsChange: p.regularPortsChange, behavior: p.behavior,
           assistedSockets: p.assistedSockets, observedRaddr: p.observedRaddr,
           lanEndpoints: p.lanEndpoints || [],
+          lanSubnets: p.lanSubnets || [],
           turnRelayAddr: p.turnRelayAddr, relayBytesIn: p.relayBytesIn,
           relayBytesOut: p.relayBytesOut, relayPacketsIn: p.relayPacketsIn,
           relayPacketsOut: p.relayPacketsOut, _publicIp: p._publicIp,
           multiExit: p.multiExit,
-          features: p.features || [],   // ★ 新增：持久化 features
+          features: p.features || [],
         };
       }
       await this.ctx.storage.put(PEERS_STORAGE_KEY, peersData);
@@ -529,22 +612,7 @@ export class Room extends DurableObject {
     const now = Date.now();
     try { await this.ctx.storage.put(COMMUNITY_STORAGE_KEY, this.community); } catch {}
 
-    const onlinePeersForClient = Array.from(this.peers.values())
-      .filter((p) => p.online && p.clientId !== clientId)
-      .map((p) => {
-        const addr = this.peerPublicAddr(p);
-        return {
-          id: p.clientId,
-          virtualIp: p.virtualIp,
-          publicIp: addr.ip,
-          publicPort: addr.port,
-          natType: p.natType || "unknown",
-          turnRelayAddr: p.turnRelayAddr || "",
-          assistedEndpoints: p.assistedSockets || [],
-          lanEndpoints: p.lanEndpoints || [],
-          features: p.features || [],   // ★ 新增：下发对端 features
-        };
-      });
+    const onlinePeersForClient = this.buildReadyPeers(clientId);
 
     let peer = this.peers.get(clientId);
     if (peer) {
@@ -552,9 +620,9 @@ export class Room extends DurableObject {
       peer.online = true;
       peer.connectedAt = now;
       peer.lastSeen = now;
+      peer.lastServerPongAt = now;
       peer.disconnectedAt = undefined;
       peer._publicIp = publicIp;
-      // features 保留旧值：客户端连接后会重新上报 p2p_metadata 覆盖
 
       if (peer.virtualIp && !this.isInVirtualNetwork(peer.virtualIp)) {
         const oldVip = peer.virtualIp;
@@ -587,15 +655,17 @@ export class Room extends DurableObject {
         clientId, mac: clientId, name: "",
         virtualIp: this.allocateIp(),
         online: true, connectedAt: now, registeredAt: now, lastSeen: now,
+        lastServerPongAt: now,
         connections: new Map(),
         pubSocket: "", p2pEndpoint: "", publicEndpoint: "",
         natType: "unknown", portsDifference: 0, regularPortsChange: false,
         behavior: "BehaviorPortChanged", assistedSockets: [], observedRaddr: "",
         lanEndpoints: [],
+        lanSubnets: [],
         turnRelayAddr: "", relayBytesIn: 0, relayBytesOut: 0, relayPacketsIn: 0, relayPacketsOut: 0,
         _publicIp: publicIp,
         multiExit: false,
-        features: [],   // ★ 新增：新 peer 初始空数组
+        features: [],
       };
       this.peers.set(clientId, peer);
     }
@@ -623,6 +693,28 @@ export class Room extends DurableObject {
     return new Response(null, { status: 101, webSocket: client });
   }
 
+  // ★ 新增：按 shouldShareLan 过滤 lanEndpoints
+  private buildReadyPeers(clientId: string): any[] {
+    const selfPeer = this.peers.get(clientId);
+    return Array.from(this.peers.values())
+      .filter((p) => p.online && p.clientId !== clientId)
+      .map((p) => {
+        const addr = this.peerPublicAddr(p);
+        const shareLan = selfPeer ? shouldShareLan(selfPeer, p) : false;
+        return {
+          id: p.clientId,
+          virtualIp: p.virtualIp,
+          publicIp: addr.ip,
+          publicPort: addr.port,
+          natType: p.natType || "unknown",
+          turnRelayAddr: p.turnRelayAddr || "",
+          assistedEndpoints: p.assistedSockets || [],
+          lanEndpoints: shareLan ? (p.lanEndpoints || []) : [],
+          features: p.features || [],
+        };
+      });
+  }
+
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     if (typeof message === "string") await this.handleControl(ws, message);
     else await this.handleBinary(ws, message);
@@ -638,6 +730,8 @@ export class Room extends DurableObject {
 
     switch (msg.type) {
       case "server_pong":
+        // ★ 新增：记录 server_pong 时间
+        if (peer) peer.lastServerPongAt = Date.now();
         return;
 
       case "ping":
@@ -663,7 +757,6 @@ export class Room extends DurableObject {
           peer.regularPortsChange = !!p.regularPortsChange;
           peer.behavior = p.behavior || peer.behavior;
 
-          // ★ 新增：处理 features
           if (Array.isArray(p.features)) {
             peer.features = sanitizeFeatures(p.features);
           }
@@ -682,6 +775,24 @@ export class Room extends DurableObject {
             peer.lanEndpoints = p.lanEndpoints.filter(
               (s: any) => typeof s === "string" && s
             );
+          }
+
+          // ★ 新增：解析 lanSubnets
+          if (Array.isArray(p.lanSubnets)) {
+            peer.lanSubnets = sanitizeLanSubnets(p.lanSubnets);
+          } else {
+            // 兼容旧客户端：从 lanEndpoints 推 /24
+            peer.lanSubnets = [];
+            for (const ep of peer.lanEndpoints) {
+              const host = ep.split(":")[0];
+              const parts = host.split(".");
+              if (parts.length === 4) {
+                const cidr = `${parts[0]}.${parts[1]}.${parts[2]}.0/24`;
+                if (parseCIDR(cidr)) {
+                  peer.lanSubnets.push(cidr);
+                }
+              }
+            }
           }
 
           if (typeof p.p2pEndpoint === "string" && p.p2pEndpoint) peer.p2pEndpoint = p.p2pEndpoint;
@@ -719,31 +830,14 @@ export class Room extends DurableObject {
           console.log(
             `[Room] p2p_metadata from ${from}: natType=${peer.natType} ` +
             `pub=${addr.ip}:${addr.port} (pubSocket=${peer.pubSocket || "<empty>"}) ` +
-            `lan=${(peer.lanEndpoints || []).length} multiExit=${peer.multiExit || false} ` +
-            `assisted=${peer.assistedSockets.length} features=${JSON.stringify(peer.features)} ` +
-            `broadcast=${needBroadcast ? "yes" : "no"}`
+            `lan=${(peer.lanEndpoints || []).length} subnets=${(peer.lanSubnets || []).length} ` +
+            `multiExit=${peer.multiExit || false} assisted=${peer.assistedSockets.length} ` +
+            `features=${JSON.stringify(peer.features)} broadcast=${needBroadcast ? "yes" : "no"}`
           );
 
           if (needBroadcast) {
-            this.broadcast(from, {
-              type: "joined", from,
-              payload: {
-                id: from,
-                virtualIp: peer.virtualIp,
-                publicIp: addr.ip,
-                publicPort: addr.port,
-                natType: peer.natType || "unknown",
-                turnRelayAddr: peer.turnRelayAddr || "",
-                assistedEndpoints: peer.assistedSockets || [],
-                lanEndpoints: peer.lanEndpoints || [],
-                features: peer.features || [],   // ★ 新增：下发 features
-                initialProbe: {
-                  pubSocket: addr.ip && addr.port > 0 ? `${addr.ip}:${addr.port}` : "",
-                  lanEndpoints: peer.lanEndpoints || [],
-                  assistedEndpoints: peer.assistedSockets || [],
-                },
-              },
-            });
+            // ★ 逐个 peer 发送 joined，按 shouldShareLan 过滤 lanEndpoints
+            this.sendJoinedToAll(from, peer);
           }
         }
         await this.runCoordination();
@@ -812,6 +906,41 @@ export class Room extends DurableObject {
     }
   }
 
+  // ★ 新增：逐个 peer 发送 joined，按 shouldShareLan 过滤
+  private sendJoinedToAll(from: string, peer: PeerRecord): void {
+    const addr = this.peerPublicAddr(peer);
+
+    for (const [id, targetWs] of this.sessions) {
+      if (id === from) continue;
+      const target = this.peers.get(id);
+      if (!target || !target.online) continue;
+
+      const shareLan = shouldShareLan(target, peer);
+      const payload = {
+        id: from,
+        virtualIp: peer.virtualIp,
+        publicIp: addr.ip,
+        publicPort: addr.port,
+        natType: peer.natType || "unknown",
+        turnRelayAddr: peer.turnRelayAddr || "",
+        assistedEndpoints: peer.assistedSockets || [],
+        lanEndpoints: shareLan ? (peer.lanEndpoints || []) : [],
+        features: peer.features || [],
+        initialProbe: {
+          pubSocket: addr.ip && addr.port > 0 ? `${addr.ip}:${addr.port}` : "",
+          lanEndpoints: shareLan ? (peer.lanEndpoints || []) : [],
+          assistedEndpoints: peer.assistedSockets || [],
+        },
+      };
+
+      try {
+        targetWs.send(JSON.stringify({ type: "joined", from, payload }));
+      } catch (e) {
+        console.error(`[Room] joined 发送失败 ${id}:`, e);
+      }
+    }
+  }
+
   private async handleBinary(ws: WebSocket, message: ArrayBuffer | Blob): Promise<void> {
     let buffer: ArrayBuffer;
     if (message instanceof ArrayBuffer) buffer = message;
@@ -825,7 +954,7 @@ export class Room extends DurableObject {
     const fromPeer = this.peers.get(from);
     if (fromPeer) fromPeer.lastSeen = Date.now();
 
-    // 1. N2NW 帧（IPv4 数据面）
+    // 1. N2NW 帧
     if (
       data.length >= 6 &&
       data[0] === 0x4E && data[1] === 0x32 &&
@@ -877,7 +1006,7 @@ export class Room extends DurableObject {
       return;
     }
 
-    // 2. N2NA 帧（★ 新增：app_stream 二进制数据面）
+    // 2. N2NA 帧
     if (
       data.length >= 7 &&
       data[0] === 0x4E && data[1] === 0x32 &&
@@ -916,14 +1045,6 @@ export class Room extends DurableObject {
     }
   }
 
-  // ★ 新增：N2NA 转发（含 features 协商 + 文本降级）
-  //
-  // 帧格式（客户端 → 服务端）：
-  //   magic(4)="N2NA" | flags(1) | peerLen(1) | peerId(N) | streamIdLen(1) | streamId(M) | rawTCPData
-  //
-  // 服务端行为：
-  //   - 目标 features 含 "n2na"  → 二进制转发（重写 peerId 为 senderId）
-  //   - 目标不含 "n2na"          → 解码转 app_stream_data 文本（旧客户端兼容）
   private forwardN2NA(
     from: string,
     fromPeer: PeerRecord | undefined,
@@ -960,19 +1081,17 @@ export class Room extends DurableObject {
         return;
       }
 
-      // ★ features 协商
       const targetSupportsBinary = peerHasFeature(targetPeer, "n2na");
 
       if (targetSupportsBinary) {
-        // 二进制转发：重写 peerId 为 senderId
         const newFrame = new Uint8Array(
           7 + fromBytes.length + streamIdLen + payload.length
         );
-        newFrame[0] = 0x4E;   // 'N'
-        newFrame[1] = 0x32;   // '2'
-        newFrame[2] = 0x4E;   // 'N'
-        newFrame[3] = 0x41;   // 'A'
-        newFrame[4] = data[4]; // flags
+        newFrame[0] = 0x4E;
+        newFrame[1] = 0x32;
+        newFrame[2] = 0x4E;
+        newFrame[3] = 0x41;
+        newFrame[4] = data[4];
         newFrame[5] = fromBytes.length;
         newFrame.set(fromBytes, 6);
         newFrame[6 + fromBytes.length] = streamIdLen;
@@ -980,7 +1099,6 @@ export class Room extends DurableObject {
         newFrame.set(payload, 7 + fromBytes.length + streamIdLen);
         targetWs.send(newFrame.buffer);
       } else {
-        // ★ 文本降级：解码 streamId + base64 payload，转成 app_stream_data
         const streamId = new TextDecoder().decode(streamIdBytes);
         const dataB64 = uint8ArrayToBase64(payload);
         targetWs.send(JSON.stringify({
@@ -991,7 +1109,6 @@ export class Room extends DurableObject {
         }));
       }
 
-      // 流量统计
       if (fromPeer) {
         fromPeer.relayBytesOut += data.length;
         fromPeer.relayPacketsOut += 1;
@@ -1187,7 +1304,8 @@ export class Room extends DurableObject {
         multiExit: !!p.multiExit,
         assistedSockets: p.assistedSockets || [],
         lanEndpoints: p.lanEndpoints || [],
-        features: p.features || [],   // ★ 新增：管理面板展示 features
+        lanSubnets: p.lanSubnets || [],
+        features: p.features || [],
         online: p.online, connectedAt: p.connectedAt, lastSeen: p.lastSeen, disconnectedAt: p.disconnectedAt,
         onlineFor: now - p.connectedAt,
         offlineFor: p.online ? 0 : (p.disconnectedAt ? now - p.disconnectedAt : 0),
@@ -1366,8 +1484,6 @@ export class Room extends DurableObject {
         }),
       }));
       this.lastReport = now;
-    } catch (e) {
-      // 失败时不更新 lastReport，让下次调用可以立即重试
-    }
+    } catch (e) {}
   }
 }
