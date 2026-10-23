@@ -49,40 +49,92 @@
 
 **服务端对三端平等对待**——同一套 WebSocket 协议，同一套打洞协调逻辑，同一个 TURN 凭证分发。
 
-### 服务端在各降级级中的作用
+### 四级降级与状态机
 
-| 降级级 | 服务端角色 | 消耗 |
-|:---|:---|:---|
-| **LAN 直连** | 仅信令（交换 LAN 候选） | 极少 |
-| **P2P 打洞** | 信令 + 打洞协调（下发指令） | 极少 |
-| **TURN 中继** | 仅下发 TURN 凭证 | 极少 |
-| **WS 中继** | **实际转发每个数据包** | 高（消耗 Worker 配额） |
+服务端主动避免数据面流量，尽量让客户端走 P2P 或 TURN：
 
-**核心设计**：服务端**主动避免**数据面流量，尽量让客户端走 P2P 或 TURN。
+| 优先级 | 连接方式 | 服务端角色 | 消耗 | 延迟 |
+|:---|:---|:---|:---|:---|
+| 1 | **LAN 直连** | 仅信令（交换 LAN 候选） | 极少 | <5ms |
+| 2 | **P2P 打洞** | 信令 + 打洞协调 | 极少 | 10-50ms |
+| 3 | **TURN 中继** | 仅下发 TURN 凭证 | 极少 | 30-100ms |
+| 4 | **WS 中继** | 实际转发每个数据包 | 高（消耗 Worker 配额） | 100-300ms |
+
+客户端状态机（`RelayManager`）：
+
+```
+Unknown → ConnLAN        (收到 LAN 数据帧 / LAN Punch/ACK / 打洞命中 LAN)
+        → ConnP2PAvailable (收到公网 Punch/ACK / 打洞握手成功)
+        → ConnP2P        (收到公网数据帧 / 公网 PONG)
+        → ConnTURN       (打洞失败 / 30s 无流量 / peer-via-turn/ws)
+        → ConnRelay      (TURN 未就绪)
+
+ConnLAN  → ConnP2P       (60s 无 LAN 流量 / LAN 发送失败)
+ConnP2P  → ConnTURN/Relay (30s 无流量 / peer-via-turn/ws)
+```
+
+**状态机与数据流完全统一**——TCP/UDP/ICMP 都走 `SendToPeer`，所有接收来源（UDP/TURN/WS）统一处理，所有状态变化经 `Mark*` 函数。
 
 ---
 
 ## ✨ 特性
 
+### 核心
 - **零运维** — 无需自建服务器，部署到 Cloudflare 即可
 - **全球加速** — 利用 Cloudflare Anycast 网络，就近接入
+- **LAN 直连** — 客户端上报 LAN 候选，同 WiFi 场景直接内网通信（<5ms）
 - **P2P 打洞** — 移植 FRP 行为阶梯，提升打洞成功率
-- **三级降级** — `P2P → TURN → WS`，保证连接永远可用
-- **LAN 直连** — 客户端上报 LAN 候选，同 WiFi 场景直接内网通信
-- **同 CGNAT 处理** — 同 STUN 出口 IP 时首次允许 hairpin 尝试，失败后下发 `force_fallback`
-- **强制降级** — 同 STUN IP 已失败时下发 `force_fallback` 指令
-- **动态端口范围** — 扫描范围按两端端口差动态计算
+- **四级降级** — `LAN → P2P → TURN → WS`，保证连接永远可用
+
+### NAT 打洞
+- **端口扫描范围动态计算** — `max(natDiff, portGap) + 缓冲`，上限 10000
 - **多端点扫描** — assisted + LAN + raddr 同时下发，提升命中率
-- **Cloudflare TURN 支持** — 原生集成 Cloudflare Calls TURN，1000GB/月免费
-- **自定义 TURN** — 支持自建 coturn（UDP/TCP transport）
+- **同 CGNAT 处理** — 同 STUN 出口 IP 时首次允许 hairpin，失败后 `force_fallback`
+- **首轮错峰** — 最新注册的 peer 留 NAT 映射建立时间
+- **状态机双向确认** — 客户端上报 `p2pStatus`，服务端交叉校验
+
+### LAN 直连（v2.0 新增）
+- **lanSubnets 上报** — 客户端上报 CIDR，多 LAN 场景准确判断
+- **cidrOverlaps 重叠判定** — 服务端优先按子网重叠判断，**双 WAN / 多 AP 上行**也能走 LAN
+- **ConnLAN 独立状态** — LAN 和公网 P2P 分开管理
+- **LAN 60s 超时** — LAN 无流量 60s 才降级到公网 P2P（不是 TURN）
+- **LAN 2s 保活豁免** — LAN 不对抗 WiFi 省电，节省流量
+
+### 网络切换（v2.0 新增）
+- **onLinkPropertiesChanged 网关检测** — WiFi1 → WiFi2（同类型网络）也能毫秒级感知
+- **NetworkCallback 类型检测** — WiFi ↔ Cellular ↔ Ethernet
+- **OnNetworkChanged 状态重置** — 清 P2P/LAN 状态、UDPAddr、LanEndpoints，保留 TURN/WS
+- **network_changed 广播** — 服务端清协调状态 + 通知其他 peer
+- **peer_network_changed 处理** — 其他 peer 清该 peer 的 LAN 地址
+
+### TURN
+- **Cloudflare TURN** — 原生集成，1000GB/月免费
+- **自定义 TURN** — 支持自建 coturn（UDP/TCP/RFC6062）
+- **actualSource 追踪** — 面板显示「配置 source」和「实际 source」不一致时黄色提示
+- **TTL 限制** — `/api/turn-credentials` 的 ttl clamp 到 `[600, 604800]`
+- **5s 超时** — Cloudflare TURN API 失败时 fallback，不 hold Worker
+
+### 混合房间
+- **协议能力协商** — 客户端上报 `features`，服务端自动协商 WS 中继帧格式（N2NW / N2NA / 文本）
+- **新→旧 N2NW 保护** — 服务端检查目标端 `n2nw`，不支持则丢弃 + 警告（旧版静默丢包）
+- **新旧客户端混合房间零丢包**
+
+### 安全与配额
+- **裸 IPv4 源 IP 校验** — 防 VIP 欺骗
+- **app_stream_* 强制 to** — 防广播
+- **app_stream_data 64KB 限制**
+- **reportToRegistry 500ms 去抖** — 防 10 设备频繁重连打爆 DO Storage
+- **runCoordination 500ms 节流** — 降 O(N²) 评估频率
+- **SOCKS5 端口冲突检测** — `Listen()` 失败返回 error，UI 显示启动失败
+- **TURN TTL 上限** — 防恶意超大 ttl 请求
+
+### 面板
 - **双面板** — 公开面板 + 管理面板（Token 保护）
+- **连接类型徽章** — `lan-XX` / `p2p-XX` / `p2p-avail-XX` / `TURN-XX` / `ws-XX`
+- **协议能力 chips** — `n2na` / `n2nw` 显示
 - **设备代号** — 按上线顺序自动分配 A/B/C/D
-- **在线/离线统计** — 区分当前在线和断线的设备
-- **状态可视化** — `p2p-BD TURN-C ws-D` 格式直观展示连接方式
-- **协议能力协商** — 客户端上报 `features`，服务端自动协商 WS 中继帧格式（N2NW / N2NA / 文本），**新旧客户端混合房间零丢包**
-- **虚拟网段可配** — 通过 `VIRTUAL_NETWORK` 配置任意 IPv4 CIDR
-- **状态持久化** — peers 写入 DO Storage，抗 evict
-- **自动清理** — 离线设备保留 30 分钟后清理，房间 1 小时无活动清理
+- **状态可视化** — `lan-BD TURN-C ws-D` 格式直观展示连接方式
+- **房间清理** — 房间完全空时 5 分钟内清 registry（不再显示"0 个设备"）
 
 ---
 
@@ -101,13 +153,16 @@
    │   └─ 中继转发（最后兜底）           │
    └────────────────────────────────────┘
             │
-            ├─ 优先级 1: P2P 直连（含 CGNAT hairpin）
+            ├─ 优先级 1: LAN 直连（同 WiFi）
             │  Edge A ←──────────────→ Edge B
             │
-            ├─ 优先级 2: TURN 中继（不消耗 Worker）
+            ├─ 优先级 2: P2P 直连（含 CGNAT hairpin）
+            │  Edge A ←──────────────→ Edge B
+            │
+            ├─ 优先级 3: TURN 中继（不消耗 Worker）
             │  Edge A ──→ TURN ──→ Edge B
             │
-            └─ 优先级 3: WebSocket 中继（最后兜底）
+            └─ 优先级 4: WebSocket 中继（最后兜底）
                Edge A ──→ Worker ──→ Edge B
 ```
 
@@ -119,7 +174,7 @@
 
 - Node.js 18+
 - Cloudflare 账号（免费版即可）
-- Wrangler CLI
+- Wrangler CLI ≥ 3.50（推荐 `^3.114.0`）
 
 ### 部署
 
@@ -276,7 +331,7 @@ npx wrangler secret put CONNECT_TOKEN
 
 ## 📡 TURN 中继配置
 
-TURN 是三级降级的第二级，**打洞失败时优先走 TURN**（不消耗 Worker 配额）。
+TURN 是四级降级的第三级，**打洞失败时优先走 TURN**（不消耗 Worker 配额）。
 
 ### 方式 1：Cloudflare TURN（推荐，1000GB/月免费）
 
@@ -306,11 +361,9 @@ TURN 是三级降级的第二级，**打洞失败时优先走 TURN**（不消耗
 ```bash
 cd edge-signal
 
-# 设置 TURN Key ID
 npx wrangler secret put TURN_KEY_ID
 # 粘贴上面复制的 Token ID
 
-# 设置 TURN Key API Token
 npx wrangler secret put TURN_KEY_API_TOKEN
 # 粘贴上面复制的 API Token
 ```
@@ -375,6 +428,7 @@ curl -s "https://edge-signal.xxx.workers.dev/api/turn-credentials" | jq
 | `"source": "none"` | 未配置 TURN | 按上文配置 |
 | `"success": false, "error": "TURN not configured"` | 环境变量名写错 | 确认是 `TURN_KEY_ID` / `TURN_KEY_API_TOKEN` |
 | HTTP 401 | `TURN_KEY_API_TOKEN` 值不对 | 重新创建 TURN Key 并替换 |
+| 请求 hang 30 秒 | Cloudflare TURN API 慢 | 已修复，5 秒超时 fallback |
 | 客户端 relay 是 `172.16.x.x` 之类内网地址 | 用的是自定义 TURN（coturn 未配 `external-ip`） | 修 coturn 或切 Cloudflare TURN |
 
 ### 方式 2：自定义 TURN 服务器
@@ -439,7 +493,7 @@ sudo systemctl restart coturn
 
 ```
 1. Cloudflare TURN（TURN_KEY_ID + TURN_KEY_API_TOKEN 都配了）
-   ↓ 调用失败
+   ↓ 调用失败（5 秒超时 / HTTP 错误 / 空响应）
 2. 自定义 TURN（TURN_SERVERS 配了）
    ↓ 都失败/未配
 3. 客户端自动降级到 WebSocket 中继
@@ -459,32 +513,44 @@ curl -s "https://edge-signal.xxx.workers.dev/api/public/turn-config" | jq
 {
   "enabled": false,
   "source": "none",
+  "actualSource": "none",
+  "actualSourceAt": 0,
   "servers": [],
   "priority": []
 }
 ```
 
-**配了 Cloudflare TURN**：
+**配了 Cloudflare TURN（API 正常）**：
 
 ```json
 {
   "enabled": true,
   "source": "cloudflare",
+  "actualSource": "cloudflare",
+  "actualSourceAt": 1729651200000,
   "servers": [],
   "priority": ["cloudflare"]
 }
 ```
 
-**配了自定义 TURN**：
+**配了 Cloudflare TURN 但 API 失败（已 fallback 到自定义）**：
 
 ```json
 {
   "enabled": true,
-  "source": "custom",
+  "source": "cloudflare",
+  "actualSource": "custom",
+  "actualSourceAt": 1729651200000,
   "servers": [{"url": "turn:111.171.194.230:3478"}],
-  "priority": ["custom"]
+  "priority": ["cloudflare", "custom"]
 }
 ```
+
+**管理面板会显示黄色提示** `TURN Cloudflare (实际: custom)` —— 说明配置层面是 Cloudflare，但最近一次实际成功用的是 custom。
+
+### TTL 限制
+
+`/api/turn-credentials` 的 `?ttl=` 参数会被 **clamp 到 `[600, 604800]`**（10 分钟 ~ 7 天），超出范围自动修正。
 
 ---
 
@@ -499,12 +565,13 @@ curl -s "https://edge-signal.xxx.workers.dev/api/public/turn-config" | jq
 
 ### 混合房间行为
 
-服务端按**目标端**是否支持 `n2na` 决定转发格式：
+服务端按**目标端**是否支持 `n2na` / `n2nw` 决定转发格式：
 
 | 发送方 | 接收方 | 服务端行为 |
 |:---|:---|:---|
-| 新 | 新 | 二进制转发（N2NA，节省 ~27% 带宽） |
-| 新 | 旧 | 解码转 `app_stream_data` 文本 |
+| 新 | 新 | 二进制转发（N2NA/N2NW，节省 ~27% 带宽） |
+| 新 | 旧（无 n2na） | 解码转 `app_stream_data` 文本 |
+| 新 | 旧（无 n2nw） | **丢弃 + 警告**（旧客户端只懂裸 IPv4） |
 | 旧 | 新 | 文本（新客户端兼容） |
 | 旧 | 旧 | 文本 |
 
@@ -536,6 +603,115 @@ curl -s "https://<worker>/api/admin/status/<room>?token=<ADMIN_TOKEN>" | jq '.pe
 
 ---
 
+## 🔄 网络切换处理（v2.0 新增）
+
+### WiFi ↔ Cellular 切换
+
+Android 客户端通过 `ConnectivityManager.NetworkCallback.onAvailable` 检测网络类型变化：
+
+```
+WiFi → Cellular / Cellular → WiFi / 任意 → Ethernet
+    ↓
+N2nController.notifyNetworkChanged("cellular")
+    ↓
+Go 层 Edge.OnNetworkChanged()
+    ├─ 清空 failCounts / natHoleActive
+    ├─ RelayManager.ResetP2PStates → ConnLAN/ConnP2P/ConnP2PAvailable → ConnUnknown
+    ├─ 清空 peers[*].UDPAddr / lastLANRecvAt / lastPublicRecvAt / LanEndpoints
+    ├─ 取消所有 fallbackTimers / p2pAvailTimers
+    ├─ 立即 reportMetadata（绕过 30s 节流）
+    └─ WS 发 network_changed → 服务端
+        ↓
+    服务端 coordinator.clearPairStateFor + 清 peer.pubSocket/... + 广播 peer_network_changed
+        ↓
+    其他 peer 收到 peer_network_changed → 清该 peer 的 UDPAddr/LanEndpoints
+```
+
+### WiFi1 → WiFi2（同类型网络）切换
+
+**问题**：`onAvailable` 只在「网络可用」时触发，WiFi 间切换 `type` 都是 `"wifi"`，旧版 `type == prev` 直接 return → 状态机停留在 `ConnLAN` → 持续丢包 30-60 秒。
+
+**修复**：`ConnectivityManager.NetworkCallback.onLinkPropertiesChanged` 检测**网关变化**：
+
+```
+WiFi1 (192.168.1.1) → WiFi2 (192.168.2.1)
+    ↓
+onLinkPropertiesChanged 检测到网关变化
+    ↓
+N2nController.notifyNetworkChanged("gateway:192.168.2.1")
+    ↓
+（同上 OnNetworkChanged 流程，毫秒级触发）
+```
+
+**跳过 VPN 自身接口**：`onLinkPropertiesChanged` 先检查 `TRANSPORT_VPN`，VPN 接口（tun0）变化时不触发，避免循环。
+
+### 切换后的收敛
+
+| 时刻 | 状态机 | 路径 |
+|:---|:---|:---|
+| T+0 | `ConnLAN/ConnP2P → ConnUnknown`（毫秒级） | WS 兜底，不丢包 |
+| T+0~T+5s | `ConnUnknown` | WS 中继 |
+| T+5s | STUN 拿到新公网地址 | — |
+| T+5s | 服务端重新协调打洞 | — |
+| T+5s~T+10s | 收敛到 `ConnLAN` / `ConnP2P` / `ConnTURN` | 正常通信 |
+
+**从「T+60s 卡在假 P2P」变成「T+5~10s 收敛」**。
+
+---
+
+## 🌐 双 WAN / 多 AP 上行场景（v2.0 新增）
+
+### 场景
+
+- A、B 物理上在同一 LAN `192.168.1.0/24`
+- A 走 WAN1（公网 IP `1.1.1.1`），B 走 WAN2（公网 IP `2.2.2.2`）
+- 双 WAN 路由 / 多 AP 各自上行
+
+### 旧版问题
+
+`shouldShareLan` 只比较 `_publicIp`：
+
+```js
+if (aIp !== bIp) return false;   // 双 WAN → false → lanEndpoints 被过滤
+```
+
+客户端 `notePeerCommon` 无法匹配 LAN 源地址 → 打洞失败 → TURN/WS。
+
+### 新版修复
+
+**服务端 `shouldShareLan` 优先看 `lanSubnets` 重叠**：
+
+```js
+function shouldShareLan(a, b) {
+  const aSubnets = a.lanSubnets || [];
+  const bSubnets = b.lanSubnets || [];
+  if (aSubnets.length > 0 && bSubnets.length > 0) {
+    for (const sa of aSubnets) {
+      for (const sb of bSubnets) {
+        if (cidrOverlaps(sa, sb)) return true;  // 子网重叠 → 同 LAN
+      }
+    }
+    return false;
+  }
+  // 兜底：旧客户端不上报 lanSubnets，退回公网 IP 相同
+  return aIp === bIp;
+}
+```
+
+**客户端 `ensureTargetPeer` 从打洞指令补充 `LanEndpoints`**：
+
+```go
+// 即使 joined 的 lanEndpoints 为空，nat_hole_instruction 的 targetLanEndpoints
+// 是完整列表（未经 shouldShareLan 过滤），写回后 notePeerCommon 能匹配 LAN 包
+if len(instr.TargetLanEndpoints) > 0 && len(p.LanEndpoints) == 0 {
+    p.LanEndpoints = sortLANByAffinity(instr.TargetLanEndpoints, prefixes)
+}
+```
+
+**效果**：双 WAN / 多 AP 上行场景，T+1s 就能走 LAN（`lan-XX` 徽章），延迟从 TURN 的 30-100ms 降到 LAN 的 <5ms。
+
+---
+
 ## 📊 面板
 
 ### 公开面板
@@ -548,7 +724,7 @@ https://edge-signal.<子域>.workers.dev/
 - 房间列表（设备数、在线、离线）
 - 设备代号（A/B/C/D）
 - 虚拟 IP、在线状态
-- NAT 类型、连接状态（`p2p-BD TURN-C ws-D`）
+- NAT 类型、连接状态（`lan-BD p2p-C TURN-D ws-E`）
 - 中继流量
 
 **不显示**：设备名、Client ID、公网地址、操作按钮、features
@@ -567,6 +743,7 @@ https://edge-signal.<子域>.workers.dev/admin?token=<ADMIN_TOKEN>
 - **协议能力 chips**（NAT 类型列下方显示 `n2na` / `n2nw`）
 - 完整连接对端列表
 - 中继流量明细
+- **TURN 实际 source**（配置 vs 实际不一致时黄色提示）
 
 操作：
 - **踢出单个设备**（关闭其 WebSocket）
@@ -577,12 +754,13 @@ https://edge-signal.<子域>.workers.dev/admin?token=<ADMIN_TOKEN>
 
 服务端面板和 Android App 使用同一套徽章：
 
-| 徽章 | 颜色 | 含义 |
-|:---|:---|:---|
-| `p2p-A` | 🟢 绿底 | P2P 直连（数据面已验证） |
-| `p2p-avail-A` | 🟡 黄底虚线 | P2PAvailable 中间态（握手成功，数据面未验证） |
-| `TURN-A` | 🔵 蓝底 | TURN 中继 |
-| `ws-A` | 🟡 黄底 | WS 中继（最后兜底） |
+| 徽章 | 颜色 | 含义 | 延迟 |
+|:---|:---|:---|:---|
+| `lan-A` | 🟢 深绿底亮绿字 | LAN 直连（同 WiFi 且子网重叠） | <5ms |
+| `p2p-A` | 🟢 绿底 | P2P 直连（数据面已验证） | 10-50ms |
+| `p2p-avail-A` | 🟡 黄底虚线 | P2PAvailable 中间态（握手成功，数据面未验证） | — |
+| `TURN-A` | 🔵 蓝底 | TURN 中继 | 30-100ms |
+| `ws-A` | 🟡 黄底 | WS 中继（最后兜底） | 100-300ms |
 
 ### 协议能力徽章（管理面板专属）
 
@@ -600,8 +778,8 @@ https://edge-signal.<子域>.workers.dev/admin?token=<ADMIN_TOKEN>
 |:---|:---|:---|
 | `/api/public/rooms` | 公开房间列表 | ❌ |
 | `/api/public/status/<room>` | 公开房间详情（脱敏） | ❌ |
-| `/api/public/turn-config` | TURN 配置（脱敏） | ❌ |
-| `/api/turn-credentials` | 生成 TURN 凭证 | ❌ |
+| `/api/public/turn-config` | TURN 配置（脱敏 + actualSource） | ❌ |
+| `/api/turn-credentials` | 生成 TURN 凭证（ttl clamp 到 7 天） | ❌ |
 | `/api/admin/rooms` | 管理房间列表 | ✅ |
 | `/api/admin/status/<room>` | 完整房间详情（含 features） | ✅ |
 | `/api/admin/nathole/<room>` | 打洞协调器状态 | ✅ |
@@ -653,7 +831,7 @@ edge-signal/
 │   └── nathole/
 │       ├── ladder.js         # FRP 行为阶梯
 │       ├── analyzer.js       # 策略记忆
-│       └── coordinator.js    # 打洞协调器
+│       └── coordinator.js    # 打洞协调器（pairPairs 修复）
 ├── public/
 │   ├── index.html            # 公开面板
 │   ├── app.js
@@ -661,7 +839,7 @@ edge-signal/
 │   ├── admin.js
 │   └── style.css
 ├── wrangler.toml
-├── package.json
+├── package.json              # wrangler ^3.114.0
 └── tsconfig.json
 ```
 
@@ -674,9 +852,10 @@ edge-signal/
 | 客户端连接 | 分配虚拟 IP，写入 storage |
 | 客户端断开 | 标记 `online: false`，保留 30 分钟 |
 | 30 分钟无活动 | 从 storage 中清理 |
-| 房间 1 小时无活动 | 从 registry 中清理 |
+| 房间完全空 | 5 分钟内主动清 registry（`alarm` 触发） |
+| 房间 1 小时无活动 | 从 registry 中清理（兜底） |
 | DO 被 evict | peers 从 storage 恢复，代号不变，features 保持 |
-| 客户端重连 | 复用旧记录，虚拟 IP 不变，清空该 peer 的打洞状态 |
+| 客户端重连 | 复用旧记录，虚拟 IP 不变，**清空 features/connections/lanEndpoints 等** |
 
 ---
 
@@ -700,58 +879,40 @@ edge-signal/
 
 | 机制 | 说明 |
 |:---|:---|
-| **梯级签名** | backoff 签名含梯级：`sender->receiver@rung`。梯级变化时立即重试，不受旧退避抑制 |
+| **pairPairs 修复** | 旧版 `paired` 是 peer 维度，N≥3 房间只有 A-B 配对。新版 `pairPairs` 是 pair 维度，每对只评估一次，删除所有 break |
+| **梯级签名** | backoff 签名含梯级：`sender->receiver@rung`。梯级变化时立即重试 |
 | **in-flight 去重** | 派发后写入 in-flight 表，10s 内不重复派发 |
 | **InProgress 刷新** | 客户端收到指令立即上报 InProgress，服务端刷新 in-flight 窗口 |
 | **首次交叉校验** | 首次成功时校验客户端自报的 `p2pStatus`；通过后 `everValidated=true` |
-| **成功退役** | 双方都不在 P2P 且超过 30s 宽限期时，清空成功记录，重新协调 |
+| **成功退役** | 双方都不在 P2P/LAN 且超过 30s 宽限期时，清空成功记录 |
+| **LAN 跳过 force_fallback** | 已是 LAN 的对跳过同 STUN IP 强制降级 |
 | **退避上限** | 60s（不是 300s，避免无意义的等待） |
 | **失败惩罚** | -2（与成功 +2 对称） |
 | **tie-break** | rung 0 > rung 4/5 > 其他 |
 
 ### 同 CGNAT 场景处理
 
-**关键问题**：两端 STUN 出口 IP 相同时（同 CGNAT 后面的两个映射），hairpin NAT 大部分运营商不支持，但仍有一小部分支持。需要区分两种情况：
+**关键问题**：两端 STUN 出口 IP 相同时，hairpin NAT 大部分运营商不支持，但仍有一小部分支持。
 
 | 场景 | 处理 |
 |:---|:---|
-| **同 STUN IP + 首次** | 允许一次 hairpin 尝试（部分 CGNAT 支持） |
-| **同 STUN IP + 已失败过** | 下发 `force_fallback` 强制降级到 TURN/WS |
-
-**实现逻辑**（`coordinator.js`）：
-
-```javascript
-const aIp = extractIP(a.pubSocket);
-const bIp = extractIP(b.pubSocket);
-if (aIp && bIp && aIp === bIp) {
-  const alreadyFailed =
-    (prevPunch && (prevPunch.aState === 2 || prevPunch.bState === 2)) ||
-    (this.failCounts.get(key) || 0) > 0;
-
-  if (alreadyFailed) {
-    // 下发 force_fallback
-    forceFallbacks.set(aKey, new Set([bKey]));
-    forceFallbacks.set(bKey, new Set([aKey]));
-    continue;
-  }
-  // 首次允许 hairpin
-}
-```
-
-**客户端行为**：三端收到 `force_fallback` 后立即 `ForceFallback` → TURN/WS，不再重复打洞。
+| **同 STUN IP + 首次** | 允许一次 hairpin 尝试 |
+| **同 STUN IP + 已失败过** | 下发 `force_fallback` 强制降级 |
+| **同 STUN IP + 已是 LAN** | **跳过**（`coordinator.js` 检查 `connections`） |
 
 ### 单向 P2P 的处理
 
-**问题**：A 的 probe 命中了 B，B 的 probe 因丢包没到 A。B 单方面报 `state=3` 会导致服务端认为 pair 已完成，A 永远收不到指令。
+**问题**：A 的 probe 命中 B，B 的 probe 因丢包没到 A。B 单方面报 `state=3` 会导致服务端认为 pair 已完成。
 
-**修复**：
-- **客户端侧**：`hasTrafficFromTarget(peerID, since)` 只检查目标 peer 的 `lastRecvAt`
-- **服务端侧**：`coordinate()` 的 `anySucceeded` 允许任一端成功即停止协调
-- **已 P2P 时**：客户端主动上报 `p2p_status=3`，让服务端 `punchState` 记录成功状态，停止重发指令
+**三层修复**：
+
+1. **客户端**：`hasTrafficFromTarget(peerID, since)` 只检查目标 peer 的 `lastRecvAt`
+2. **服务端**：`coordinate()` 的 `anySucceeded` 允许任一端成功即停止协调
+3. **TURN 帧降级**：TURN 收到对端帧时，`viaTURN=true + cur == ConnP2P/ConnLAN` → `ForceFallback("peer-via-turn")`
 
 ### 端口扫描范围
 
-**问题**：HardNAT 下两端上报的 `pubSocket` 端口是"发到 STUN 时"的端口，但两端 STUN 时刻不同——CGNAT 中间可能为其他连接分配了几十个端口，导致真实出口端口差距很大。
+**问题**：HardNAT 下两端上报的 `pubSocket` 端口是"发到 STUN 时"的端口，但两端 STUN 时刻不同。
 
 **解法**：
 
@@ -764,12 +925,12 @@ const natDiff = Math.abs(
 // 两端 pubSocket 的实际端口差
 const portGap = Math.abs(senderPort - receiverPort);
 
-// 有效范围 = max(natDiff, portGap) + 缓冲，上限 100
+// 有效范围 = max(natDiff, portGap) + 缓冲，上限 10000
 let halfWidth = Math.max(natDiff, portGap) + PORTS_RANGE_NARROW;
-if (halfWidth > 100) halfWidth = 100;
+if (halfWidth > 10000) halfWidth = 10000;
 ```
 
-**客户端侧分阶段扫描**：
+**客户端侧分阶段扫描**（`fullScanTiers = [3, 10, 20, 30, 60, 100, 300, 1000, 3000, 10000]`）：
 
 | 层 | 范围 | 本轮增量端口数 | 累计 |
 |:---|:---|:---|:---|
@@ -779,24 +940,34 @@ if (halfWidth > 100) halfWidth = 100;
 | 4 | ±30 | 20 | 61 |
 | 5 | ±60 | 60 | 121 |
 | 6 | ±100 | 80 | 201 |
+| 7 | ±300 | 400 | 601 |
+| 8 | ±1000 | 1400 | 2001 |
+| 9 | ±3000 | 4000 | 6001 |
+| 10 | ±10000 | 14000 | 20001 |
 
-**每层连发 3 次**（覆盖丢包），**层间 100ms**。
+**每层连发 3 次**（覆盖丢包），**层间 100ms**。当 `half > 500` 时每层只发 1 次（大范围扫描避免耗时过长）。
 
 - 端口差小（±3）：第 1 层命中，**~300ms**
 - 端口差中等（±20）：第 3 层命中，**~900ms**
 - 端口差大（±100）：第 6 层碰运气，**~1.8s**
-- 完全失败：跑满 6 层，**~1.8s** 后放弃，走 TURN
+- 端口差超大（±1000+）：第 8-10 层碰运气，**~2-3s**
+- 完全失败：跑满 10 层，**~3s** 后放弃，走 TURN
 
 ### 多端点扫描
 
 打洞指令同时下发四类候选：
 
 1. **`targetAssistedEndpoints`** — STUN 反射的多个公网映射
-2. **`targetLanEndpoints`** — 对端上报的 LAN 地址（同 WiFi 场景）
+2. **`targetLanEndpoints`** — 对端上报的 LAN 地址
 3. **`targetPubSocket`** — 对端上报的主公网地址
-4. **raddr** — 客户端观测到的对端源地址（本机侧）
+4. **raddr** — 客户端观测到的对端源地址
 
 客户端按 **LAN → assisted → raddr → pubSocket** 的顺序扫描，命中即停。
+
+**LAN 命中判定**：`hasTrafficFromTargetLAN(peerID, since)` 检查 `lastLANRecvAt`。
+**公网命中判定**：`hasTrafficFromTargetPublic(peerID, since)` 检查 `lastPublicRecvAt`。
+
+两者分开，`recordP2PSuccess` 只在公网命中时更新 `UDPAddr`，LAN 命中直接 `MarkLAN`。
 
 ### 调试端点
 
@@ -819,12 +990,12 @@ GET /api/admin/nathole/<room>?token=<ADMIN_TOKEN>
 |:---|:---|
 | 单房间设备数 | 取决于 `VIRTUAL_NETWORK`（默认 253） |
 | 推荐规模 | 10 台以内 |
-| 打洞协调复杂度 | O(N²) |
+| 打洞协调复杂度 | O(N²)，`runCoordination` 500ms 节流 |
 
 ### 免费版配额
 
 - **每天 10 万次请求**（Worker）
-- **DO Storage 每天 1000 次写操作**
+- **DO Storage 每天 1000 次写操作**（`reportToRegistry` 500ms 去抖）
 
 ### TURN 免费额度
 
@@ -856,6 +1027,15 @@ GET /api/admin/nathole/<room>?token=<ADMIN_TOKEN>
 
 **修复**：确认客户端和 `coordinator.js` 都是最新版。
 
+### Q: 两端状态不一致（A=lan，B=p2p）？
+
+**正常现象**——A 和 B 各自的 `relayMgr.states` 独立管理，可能不同步：
+
+- A 从 LAN 收到 B 的数据帧 → A 标 `ConnLAN`
+- B 从公网收到 A 的数据帧 → B 标 `ConnP2P`
+
+这是**设计如此**——每端只关心自己到对端的路径。
+
 ### Q: 两端状态不一致（A=p2p，B=TURN）？
 
 **单向打洞成功**——A 的 probe 命中 B，但 B 回发给 A 的 probe 丢包了。
@@ -863,7 +1043,7 @@ GET /api/admin/nathole/<room>?token=<ADMIN_TOKEN>
 **修复**：
 - 客户端用 `hasTrafficFromTarget` 替代 `hasTrafficAny`
 - 服务端用 `anySucceeded` 替代 `bothSucceeded`
-- 已 P2P 一端主动上报 `p2p_status=3`，让服务端记录成功
+- **TURN 帧降级**：B 通过 TURN 发给 A 的数据帧，A 收到后 `ForceFallback("peer-via-turn")` → A 也降级
 
 ### Q: 同 STUN 出口 IP 时疯狂打洞？
 
@@ -873,6 +1053,7 @@ GET /api/admin/nathole/<room>?token=<ADMIN_TOKEN>
 
 1. **首次遇到** → 允许一次 hairpin 尝试
 2. **已失败过** → 下发 `force_fallback` 强制降级
+3. **已是 LAN** → 跳过（`connections` 里 `lan` 值）
 
 **修复**：重新部署 `coordinator.js`。
 
@@ -908,13 +1089,13 @@ GET /api/admin/nathole/<room>?token=<ADMIN_TOKEN>
 **修复**：客户端在跳过指令时**主动上报** `p2p_status=3`：
 
 ```go
-if e.relayMgr.GetState(instr.TargetMac) == ConnP2P {
+if st == ConnLAN || st == ConnP2P {
     e.reportP2PStatus(instr.TargetMac, 3)
     return
 }
 ```
 
-**验证**：客户端日志 `[NAT-HOLE] 跳过指令 target=xxx（已 P2P），上报 p2p_status=3` **只出现一次**。
+**验证**：客户端日志 `[NAT-HOLE] 跳过指令 target=xxx（已 ConnP2P），上报 p2p_status=3` **只出现一次**。
 
 ### Q: TURN 服务器额度用尽？
 
@@ -927,8 +1108,9 @@ if e.relayMgr.GetState(instr.TargetMac) == ConnP2P {
 **打洞失败时每条数据都走 Worker 中继**，消耗很快。
 
 **修复**：
-1. 优先让 P2P 打通（hairpin）
-2. 配置 TURN，让流量走 TURN 而不是 Worker
+1. 优先让 LAN 打通（同 WiFi 场景）
+2. 优先让 P2P 打通（hairpin）
+3. 配置 TURN，让流量走 TURN 而不是 Worker
 
 ### Q: `natType` 显示不一致（一端 HardNAT、一端 EasyNAT）？
 
@@ -936,21 +1118,13 @@ if e.relayMgr.GetState(instr.TargetMac) == ConnP2P {
 
 **修复**：两端升级到同一版本客户端。
 
-### Q: 同一对设备一会走 P2P 一会走 TURN？
+### Q: 同一对设备一会走 LAN 一会走 TURN？
 
-**CGNAT 端口漂移**。客户端上报的 `pubSocket` 端口在打洞时已经过期。
+**网络切换**。客户端 WiFi1 → WiFi2，`ConnLAN → ConnUnknown`，重新打洞。
 
-**修复**：客户端**启用 UDP 保活**（每 5 秒刷新 STUN 映射）。检查客户端版本。
+**修复**：客户端已通过 `onLinkPropertiesChanged` 毫秒级感知，T+5~10s 收敛。
 
-**服务端对应处理**：`room.ts` 里只在**出口 IP 变化**时清空打洞状态，端口变化不清：
-
-```typescript
-const oldIp = this.extractIp(oldPubSocket);
-const newIp = this.extractIp(publicEndpoint);
-if (oldIp && newIp && oldIp !== newIp) {
-  this.coordinator.clearPairStateFor(from);
-}
-```
+**服务端对应处理**：`network_changed` 广播 + `clearPairStateFor`。
 
 ### Q: 房间清理不掉？
 
@@ -968,6 +1142,12 @@ curl -X POST "https://edge-signal.xxx.workers.dev/api/admin/clear?room=myroom&fo
 ```bash
 curl -X POST "https://edge-signal.xxx.workers.dev/api/admin/kick?room=myroom&cid=<ClientID>&token=<ADMIN_TOKEN>"
 ```
+
+### Q: 房间完全空后多久从面板消失？
+
+**5 分钟内**。`Room.alarm` 触发时 `peers.size === 0` 主动清 registry（`_clear-one`）。
+
+旧版要等 registry 1 小时无活动才清理，中间面板显示"0 个设备"。
 
 ### Q: Worker 日志怎么查看？
 
@@ -987,11 +1167,11 @@ https://dash.cloudflare.com/
 **关键日志**：
 
 ```
-[Room] p2p_metadata from xxx: natType=... pub=... multiExit=... features=["n2na","n2nw"]
+[Room] p2p_metadata from xxx: natType=... pub=... lan=... subnets=... features=["n2na","n2nw"]
 [NAT] xxx 同 STUN 出口 IP (120.239.134.13)，允许一次 hairpin 尝试
-[NAT] xxx 跳过：同 STUN 出口 IP 已尝试失败，标记强制降级
-[Room] → xxx 下发 force_fallback (1 peers)
-[Room] → xxx 下发 nat_hole_instruction role=1 target=...
+[NAT] xxx 同 STUN 出口 IP 已尝试失败，标记强制降级
+[Room] xxx 网络变化 (gateway:192.168.2.1)，清空打洞状态并广播
+[Room] → xxx 下发 nat_hole_instruction role=1 target=... lan=1
 ```
 
 ### Q: 怎么验证 TURN 配置生效？
@@ -1006,6 +1186,8 @@ curl -s "https://edge-signal.xxx.workers.dev/api/public/turn-config" | jq
 {
   "enabled": false,
   "source": "none",
+  "actualSource": "none",
+  "actualSourceAt": 0,
   "servers": [],
   "priority": []
 }
@@ -1017,6 +1199,8 @@ curl -s "https://edge-signal.xxx.workers.dev/api/public/turn-config" | jq
 {
   "enabled": true,
   "source": "custom",
+  "actualSource": "custom",
+  "actualSourceAt": 1729651200000,
   "servers": [{"url": "turn:111.171.194.230:3478"}],
   "priority": ["custom"]
 }
@@ -1026,24 +1210,33 @@ curl -s "https://edge-signal.xxx.workers.dev/api/public/turn-config" | jq
 
 **症状**：明明设置了 `TURN_KEY_ID` 和 `TURN_KEY_API_TOKEN`，但 `source` 一直是 `custom`。
 
-**原因**：旧版 `index.ts` 里 `generateCloudflareTURN` 有个 bug：
+**原因**：
 
-```typescript
-for (const ice of data.iceServers || []) {  // ← iceServers 是对象，不是数组
-```
-
-**`for...of` 对对象会抛 `TypeError`**，或者 `iceServers` 为 undefined 时循环不执行 → `servers` 为空 → fallback 到 `custom`。
+1. **旧版 bug**：`generateCloudflareTURN` 里 `for (const ice of data.iceServers || [])` 对对象会抛 `TypeError`
+2. **Cloudflare TURN API 慢**：请求 hold 30 秒后超时返回空
+3. **API Token 过期**
 
 **修复**：
 
-1. 用最新版 `index.ts`（本仓库 main 分支）替换
-2. `npx wrangler deploy`
-3. 重新验证：
+1. 用最新版 `index.ts`（已修 `iceServers` 解析 + 5 秒超时）
+2. 重新验证：
 
 ```bash
 curl -s "https://xxx.workers.dev/api/turn-credentials" | jq '.source'
 # 应该输出 "cloudflare"
 ```
+
+### Q: 管理面板 TURN 显示黄色 `(实际: custom)`？
+
+**配置层面是 Cloudflare，但最近一次实际成功用的是 custom**。
+
+**原因**：Cloudflare TURN API 调用失败（超时/HTTP 错误/空响应）→ fallback 到 custom。
+
+**修复**：
+
+1. 检查 `TURN_KEY_ID` / `TURN_KEY_API_TOKEN` 是否正确
+2. 查看 Worker 日志 `[TURN] Cloudflare API failed:` 的具体错误
+3. 如果 API Token 过期，重新创建 TURN Key
 
 ### Q: 客户端日志里 TURN relay 是 `172.16.x.x` 之类内网地址？
 
@@ -1117,14 +1310,48 @@ DO 被 evict 后，从 storage 恢复 → 代号保持。
 
 **不会**。
 
-**服务端按目标端协商**：
+服务端按目标端协商：
 
 - 发送方新、接收方新 → N2NA 二进制
-- 发送方新、接收方旧 → 自动解码转文本 `app_stream_data`
+- 发送方新、接收方旧（无 n2na） → 自动解码转文本 `app_stream_data`
+- 发送方新、接收方旧（无 n2nw） → **丢弃 + 警告**（旧客户端只懂裸 IPv4）
 - 发送方旧、接收方新 → 文本转发（新客户端兼容）
 - 双方都旧 → 文本
 
 **旧客户端完全无感知**，新客户端自动获得二进制优化。
+
+### Q: WiFi1 → WiFi2 切换后 30-60 秒才恢复？
+
+**客户端是旧版**（没有 `onLinkPropertiesChanged` 网关检测）。
+
+**原因**：`onAvailable` 只在网络类型变化时触发（WiFi ↔ Cellular），WiFi 间切换 `type` 都是 `"wifi"` → 不触发 → 状态机停留在 `ConnLAN` → 持续丢包。
+
+**修复**：升级客户端到 v2.0+（含 `onLinkPropertiesChanged` 网关检测 + `OnNetworkChanged` 状态重置）。
+
+**验证**：客户端日志 `[Network] 网关变化: 192.168.1.1 → 192.168.2.1，通知 Go 层`。
+
+### Q: 双 WAN / 多 AP 上行场景，同 LAN 却走 TURN/WS？
+
+**服务端 `shouldShareLan` 只看公网 IP**（旧版）。
+
+**原因**：A 走 WAN1（1.1.1.1），B 走 WAN2（2.2.2.2）→ 公网 IP 不同 → `shouldShareLan` 返回 false → `lanEndpoints` 被过滤 → 客户端匹配不上 LAN 包 → 打洞失败。
+
+**修复**：
+
+1. 服务端 `shouldShareLan` 优先看 `lanSubnets` 重叠（v2.0+）
+2. 客户端 `ensureTargetPeer` 从 `nat_hole_instruction` 补充 `LanEndpoints`
+
+**验证**：服务端日志 `[NAT] pair-xxx 生成指令... lan=1/1`，面板 `lan-XX`。
+
+### Q: 快速点 停止→启动，SOCKS5 端口冲突？
+
+**症状**：用户看到"启动成功"，但 `curl --socks5 127.0.0.1:1080` 连不上。
+
+**原因**：`N2nController.stop()` 是异步的，`Client.Stop` → `Client.Start` → `NewSocks5Server` → `net.Listen` → `EADDRINUSE`（旧的 SOCKS5 没关）。旧版 `Serve()` 里静默 return，上层不知道端口冲突。
+
+**修复**：升级客户端到 v2.0+（`Socks5Server.Listen()` 失败返回 error，UI 显示"启动失败: SOCKS5 监听 ... 失败"）。
+
+**验证**：通知栏显示 `启动失败: SOCKS5 监听 127.0.0.1:1080 失败: address already in use`，3 秒后自动停止。
 
 ---
 
@@ -1146,6 +1373,7 @@ DO 被 evict 后，从 storage 恢复 → 代号保持。
 | **被动 UDP** | ✅ | ✅ | ✅ |
 | **被动 ICMP** | ✅ | ✅ | ✅ |
 | 上报 `lanEndpoints` | ✅ | ✅ | ✅ |
+| 上报 `lanSubnets` | ✅ | ✅ | ✅ |
 | 上报 `assistedEndpoints` | ✅ | ✅ | ✅ |
 | 上报 `features` | ✅ `["n2na","n2nw"]` | ✅ `["n2na","n2nw"]` | ✅ `["n2na","n2nw"]` |
 
@@ -1188,6 +1416,59 @@ DO 被 evict 后，从 storage 恢复 → 代号保持。
 
 ---
 
+## 🔄 版本历史
+
+### v2.0（当前）—— LAN / 网络切换 / 状态机统一
+
+**新增功能**：
+- `ConnLAN` 独立状态（LAN 和公网 P2P 分开）
+- `lanSubnets` 上报 + `cidrOverlaps` 重叠判定（双 WAN / 多 AP 上行走 LAN）
+- `onLinkPropertiesChanged` 网关检测（WiFi1 → WiFi2 也触发 `OnNetworkChanged`）
+- `OnNetworkChanged` 状态重置（清 P2P/LAN/UDPAddr，保留 TURN/WS）
+- `network_changed` 广播 + `peer_network_changed` 处理
+- `actualSource` 追踪（TURN 配置 vs 实际不一致时黄色提示）
+- `alarm` 房间空时主动清 registry
+
+**修复**：
+- `pairPairs` 替代 `paired`（N≥3 房间所有 pair 都评估）
+- `isRealData` 加 `viaTURN` 分支（TURN 收数据误判 P2P → 持续丢包）
+- TURN 帧 `peer-via-turn` / WS 帧 `peer-via-ws` 降级（单向 P2P 自动降级）
+- `MarkFallback` 删 10s 保护（`ConnUnknown` 卡住）
+- `sendP2PIdleKeepalive` 30s 只对 `ConnP2P` 生效（`ConnP2PAvailable` 交给 60s 超时）
+- `SendToPeer` 的 `ConnLAN` 失败降级到 `ConnP2PAvailable`（不是 `ConnP2P`）
+- `findPeerIDByAddr` 唯一命中（多 peer 同 CGNAT 串包）
+- `registeredAt` 兜底（初始 LAN peer 永不切公网）
+- `ensureTargetPeer` 不覆盖实时 `UDPAddr` + 补充 `LanEndpoints`
+- 重连重置 `features` / `connections` / `lanEndpoints`（旧客户端能力误判）
+- `p2p_metadata` 双读 `publicEndpoint` / `pubSocket`（旧协议兼容）
+- N2NW 目标端 `n2nw` 检查（旧客户端静默丢包）
+- 裸 IPv4 源 IP 校验（防 VIP 欺骗）
+- `app_stream_data` `to` 必填 + 64KB 限制（防广播 / 大包）
+- TURN API 5s 超时 + TTL clamp（Worker hold / 恶意请求）
+- `reportToRegistry` 500ms 去抖（DO Storage 配额）
+- `runCoordination` 500ms 节流（O(N²) CPU）
+- `_clear` 清 `pendingSaveTimer`（空状态写回）
+- `registry._clear-all` 只删 `rooms` key（不用 `deleteAll`）
+- `force_fallback` 在 LAN/P2P 时上报 `p2p_status=3`（服务端状态同步）
+- `peerExists` 大小写不敏感
+- `allocID` 加时间戳（客户端崩溃重启串话）
+- `recordP2PSuccess` 补 `registeredAt` + LAN 命中 MarkLAN
+- `MarkP2PAvailable` 上报 `status=2`（服务端持续重发指令）
+- SOCKS5 `Listen()` 拆出（端口冲突不静默失败）
+- `onLinkPropertiesChanged` 跳过 `TRANSPORT_VPN`（避免循环）
+- Kotlin `refreshPeers` 比较 code 序列（顺序变化时全量重建）
+- Kotlin `break continue in inline lambdas` 编译错误
+
+### v1.0 —— 基础四级降级
+
+- 四级降级（LAN → P2P → TURN → WS）
+- FRP 行为阶梯
+- 协议能力协商（`features`）
+- 双面板
+- TURN 凭证分发（Cloudflare + 自定义）
+
+---
+
 ## 📄 License
 
 MIT
@@ -1197,3 +1478,6 @@ MIT
 - [n2n-go-client](https://github.com/goyo123321/n2n-go-client) — 跨平台客户端（桌面 / 路由器 / 服务器）
 - [n2n-termux](https://github.com/goyo123321/n2n-termux) — Android Termux SOCKS5 客户端（双向互通）
 - [n2n-android](https://github.com/goyo123321/n2n-android) — Android APK 客户端（VpnService）
+- [pion/stun](https://github.com/pion/stun) — STUN 协议
+- [gorilla/websocket](https://github.com/gorilla/websocket) — WebSocket
+- [gomobile](https://pkg.go.dev/golang.org/x/mobile) — Go/Kotlin 桥接
