@@ -74,21 +74,9 @@ function isIPv6Sock(sock) {
   return colonCount > 1;
 }
 
-// ============================================================
 // shouldRetireSuccess 成功记录退役判定
-// ============================================================
 //
 // 关键修复：单向 P2P 也退役
-//
-// 场景：A 降级到 Unknown（清空连接），B 仍是 p2p。
-//   aToB = undefined (A 没有 B)
-//   bToA = "p2p" (B 认为 A 是 p2p)
-//
-//   旧逻辑：要求双方都不在 p2p/lan 才退役 → 单向 p2p 永远不退役
-//     → punchState 保留旧的"成功"状态 → anySucceeded=true
-//     → 跳过所有打洞指令 → 服务端不下发 nat_hole_instruction
-//
-//   新逻辑：单向 p2p 也退役 → 清空 punchState → 重新协调
 function shouldRetireSuccess(prev, a, b, now) {
   if (!prev) return false;
   if (prev.aState !== 3 && prev.bState !== 3) return false;
@@ -115,12 +103,10 @@ function shouldRetireSuccess(prev, a, b, now) {
   const aInP2P = aToB === CONN_P2P || aToB === CONN_LAN;
   const bInP2P = bToA === CONN_P2P || bToA === CONN_LAN;
 
-  // 双向都不在 p2p/lan → 完全断开，退役
   if (!aInP2P && !bInP2P) {
     return true;
   }
 
-  // ★ 修复：单向 p2p/lan → 也退役，重新协调打洞
   if (aInP2P !== bInP2P) {
     console.log(
       `[NAT] 单向 p2p 检测: aToB=${aToB || "?"} bToA=${bToA || "?"} → 退役重新协调`
@@ -128,7 +114,6 @@ function shouldRetireSuccess(prev, a, b, now) {
     return true;
   }
 
-  // 双方都是 p2p/lan → 正常，不退役
   return false;
 }
 
@@ -174,6 +159,15 @@ export class NatHoleCoordinator {
     return this.senderDelayMs;
   }
 
+  // clearPairStateFor 清理与某个 peer 相关的所有打洞状态。
+  //
+  // ★ 修复：保留 lastDispatchedRung
+  //
+  //   场景：反复切换网络 → network_changed → clearPairStateFor
+  //   旧版：删 lastDispatchedRung + analyzer.forgetMAC → 下次从 rung 0 开始
+  //        累积的打洞策略经验全丢
+  //   新版：保留 lastDispatchedRung，NAT 类型没变的情况下 rung 推荐仍然有效
+  //        analyzer.forgetMAC 仍清（历史 score 需要基于新网络重新学习）
   clearPairStateFor(mac) {
     if (!mac) return;
     const needle = String(mac).toLowerCase();
@@ -184,8 +178,9 @@ export class NatHoleCoordinator {
     for (const k of [...this.backoff.keys()]) if (touches(k)) this.backoff.delete(k);
     for (const k of [...this.punchState.keys()]) if (touches(k)) this.punchState.delete(k);
     for (const k of [...this.failCounts.keys()]) if (touches(k)) this.failCounts.delete(k);
-    for (const k of [...this.lastDispatchedRung.keys()]) if (touches(k)) this.lastDispatchedRung.delete(k);
     for (const k of [...this.inFlight.keys()]) if (touches(k)) this.inFlight.delete(k);
+    // ★ 保留 lastDispatchedRung：网络变了但 NAT 策略没变
+    // for (const k of [...this.lastDispatchedRung.keys()]) if (touches(k)) this.lastDispatchedRung.delete(k);
     this.analyzer.forgetMAC(mac);
   }
 
