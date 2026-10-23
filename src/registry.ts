@@ -61,8 +61,7 @@ export class Registry extends DurableObject {
     if (url.pathname === "/_clear-all" && request.method === "POST") {
       const rooms = (await this.ctx.storage.get<Record<string, any>>("rooms")) || {};
       const count = Object.keys(rooms).length;
-      // ★ 修复：只删 "rooms" key，不用 deleteAll()
-      //   避免误删未来新增的其他 key（如全局配置缓存）
+      // 只删 "rooms" key，不用 deleteAll()
       await this.ctx.storage.delete("rooms");
       console.log(`[Registry] cleared ALL rooms (${count} deleted)`);
       return new Response(JSON.stringify({ ok: true, count }), {
