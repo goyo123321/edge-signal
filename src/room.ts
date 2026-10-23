@@ -44,10 +44,7 @@ const OFFLINE_TTL_MS = 30 * 60 * 1000;
 const SAVE_THROTTLE_MS = 3 * 1000;
 const SERVER_PING_INTERVAL_MS = 30 * 1000;
 const PEER_STALE_MS = 90 * 1000;
-
-// ★ runCoordination 500ms 节流（避免 O(N²) 高频执行）
 const COORDINATE_THROTTLE_MS = 500;
-// ★ reportToRegistry force=true 时 500ms 去抖（避免频繁重连打爆 DO Storage 写配额）
 const REGISTRY_DEBOUNCE_MS = 500;
 
 const DEFAULT_VIRTUAL_NETWORK = "10.64.0.0/24";
@@ -56,7 +53,6 @@ const MAX_FEATURES = 16;
 const MAX_FEATURE_LEN = 32;
 const MAX_PEER_ID_LEN = 255;
 const MAX_LAN_SUBNETS = 8;
-// ★ app_stream_data 64KB 大小限制
 const MAX_APP_STREAM_DATA_LEN = 65536;
 
 interface ParsedCIDR {
@@ -116,29 +112,53 @@ function cidrOverlaps(a: string, b: string): boolean {
 }
 
 // ============================================================
-// ★ shouldShareLan：优先看 lanSubnets 重叠（不依赖公网 IP）
+// shouldShareLan：优先看 lanSubnets 重叠（不依赖公网 IP）
 // ============================================================
 //
-// 场景：双 WAN / 多 AP 上行时，两端物理同 LAN 但公网 IP 不同。
-//   旧版 aIp !== bIp 直接 return false → LanEndpoints 被过滤
-//   → 客户端 notePeerCommon 匹配不上 LAN 包 → 打洞失败。
-//
-// 兜底：旧客户端不上报 lanSubnets，退回「公网 IP 相同」判断。
+// 场景 1：双 WAN / 多 AP 上行（两端物理同 LAN 但公网 IP 不同）
+// 场景 2：客户端某次 p2p_metadata 上报 lanSubnets: []（临时探测失败）
+//        但 lanEndpoints 仍是上次的有效值
+// 兜底：都没端点，退回「公网 IP 相同」
 function shouldShareLan(a: PeerRecord, b: PeerRecord): boolean {
-  const aSubnets = a.lanSubnets || [];
-  const bSubnets = b.lanSubnets || [];
+  let aSubnets = a.lanSubnets || [];
+  let bSubnets = b.lanSubnets || [];
+
+  // ★ 修复：lanSubnets 为空但 lanEndpoints 非空时，从端点推 /24 兜底
+  if (aSubnets.length === 0 && a.lanEndpoints.length > 0) {
+    const inferred: string[] = [];
+    for (const ep of a.lanEndpoints) {
+      const host = ep.split(":")[0];
+      const parts = host.split(".");
+      if (parts.length === 4) {
+        const cidr = `${parts[0]}.${parts[1]}.${parts[2]}.0/24`;
+        if (parseCIDR(cidr)) inferred.push(cidr);
+      }
+    }
+    aSubnets = inferred;
+  }
+  if (bSubnets.length === 0 && b.lanEndpoints.length > 0) {
+    const inferred: string[] = [];
+    for (const ep of b.lanEndpoints) {
+      const host = ep.split(":")[0];
+      const parts = host.split(".");
+      if (parts.length === 4) {
+        const cidr = `${parts[0]}.${parts[1]}.${parts[2]}.0/24`;
+        if (parseCIDR(cidr)) inferred.push(cidr);
+      }
+    }
+    bSubnets = inferred;
+  }
 
   if (aSubnets.length > 0 && bSubnets.length > 0) {
     for (const sa of aSubnets) {
       for (const sb of bSubnets) {
-        if (cidrOverlaps(sa, sb)) {
-          return true;
-        }
+        if (cidrOverlaps(sa, sb)) return true;
       }
     }
     return false;
   }
 
+  // 兜底：都没端点，退回「公网 IP 相同」
   const aIp = a._publicIp || "";
   const bIp = b._publicIp || "";
   return !!(aIp && bIp && aIp === bIp);
@@ -216,9 +236,7 @@ export class Room extends DurableObject {
 
   private lastReport = 0;
   private lastRegistryRefresh = 0;
-  // ★ reportToRegistry force 去抖
   private lastForceReportAt = 0;
-  // ★ runCoordination 节流
   private lastCoordAt = 0;
 
   private coordinator: NatHoleCoordinator;
@@ -521,7 +539,6 @@ export class Room extends DurableObject {
     const url = new URL(request.url);
 
     if (url.pathname === "/_clear") {
-      // ★ 清 pendingSaveTimer，避免 clear 后又把空状态写回
       if (this.pendingSaveTimer !== null) {
         clearTimeout(this.pendingSaveTimer);
         this.pendingSaveTimer = null;
@@ -640,7 +657,7 @@ export class Room extends DurableObject {
       peer.disconnectedAt = undefined;
       peer._publicIp = publicIp;
 
-      // ★ 重连时重置，等客户端下次 p2p_metadata 重报
+      // 重连时重置，等客户端下次 p2p_metadata 重报
       peer.features = [];
       peer.connections = new Map();
       peer.lanEndpoints = [];
@@ -763,8 +780,45 @@ export class Room extends DurableObject {
         try { ws.send(JSON.stringify({ type: "pong", from, t: msg.ts || Date.now() })); } catch {}
         return;
 
+      // ============================================================
+      // ★ 修复：connection_status 双向状态同步检测
+      // ============================================================
+      //
+      // 场景：A 走 TURN，B 走 P2P（单向 P2P）。
+      //   A 的 TURN 为 B 开了 Permission，但 B 的 TURN 没为 A 开 Permission
+      //   → TURN 服务器拒绝转发 A 的包给 B
+      //   → B 收不到 A 的 TURN 帧 → 无法触发 peer-via-turn 降级
+      //   → 两端都不通
+      // 修复：服务端检测到 A→B=turn 但 B→A=p2p 时，
+      //   下发 force_fallback 让 B 也降级到 TURN
       case "connection_status":
-        if (peer) peer.connections = new Map(Object.entries(msg.payload?.connections || {})) as Map<string, ConnType>;
+        if (peer) {
+          peer.connections = new Map(Object.entries(msg.payload?.connections || {})) as Map<string, ConnType>;
+
+          for (const [otherId, myState] of peer.connections) {
+            const other = this.peers.get(otherId);
+            if (!other || !other.online) continue;
+            const otherState = other.connections.get(from);
+            if (myState === "turn" && otherState === "p2p") {
+              const targetWs = this.sessions.get(otherId);
+              if (targetWs) {
+                try {
+                  targetWs.send(JSON.stringify({
+                    type: "force_fallback",
+                    from: "server",
+                    payload: { peers: [from], reason: "peer-uses-turn" },
+                  }));
+                  console.log(
+                    `[Room] 单向状态不一致: ${from}→${otherId}=turn, ${otherId}→${from}=p2p，` +
+                    `强制 ${otherId} 也降级到 TURN`
+                  );
+                } catch (e) {
+                  console.error(`[Room] force_fallback 发送失败:`, e);
+                }
+              }
+            }
+          }
+        }
         return;
 
       case "p2p_metadata":
@@ -806,7 +860,6 @@ export class Room extends DurableObject {
           if (Array.isArray(p.lanSubnets)) {
             peer.lanSubnets = sanitizeLanSubnets(p.lanSubnets);
           } else {
-            // 兼容旧客户端：从 lanEndpoints 推 /24
             peer.lanSubnets = [];
             for (const ep of peer.lanEndpoints) {
               const host = ep.split(":")[0];
@@ -823,7 +876,6 @@ export class Room extends DurableObject {
           if (typeof p.p2pEndpoint === "string" && p.p2pEndpoint) peer.p2pEndpoint = p.p2pEndpoint;
 
           let pubChanged = false;
-          // ★ 同时识别 publicEndpoint 和 pubSocket（旧协议）
           const publicEndpoint =
             (typeof p.publicEndpoint === "string" && p.publicEndpoint) ||
             (typeof p.pubSocket === "string" && p.pubSocket) ||
@@ -920,7 +972,6 @@ export class Room extends DurableObject {
         return;
       }
 
-      // ★ 新增：客户端网络变化（WiFi ↔ Cellular / WiFi1 → WiFi2）
       case "network_changed": {
         if (!peer) return;
         const reason = (msg.reason as string) || "unknown";
@@ -947,14 +998,12 @@ export class Room extends DurableObject {
         }
 
         this.saveStateThrottled();
-        // 重置节流，确保立即协调
         this.lastCoordAt = 0;
         await this.runCoordination();
         return;
       }
 
       default: {
-        // ★ 已知 app_stream_* 必须带 to 且校验长度
         const knownStreamTypes = new Set([
           "app_stream_data", "app_stream_ack", "app_stream_close",
           "app_stream_open", "app_stream_open_ack",
@@ -1033,7 +1082,7 @@ export class Room extends DurableObject {
     const fromPeer = this.peers.get(from);
     if (fromPeer) fromPeer.lastSeen = Date.now();
 
-    // ============ 1. N2NW 帧 ============
+    // 1. N2NW 帧
     if (
       data.length >= 6 &&
       data[0] === 0x4E && data[1] === 0x32 &&
@@ -1050,7 +1099,6 @@ export class Room extends DurableObject {
       const targetWs = this.sessions.get(targetClientId);
       if (!targetWs) return;
 
-      // ★ 检查目标端是否支持 n2nw
       const toPeer = this.peers.get(targetClientId);
       if (!peerHasFeature(toPeer, "n2nw")) {
         console.warn(
@@ -1093,7 +1141,7 @@ export class Room extends DurableObject {
       return;
     }
 
-    // ============ 2. N2NA 帧 ============
+    // 2. N2NA 帧
     if (
       data.length >= 7 &&
       data[0] === 0x4E && data[1] === 0x32 &&
@@ -1103,14 +1151,13 @@ export class Room extends DurableObject {
       return;
     }
 
-    // ============ 3. 裸 IPv4 包 ============
+    // 3. 裸 IPv4 包
     if (data.length < 20) return;
     if (data[0] >> 4 !== 4) return;
 
     const srcIP = `${data[12]}.${data[13]}.${data[14]}.${data[15]}`;
     const dstIP = `${data[16]}.${data[17]}.${data[18]}.${data[19]}`;
 
-    // ★ 源 IP 校验（防 VIP 欺骗）
     if (fromPeer && fromPeer.virtualIp && srcIP !== fromPeer.virtualIp) {
       console.warn(
         `[Room] 裸 IPv4 源 IP 欺骗: ${from} 声称 ${srcIP}，实际 VIP ${fromPeer.virtualIp}`
@@ -1258,13 +1305,6 @@ export class Room extends DurableObject {
     await this.webSocketClose(ws);
   }
 
-  // ============================================================
-  // ★ runCoordination 500ms 节流
-  // ============================================================
-  //
-  // p2p_metadata / p2p_state_info 每次进入都调 coordinate()，coordinate 是 O(N²)。
-  // 客户端 5 秒一次 metadata，N=10 房间 → 每 5 秒 45 对评估。
-  // 500ms 节流显著降低 Worker CPU 消耗。
   private async runCoordination(): Promise<void> {
     const now = Date.now();
     if (now - this.lastCoordAt < COORDINATE_THROTTLE_MS) return;
@@ -1377,7 +1417,6 @@ export class Room extends DurableObject {
         if (targetCode) connectionsByCode[targetCode] = type;
       }
 
-      // ★ 加 lanCount
       let p2pCount = 0, relayCount = 0, turnCount = 0, availCount = 0, lanCount = 0;
       for (const t of p.connections.values()) {
         if (t === "lan") lanCount++;
@@ -1487,12 +1526,6 @@ export class Room extends DurableObject {
     this.saveAlarmScheduled = true;
   }
 
-  // ============================================================
-  // ★ alarm：房间完全空时主动清 registry
-  // ============================================================
-  //
-  // 旧版：等 registry 1 小时无活动才清理 → 中间面板显示"0 个设备"。
-  // 新版：alarm（5 分钟）触发时若 peers.size === 0 立即清掉。
   async alarm(): Promise<void> {
     try {
       await this.ensureLoaded();
@@ -1512,7 +1545,6 @@ export class Room extends DurableObject {
       await this.setupSaveAlarm();
       await this.saveStateNow();
 
-      // ★ 房间完全空时主动清 registry
       if (this.peers.size === 0 && this.community) {
         try {
           const env = this.env as any;
@@ -1599,13 +1631,6 @@ export class Room extends DurableObject {
     );
   }
 
-  // ============================================================
-  // ★ reportToRegistry：force=true 时 500ms 去抖
-  // ============================================================
-  //
-  // 10 设备频繁重连时，每次连接/断开都触发 reportToRegistry(true)。
-  // 每次 DO Storage 写 +1，10 设备频繁重连会打爆免费配额 1000 次/天。
-  // 500ms 去抖合并同一时刻的多次 close/error。
   private async reportToRegistry(force = false): Promise<void> {
     const now = Date.now();
     if (force) {
