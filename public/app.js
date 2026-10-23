@@ -52,20 +52,22 @@ function natBadge(natType) {
   return `<span class="badge unknown">${esc(natType)}</span>`;
 }
 
-// ★ 已更新：识别 p2p-avail
+// ★ 加 lanList
 function formatConnStatus(connections) {
   if (!connections || Object.keys(connections).length === 0) {
     return `<span style="color:#64748b">--</span>`;
   }
-  const p2pList = [], turnList = [], relayList = [], availList = [];
+  const p2pList = [], turnList = [], relayList = [], availList = [], lanList = [];
   for (const [code, type] of Object.entries(connections)) {
-    if (type === "p2p") p2pList.push(code);
+    if (type === "lan") lanList.push(code);
+    else if (type === "p2p") p2pList.push(code);
     else if (type === "p2p-avail") availList.push(code);
     else if (type === "turn") turnList.push(code);
     else if (type === "relay") relayList.push(code);
   }
-  p2pList.sort(); availList.sort(); turnList.sort(); relayList.sort();
+  p2pList.sort(); availList.sort(); turnList.sort(); relayList.sort(); lanList.sort();
   const parts = [];
+  if (lanList.length > 0) parts.push(`<span class="badge lan" title="LAN 直连（同 WiFi）">lan-${lanList.join("")}</span>`);
   if (p2pList.length > 0) parts.push(`<span class="badge p2p">p2p-${p2pList.join("")}</span>`);
   if (availList.length > 0) parts.push(`<span class="badge p2p-avail" title="打洞握手成功，数据面未验证，实际走中继">p2p-avail-${availList.join("")}</span>`);
   if (turnList.length > 0) parts.push(`<span class="badge turn">TURN-${turnList.join("")}</span>`);
