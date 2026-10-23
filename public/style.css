@@ -55,14 +55,14 @@ tbody tr:hover { background: #263449; }
 .badge.online { background: #065f46; color: #6ee7b7; }
 .badge.turn { background: #1e40af; color: #93c5fd; }
 
-/* ★ LAN 直连徽章 */
+/* LAN 直连徽章（深绿底亮绿字） */
 .badge.lan {
   background: #065f46;
   color: #34d399;
   border: 1px solid #10b981;
 }
 
-/* 打洞握手成功但数据面未验证（实际走中继） */
+/* 打洞握手成功但数据面未验证 */
 .badge.p2p-avail {
   background: #78350f;
   color: #fbbf24;
