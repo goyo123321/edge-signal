@@ -34,6 +34,14 @@ interface PeerRecord {
   _publicIp?: string;
   multiExit?: boolean;
   features: string[];
+
+  // ★ 新增：网络变化去抖 + 冷却期
+  //   lastNetworkChangedAt：最近一次处理 network_changed 的时间（1.5s 去抖用）
+  //   networkChangedCooldownUntil：冷却期截止时间。期间 runCoordination 不把
+  //     该 peer 纳入协调，等 STUN 拿新地址后 p2p_metadata 清掉冷却期再恢复。
+  //     冷却期 10s 兜底，客户端 STUN 5s 周期内通常 1~2s 就能清掉。
+  lastNetworkChangedAt?: number;
+  networkChangedCooldownUntil?: number;
 }
 
 const STAGGER_FALLBACK_SAVE_MS = 300 * 1000;
@@ -46,6 +54,10 @@ const SERVER_PING_INTERVAL_MS = 30 * 1000;
 const PEER_STALE_MS = 90 * 1000;
 const COORDINATE_THROTTLE_MS = 500;
 const REGISTRY_DEBOUNCE_MS = 500;
+
+// ★ 新增：network_changed 去抖 + 冷却期
+const NETWORK_CHANGED_DEBOUNCE_MS = 1500;
+const NETWORK_CHANGED_COOLDOWN_MS = 10000;
 
 const DEFAULT_VIRTUAL_NETWORK = "10.64.0.0/24";
 
@@ -461,6 +473,9 @@ export class Room extends DurableObject {
             _publicIp: p._publicIp || "",
             multiExit: !!p.multiExit,
             features: sanitizeFeatures(p.features),
+            // ★ 恢复 lastNetworkChangedAt（冷却期是相对当前时间，不恢复）
+            lastNetworkChangedAt: p.lastNetworkChangedAt || 0,
+            networkChangedCooldownUntil: 0,
           });
 
           if (p.virtualIp && p.online && this.isInVirtualNetwork(p.virtualIp)) {
@@ -510,6 +525,8 @@ export class Room extends DurableObject {
           relayPacketsOut: p.relayPacketsOut, _publicIp: p._publicIp,
           multiExit: p.multiExit,
           features: p.features || [],
+          // ★ 持久化 lastNetworkChangedAt
+          lastNetworkChangedAt: p.lastNetworkChangedAt || 0,
         };
       }
       await this.ctx.storage.put(PEERS_STORAGE_KEY, peersData);
@@ -668,6 +685,8 @@ export class Room extends DurableObject {
       peer.pubSocket = "";
       peer.publicEndpoint = "";
       peer.p2pEndpoint = "";
+      // ★ 重连清冷却期
+      peer.networkChangedCooldownUntil = 0;
 
       if (peer.virtualIp && !this.isInVirtualNetwork(peer.virtualIp)) {
         const oldVip = peer.virtualIp;
@@ -711,6 +730,8 @@ export class Room extends DurableObject {
         _publicIp: publicIp,
         multiExit: false,
         features: [],
+        lastNetworkChangedAt: 0,
+        networkChangedCooldownUntil: 0,
       };
       this.peers.set(clientId, peer);
     }
@@ -781,18 +802,6 @@ export class Room extends DurableObject {
         try { ws.send(JSON.stringify({ type: "pong", from, t: msg.ts || Date.now() })); } catch {}
         return;
 
-      // ============================================================
-      // ★ 修复：connection_status 更新后触发 runCoordination
-      // ============================================================
-      //
-      // 旧版：只更新 peer.connections，不触发协调
-      //   → 状态变化后不重新下发打洞指令
-      //   → 单向 P2P 时服务端不下发 nat_hole_instruction
-      //
-      // 新版：
-      //   1. 双向状态不一致 → 下发 force_fallback
-      //   2. 单向 P2P（A=undefined, B=p2p）→ 清空 punchState
-      //   3. 触发 runCoordination（500ms 节流）
       case "connection_status":
         if (peer) {
           peer.connections = new Map(Object.entries(msg.payload?.connections || {})) as Map<string, ConnType>;
@@ -822,8 +831,7 @@ export class Room extends DurableObject {
               }
             }
 
-            // ★ 新增：单向 P2P（A 已清空连接，B 还是 p2p）→ 清空 punchState
-            //   → 触发协调后重新下发打洞指令
+            // 单向 P2P（A 已清空连接，B 还是 p2p）→ 清空 punchState
             const otherIsP2P = otherState === "p2p" || otherState === "lan";
             const selfIsGone = myState === undefined || myState === "unknown";
             if (selfIsGone && otherIsP2P) {
@@ -841,7 +849,6 @@ export class Room extends DurableObject {
             }
           }
         }
-        // ★ 修复：触发协调
         await this.runCoordination();
         return;
 
@@ -917,9 +924,16 @@ export class Room extends DurableObject {
             if (oldPubSocket !== publicEndpoint) pubChanged = true;
             peer.publicEndpoint = publicEndpoint;
             peer.pubSocket = publicEndpoint;
+
+            // ★ 新增：有效公网地址上报时清冷却期
+            //   客户端换网络后 STUN 拿到新地址就会上报，此时不需要继续冷却
+            if (peer.networkChangedCooldownUntil && peer.networkChangedCooldownUntil > 0) {
+              console.log(
+                `[Room] ${from} 冷却期结束（新地址已上报），恢复协调`
+              );
+              peer.networkChangedCooldownUntil = 0;
+            }
           } else {
-            // ★ 修复：p2p_metadata 的空 publicEndpoint 表示客户端地址无效
-            //   无条件清空（不依赖 network_changed 是否到达）
             if (peer.pubSocket !== "" || peer.publicEndpoint !== "") {
               console.log(
                 `[Room] ${from} p2p_metadata 空 publicEndpoint，清空 peer.pubSocket (old=${peer.pubSocket})`
@@ -1005,9 +1019,22 @@ export class Room extends DurableObject {
         return;
       }
 
+      // ★ 关键修改：network_changed 加 1.5s 去抖 + 设 10s 兜底冷却期
       case "network_changed": {
         if (!peer) return;
         const reason = (msg.reason as string) || "unknown";
+        const now = Date.now();
+
+        // 1.5 秒去抖（客户端已去抖 + 合并延迟，这是双保险）
+        if (peer.lastNetworkChangedAt && now - peer.lastNetworkChangedAt < NETWORK_CHANGED_DEBOUNCE_MS) {
+          console.log(
+            `[Room] ${from} network_changed 去抖 (${reason})，` +
+            `${now - peer.lastNetworkChangedAt}ms < ${NETWORK_CHANGED_DEBOUNCE_MS}ms`
+          );
+          return;
+        }
+        peer.lastNetworkChangedAt = now;
+
         console.log(`[Room] ${from} 网络变化 (${reason})，清空打洞状态并广播`);
 
         this.coordinator.clearPairStateFor(from);
@@ -1018,6 +1045,15 @@ export class Room extends DurableObject {
         peer.observedRaddr = "";
         peer.lanSubnets = [];
         peer._publicIp = "";
+
+        // ★ 新增：设 10s 兜底冷却期
+        //   客户端 STUN 拿到新地址后会 p2p_metadata 上报，此时清掉冷却期
+        //   如果客户端完全失败，10s 后自动解冻（走 WS 兜底）
+        peer.networkChangedCooldownUntil = now + NETWORK_CHANGED_COOLDOWN_MS;
+        console.log(
+          `[Room] ${from} 进入冷却期 ${NETWORK_CHANGED_COOLDOWN_MS}ms，` +
+          `期间不参与打洞协调（等 STUN 拿新地址）`
+        );
 
         for (const [id, targetWs] of this.sessions) {
           if (id === from) continue;
@@ -1335,6 +1371,12 @@ export class Room extends DurableObject {
     await this.webSocketClose(ws);
   }
 
+  // ★ 关键修改：冷却期过滤
+  //
+  // network_changed 后客户端 STUN 需要 1~5 秒拿新地址。这期间：
+  //   - 该 peer 的 pubSocket="" → coordinate() 会因 !a.pubSocket 跳过
+  //   - 但仍会跑 O(N²) 遍历
+  // 冷却期过滤后：该 peer 不进入 coordPeers，O(N²) 减少，且不会生成无效指令
   private async runCoordination(): Promise<void> {
     const now = Date.now();
     if (now - this.lastCoordAt < COORDINATE_THROTTLE_MS) return;
@@ -1343,7 +1385,40 @@ export class Room extends DurableObject {
     const onlinePeers = Array.from(this.peers.values()).filter((p) => p.online);
     if (onlinePeers.length < 2) return;
 
-    const community = { getOnlinePeers: () => onlinePeers };
+    // 冷却期过滤
+    const coordPeers = onlinePeers.filter((p) => {
+      if (p.networkChangedCooldownUntil && now < p.networkChangedCooldownUntil) {
+        return false;
+      }
+      return true;
+    });
+
+    if (coordPeers.length < 2) {
+      // 只有一个 peer 可协调，看最早结束冷却期的时刻，提前设置 alarm 唤醒
+      let earliest = Infinity;
+      for (const p of onlinePeers) {
+        if (p.networkChangedCooldownUntil && p.networkChangedCooldownUntil > now) {
+          if (p.networkChangedCooldownUntil < earliest) {
+            earliest = p.networkChangedCooldownUntil;
+          }
+        }
+      }
+      if (earliest !== Infinity) {
+        try {
+          const current = await this.ctx.storage.getAlarm();
+          if (current === null || current > earliest) {
+            await this.ctx.storage.setAlarm(earliest);
+            console.log(
+              `[Room] 冷却期过滤后只剩 ${coordPeers.length} 个 peer，` +
+              `设置 alarm 在 ${Math.round((earliest - now) / 1000)}s 后唤醒`
+            );
+          }
+        } catch (e) {}
+      }
+      return;
+    }
+
+    const community = { getOnlinePeers: () => coordPeers };
     const { instructions, forceFallbacks } = this.coordinator.coordinate(community);
 
     if (forceFallbacks && forceFallbacks.size > 0) {
