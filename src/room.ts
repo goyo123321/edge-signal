@@ -111,19 +111,18 @@ function cidrOverlaps(a: string, b: string): boolean {
   }
 }
 
-// ============================================================
 // shouldShareLan：优先看 lanSubnets 重叠（不依赖公网 IP）
-// ============================================================
 //
-// 场景 1：双 WAN / 多 AP 上行（两端物理同 LAN 但公网 IP 不同）
-// 场景 2：客户端某次 p2p_metadata 上报 lanSubnets: []（临时探测失败）
-//        但 lanEndpoints 仍是上次的有效值
-// 兜底：都没端点，退回「公网 IP 相同」
-function shouldShareLan(a: PeerRecord, b: PeerRecord): boolean {
+// ★ 修复：排除虚拟网段（客户端误上报 10.64.0.0/24 时）
+function shouldShareLan(a: PeerRecord, b: PeerRecord, virtualCidr: string): boolean {
   let aSubnets = a.lanSubnets || [];
   let bSubnets = b.lanSubnets || [];
 
-  // ★ 修复：lanSubnets 为空但 lanEndpoints 非空时，从端点推 /24 兜底
+  const excludeVirtual = (subnets: string[]) =>
+    subnets.filter((s) => !cidrOverlaps(s, virtualCidr));
+  aSubnets = excludeVirtual(aSubnets);
+  bSubnets = excludeVirtual(bSubnets);
+
   if (aSubnets.length === 0 && a.lanEndpoints.length > 0) {
     const inferred: string[] = [];
     for (const ep of a.lanEndpoints) {
@@ -131,7 +130,9 @@ function shouldShareLan(a: PeerRecord, b: PeerRecord): boolean {
       const parts = host.split(".");
       if (parts.length === 4) {
         const cidr = `${parts[0]}.${parts[1]}.${parts[2]}.0/24`;
-        if (parseCIDR(cidr)) inferred.push(cidr);
+        if (parseCIDR(cidr) && !cidrOverlaps(cidr, virtualCidr)) {
+          inferred.push(cidr);
+        }
       }
     }
     aSubnets = inferred;
@@ -143,7 +144,9 @@ function shouldShareLan(a: PeerRecord, b: PeerRecord): boolean {
       const parts = host.split(".");
       if (parts.length === 4) {
         const cidr = `${parts[0]}.${parts[1]}.${parts[2]}.0/24`;
-        if (parseCIDR(cidr)) inferred.push(cidr);
+        if (parseCIDR(cidr) && !cidrOverlaps(cidr, virtualCidr)) {
+          inferred.push(cidr);
+        }
       }
     }
     bSubnets = inferred;
@@ -158,7 +161,6 @@ function shouldShareLan(a: PeerRecord, b: PeerRecord): boolean {
     return false;
   }
 
-  // 兜底：都没端点，退回「公网 IP 相同」
   const aIp = a._publicIp || "";
   const bIp = b._publicIp || "";
   return !!(aIp && bIp && aIp === bIp);
@@ -742,7 +744,7 @@ export class Room extends DurableObject {
       .filter((p) => p.online && p.clientId !== clientId)
       .map((p) => {
         const addr = this.peerPublicAddr(p);
-        const shareLan = selfPeer ? shouldShareLan(selfPeer, p) : false;
+        const shareLan = selfPeer ? shouldShareLan(selfPeer, p, this.virtualCidr) : false;
         return {
           id: p.clientId,
           virtualIp: p.virtualIp,
@@ -779,6 +781,18 @@ export class Room extends DurableObject {
         try { ws.send(JSON.stringify({ type: "pong", from, t: msg.ts || Date.now() })); } catch {}
         return;
 
+      // ============================================================
+      // ★ 修复：connection_status 更新后触发 runCoordination
+      // ============================================================
+      //
+      // 旧版：只更新 peer.connections，不触发协调
+      //   → 状态变化后不重新下发打洞指令
+      //   → 单向 P2P 时服务端不下发 nat_hole_instruction
+      //
+      // 新版：
+      //   1. 双向状态不一致 → 下发 force_fallback
+      //   2. 单向 P2P（A=undefined, B=p2p）→ 清空 punchState
+      //   3. 触发 runCoordination（500ms 节流）
       case "connection_status":
         if (peer) {
           peer.connections = new Map(Object.entries(msg.payload?.connections || {})) as Map<string, ConnType>;
@@ -787,6 +801,8 @@ export class Room extends DurableObject {
             const other = this.peers.get(otherId);
             if (!other || !other.online) continue;
             const otherState = other.connections.get(from);
+
+            // 双向状态不一致：A=turn, B=p2p → 强制 B 降级
             if (myState === "turn" && otherState === "p2p") {
               const targetWs = this.sessions.get(otherId);
               if (targetWs) {
@@ -805,8 +821,28 @@ export class Room extends DurableObject {
                 }
               }
             }
+
+            // ★ 新增：单向 P2P（A 已清空连接，B 还是 p2p）→ 清空 punchState
+            //   → 触发协调后重新下发打洞指令
+            const otherIsP2P = otherState === "p2p" || otherState === "lan";
+            const selfIsGone = myState === undefined || myState === "unknown";
+            if (selfIsGone && otherIsP2P) {
+              const key = otherId < from ? `${otherId}|${from}` : `${from}|${otherId}`;
+              const prevPunch = this.coordinator.punchState.get(key);
+              if (prevPunch && (prevPunch.aState === 3 || prevPunch.bState === 3)) {
+                console.log(
+                  `[Room] ${from} 已清空连接但 ${otherId} 仍是 ${otherState}，清空 punchState 重新协调`
+                );
+                this.coordinator.punchState.delete(key);
+                this.coordinator.backoff.delete(key);
+                this.coordinator.inFlight.delete(key);
+                this.coordinator.failCounts.delete(key);
+              }
+            }
           }
         }
+        // ★ 修复：触发协调
+        await this.runCoordination();
         return;
 
       case "p2p_metadata":
@@ -884,16 +920,6 @@ export class Room extends DurableObject {
           } else {
             // ★ 修复：p2p_metadata 的空 publicEndpoint 表示客户端地址无效
             //   无条件清空（不依赖 network_changed 是否到达）
-            //
-            // 场景：A 换网络 → OnNetworkChanged 清空 natMeta.PublicEndpoint
-            //   → reportMetadata 上报空 publicEndpoint
-            //   → 旧版：if (!peer.publicEndpoint) peer.pubSocket = ""
-            //     → 如果 peer.publicEndpoint 非空（旧地址未清），不清空
-            //     → 服务端保留旧地址 → 面板显示旧地址
-            //   → 新版：无条件清空 peer.pubSocket + peer.publicEndpoint
-            //
-            // 注意：不设置 pubChanged = true，避免广播空的 joined 给其他 peer
-            //   其他 peer 的 peer_network_changed / 新 p2p_metadata 到达时会更新
             if (peer.pubSocket !== "" || peer.publicEndpoint !== "") {
               console.log(
                 `[Room] ${from} p2p_metadata 空 publicEndpoint，清空 peer.pubSocket (old=${peer.pubSocket})`
@@ -1050,7 +1076,7 @@ export class Room extends DurableObject {
       const target = this.peers.get(id);
       if (!target || !target.online) continue;
 
-      const shareLan = shouldShareLan(target, peer);
+      const shareLan = shouldShareLan(target, peer, this.virtualCidr);
       const payload = {
         id: from,
         virtualIp: peer.virtualIp,
