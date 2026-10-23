@@ -52,7 +52,6 @@ function natBadge(natType) {
   return `<span class="badge unknown">${esc(natType)}</span>`;
 }
 
-// ★ 加 lanList
 function formatConnStatus(connections) {
   if (!connections || Object.keys(connections).length === 0) {
     return `<span style="color:#64748b">--</span>`;
