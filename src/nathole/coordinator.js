@@ -15,7 +15,7 @@ const INFLIGHT_TIMEOUT_MS = 10000;
 const SUCCESS_GRACE_MS = 30000;
 
 const CONN_P2P = "p2p";
-const CONN_LAN = "lan";         // ★ 新增
+const CONN_LAN = "lan";
 const P2P_AVAILABLE = 2;
 const P2P_FULLDUPLEX = 3;
 
