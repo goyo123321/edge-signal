@@ -31,15 +31,15 @@ interface PeerRecord {
   relayBytesOut: number;
   relayPacketsIn: number;
   relayPacketsOut: number;
+  // ★ _publicIp 语义：WSS 连接的 TCP 源 IP（Cloudflare 看到的客户端出口）。
+  //   只在 WS 升级时（fetch()）更新，不受 UDP 层变化影响。
+  //   network_changed 不清空它，否则面板 HTTP IP 列永久空白
+  //   （客户端 _reconnected 会补发 network_changed，每次重连都清）。
   _publicIp?: string;
   multiExit?: boolean;
   features: string[];
 
-  // ★ 新增：网络变化去抖 + 冷却期
-  //   lastNetworkChangedAt：最近一次处理 network_changed 的时间（1.5s 去抖用）
-  //   networkChangedCooldownUntil：冷却期截止时间。期间 runCoordination 不把
-  //     该 peer 纳入协调，等 STUN 拿新地址后 p2p_metadata 清掉冷却期再恢复。
-  //     冷却期 10s 兜底，客户端 STUN 5s 周期内通常 1~2s 就能清掉。
+  // ★ 网络变化去抖 + 冷却期
   lastNetworkChangedAt?: number;
   networkChangedCooldownUntil?: number;
 }
@@ -55,7 +55,7 @@ const PEER_STALE_MS = 90 * 1000;
 const COORDINATE_THROTTLE_MS = 500;
 const REGISTRY_DEBOUNCE_MS = 500;
 
-// ★ 新增：network_changed 去抖 + 冷却期
+// ★ network_changed 去抖 + 冷却期
 const NETWORK_CHANGED_DEBOUNCE_MS = 1500;
 const NETWORK_CHANGED_COOLDOWN_MS = 10000;
 
@@ -123,9 +123,6 @@ function cidrOverlaps(a: string, b: string): boolean {
   }
 }
 
-// shouldShareLan：优先看 lanSubnets 重叠（不依赖公网 IP）
-//
-// ★ 修复：排除虚拟网段（客户端误上报 10.64.0.0/24 时）
 function shouldShareLan(a: PeerRecord, b: PeerRecord, virtualCidr: string): boolean {
   let aSubnets = a.lanSubnets || [];
   let bSubnets = b.lanSubnets || [];
@@ -473,8 +470,8 @@ export class Room extends DurableObject {
             _publicIp: p._publicIp || "",
             multiExit: !!p.multiExit,
             features: sanitizeFeatures(p.features),
-            // ★ 恢复 lastNetworkChangedAt（冷却期是相对当前时间，不恢复）
             lastNetworkChangedAt: p.lastNetworkChangedAt || 0,
+            // 冷却期是相对当前时间的，不恢复
             networkChangedCooldownUntil: 0,
           });
 
@@ -525,7 +522,6 @@ export class Room extends DurableObject {
           relayPacketsOut: p.relayPacketsOut, _publicIp: p._publicIp,
           multiExit: p.multiExit,
           features: p.features || [],
-          // ★ 持久化 lastNetworkChangedAt
           lastNetworkChangedAt: p.lastNetworkChangedAt || 0,
         };
       }
@@ -649,11 +645,20 @@ export class Room extends DurableObject {
     const clientId = url.searchParams.get("cid") || crypto.randomUUID();
     this.community = url.pathname.split("/")[2] || "default";
 
+    // ★ 修复：优先 cf-connecting-ip，兜底 request.cf.clientIp
+    //   某些边缘场景（自定义域名 + Cloudflare Tunnel）可能拿不到 header
     const publicIp =
       request.headers.get("cf-connecting-ip") ||
       request.headers.get("x-real-ip") ||
       request.headers.get("x-forwarded-for")?.split(",")[0].trim() ||
+      (request as any).cf?.clientIp ||
       "";
+
+    // ★ 诊断日志：确认 publicIp 拿到没
+    console.log(
+      `[Room] WS 升级 cid=${clientId} publicIp=${publicIp || "<empty>"} ` +
+      `cf-connecting-ip=${request.headers.get("cf-connecting-ip") || "<null>"}`
+    );
 
     this.closeDuplicate(clientId);
 
@@ -674,6 +679,7 @@ export class Room extends DurableObject {
       peer.lastSeen = now;
       peer.lastServerPongAt = now;
       peer.disconnectedAt = undefined;
+      // ★ _publicIp 只在 WS 升级时更新
       peer._publicIp = publicIp;
 
       peer.features = [];
@@ -925,8 +931,7 @@ export class Room extends DurableObject {
             peer.publicEndpoint = publicEndpoint;
             peer.pubSocket = publicEndpoint;
 
-            // ★ 新增：有效公网地址上报时清冷却期
-            //   客户端换网络后 STUN 拿到新地址就会上报，此时不需要继续冷却
+            // ★ 有效公网地址上报时清冷却期
             if (peer.networkChangedCooldownUntil && peer.networkChangedCooldownUntil > 0) {
               console.log(
                 `[Room] ${from} 冷却期结束（新地址已上报），恢复协调`
@@ -1019,13 +1024,16 @@ export class Room extends DurableObject {
         return;
       }
 
-      // ★ 关键修改：network_changed 加 1.5s 去抖 + 设 10s 兜底冷却期
+      // ★ 关键：network_changed 处理
+      //
+      // 语义：客户端报告「UDP 层可能变了」（换 WiFi / 切 4G / WSS 重连后补发）。
+      // 清空 UDP 相关状态，但不清 _publicIp（WSS TCP 源 IP）。
       case "network_changed": {
         if (!peer) return;
         const reason = (msg.reason as string) || "unknown";
         const now = Date.now();
 
-        // 1.5 秒去抖（客户端已去抖 + 合并延迟，这是双保险）
+        // 1.5 秒去抖（客户端已去抖 + 合并延迟，双保险）
         if (peer.lastNetworkChangedAt && now - peer.lastNetworkChangedAt < NETWORK_CHANGED_DEBOUNCE_MS) {
           console.log(
             `[Room] ${from} network_changed 去抖 (${reason})，` +
@@ -1038,15 +1046,27 @@ export class Room extends DurableObject {
         console.log(`[Room] ${from} 网络变化 (${reason})，清空打洞状态并广播`);
 
         this.coordinator.clearPairStateFor(from);
+
+        // 清空 UDP 层状态（换网络后全部失效）
         peer.pubSocket = "";
         peer.publicEndpoint = "";
         peer.p2pEndpoint = "";
         peer.assistedSockets = [];
         peer.observedRaddr = "";
         peer.lanSubnets = [];
-        peer._publicIp = "";
+        peer.lanEndpoints = [];  // ★ 补清：旧 LAN 地址换网络后不可达
 
-        // ★ 新增：设 10s 兜底冷却期
+        // ★ 清空 TURN relay 地址（旧 allocation 基于旧 NAT 映射，已失效）
+        //   客户端重建 TURN 后会通过 turn_relay_info 重新上报
+        peer.turnRelayAddr = "";
+
+        // ★ 注意：peer._publicIp 不清！
+        //   _publicIp 是 WSS 的 TCP 源 IP，只在 WS 升级时（fetch）更新。
+        //   network_changed 只表示 UDP 层可能变了，不影响 WSS 源 IP。
+        //   清空会导致面板 HTTP IP 列永久空白（客户端 _reconnected 每次都补发
+        //   network_changed，每次重连都清）。
+
+        // 设 10s 兜底冷却期
         //   客户端 STUN 拿到新地址后会 p2p_metadata 上报，此时清掉冷却期
         //   如果客户端完全失败，10s 后自动解冻（走 WS 兜底）
         peer.networkChangedCooldownUntil = now + NETWORK_CHANGED_COOLDOWN_MS;
@@ -1055,6 +1075,7 @@ export class Room extends DurableObject {
           `期间不参与打洞协调（等 STUN 拿新地址）`
         );
 
+        // 广播给其他 peer
         for (const [id, targetWs] of this.sessions) {
           if (id === from) continue;
           try {
@@ -1371,7 +1392,7 @@ export class Room extends DurableObject {
     await this.webSocketClose(ws);
   }
 
-  // ★ 关键修改：冷却期过滤
+  // 冷却期过滤
   //
   // network_changed 后客户端 STUN 需要 1~5 秒拿新地址。这期间：
   //   - 该 peer 的 pubSocket="" → coordinate() 会因 !a.pubSocket 跳过
@@ -1394,7 +1415,6 @@ export class Room extends DurableObject {
     });
 
     if (coordPeers.length < 2) {
-      // 只有一个 peer 可协调，看最早结束冷却期的时刻，提前设置 alarm 唤醒
       let earliest = Infinity;
       for (const p of onlinePeers) {
         if (p.networkChangedCooldownUntil && p.networkChangedCooldownUntil > now) {
