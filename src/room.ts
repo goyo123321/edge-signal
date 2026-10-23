@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { NatHoleCoordinator } from "./nathole/coordinator.js";
 
-type ConnType = "p2p" | "p2p-avail" | "turn" | "relay" | "unknown";
+type ConnType = "p2p" | "p2p-avail" | "lan" | "turn" | "relay" | "unknown";
 
 interface PeerRecord {
   clientId: string;
@@ -44,8 +44,8 @@ const OFFLINE_TTL_MS = 30 * 60 * 1000;
 const SAVE_THROTTLE_MS = 3 * 1000;
 const SERVER_PING_INTERVAL_MS = 30 * 1000;
 const PEER_STALE_MS = 90 * 1000;
-const COORDINATE_THROTTLE_MS = 500;     // ★ 新增
-const REGISTRY_DEBOUNCE_MS = 500;       // ★ 新增
+const COORDINATE_THROTTLE_MS = 500;
+const REGISTRY_DEBOUNCE_MS = 500;
 
 const DEFAULT_VIRTUAL_NETWORK = "10.64.0.0/24";
 
@@ -53,7 +53,7 @@ const MAX_FEATURES = 16;
 const MAX_FEATURE_LEN = 32;
 const MAX_PEER_ID_LEN = 255;
 const MAX_LAN_SUBNETS = 8;
-const MAX_APP_STREAM_DATA_LEN = 65536;  // ★ 新增
+const MAX_APP_STREAM_DATA_LEN = 65536;
 
 interface ParsedCIDR {
   base: number;
@@ -111,25 +111,25 @@ function cidrOverlaps(a: string, b: string): boolean {
   }
 }
 
+// ★ 修改：优先看 lanSubnets 重叠
 function shouldShareLan(a: PeerRecord, b: PeerRecord): boolean {
-  const aIp = a._publicIp || "";
-  const bIp = b._publicIp || "";
-  if (!aIp || !bIp || aIp !== bIp) {
+  const aSubnets = a.lanSubnets || [];
+  const bSubnets = b.lanSubnets || [];
+
+  if (aSubnets.length > 0 && bSubnets.length > 0) {
+    for (const sa of aSubnets) {
+      for (const sb of bSubnets) {
+        if (cidrOverlaps(sa, sb)) {
+          return true;
+        }
+      }
+    }
     return false;
   }
 
-  const aSubnets = a.lanSubnets || [];
-  const bSubnets = b.lanSubnets || [];
-  if (aSubnets.length === 0 || bSubnets.length === 0) {
-    return true;
-  }
-
-  for (const sa of aSubnets) {
-    for (const sb of bSubnets) {
-      if (cidrOverlaps(sa, sb)) return true;
-    }
-  }
-  return false;
+  const aIp = a._publicIp || "";
+  const bIp = b._publicIp || "";
+  return !!(aIp && bIp && aIp === bIp);
 }
 
 function idxToCode(i: number): string {
@@ -204,8 +204,8 @@ export class Room extends DurableObject {
 
   private lastReport = 0;
   private lastRegistryRefresh = 0;
-  private lastForceReportAt = 0;        // ★ 新增：reportToRegistry 去抖
-  private lastCoordAt = 0;              // ★ 新增：runCoordination 节流
+  private lastForceReportAt = 0;
+  private lastCoordAt = 0;
   private coordinator: NatHoleCoordinator;
   private saveAlarmScheduled = false;
   private loadedFromStorage = false;
@@ -506,7 +506,6 @@ export class Room extends DurableObject {
     const url = new URL(request.url);
 
     if (url.pathname === "/_clear") {
-      // ★ 新增：清 pendingSaveTimer，避免 clear 后又把空状态写回
       if (this.pendingSaveTimer !== null) {
         clearTimeout(this.pendingSaveTimer);
         this.pendingSaveTimer = null;
@@ -625,10 +624,7 @@ export class Room extends DurableObject {
       peer.disconnectedAt = undefined;
       peer._publicIp = publicIp;
 
-      // ★ 新增：重连时重置，等客户端下次 p2p_metadata 重报
-      //
-      // 场景：客户端重连时若不上报 features（旧版本降级、metadata 丢包），
-      //       旧版会沿用上次的 features，按「支持 n2na」推二进制 → 目标端解析失败。
+      // 重连重置，等客户端下次 p2p_metadata 重报
       peer.features = [];
       peer.connections = new Map();
       peer.lanEndpoints = [];
@@ -763,7 +759,7 @@ export class Room extends DurableObject {
           const oldNatType = peer.natType;
           const oldLanKey = lanListKey(peer.lanEndpoints);
           const oldAssistedKey = lanListKey(peer.assistedSockets);
-          const oldFeaturesKey = JSON.stringify(peer.features);  // ★ 新增
+          const oldFeaturesKey = JSON.stringify(peer.features);
 
           if (typeof p.name === "string" && p.name) peer.name = p.name;
           peer.natType = p.natType || peer.natType;
@@ -810,7 +806,7 @@ export class Room extends DurableObject {
           if (typeof p.p2pEndpoint === "string" && p.p2pEndpoint) peer.p2pEndpoint = p.p2pEndpoint;
 
           let pubChanged = false;
-          // ★ 修复：同时识别 publicEndpoint 和 pubSocket（旧协议）
+          // 同时识别 publicEndpoint 和 pubSocket（旧协议）
           const publicEndpoint =
             (typeof p.publicEndpoint === "string" && p.publicEndpoint) ||
             (typeof p.pubSocket === "string" && p.pubSocket) ||
@@ -837,11 +833,11 @@ export class Room extends DurableObject {
 
           const newLanKey = lanListKey(peer.lanEndpoints);
           const newAssistedKey = lanListKey(peer.assistedSockets);
-          const newFeaturesKey = JSON.stringify(peer.features);  // ★ 新增
+          const newFeaturesKey = JSON.stringify(peer.features);
           const natTypeChanged = peer.natType !== oldNatType;
           const lanChanged = newLanKey !== oldLanKey;
           const assistedChanged = newAssistedKey !== oldAssistedKey;
-          const featuresChanged = newFeaturesKey !== oldFeaturesKey;  // ★ 新增
+          const featuresChanged = newFeaturesKey !== oldFeaturesKey;
           const needBroadcast =
             pubChanged || natTypeChanged || lanChanged || assistedChanged || featuresChanged;
 
@@ -907,13 +903,6 @@ export class Room extends DurableObject {
         return;
       }
 
-      // ★ 新增：客户端网络变化（WiFi ↔ Cellular）
-      //
-      // 客户端 ConnectivityManager.NetworkCallback 感知后立即上报：
-      //   1. 清空该 peer 的打洞状态
-      //   2. 清空 peer 的公网地址（等新 metadata 上报）
-      //   3. 广播 peer_network_changed 给其他 peer
-      //   4. 触发重新协调
       case "network_changed": {
         if (!peer) return;
         const reason = (msg.reason as string) || "unknown";
@@ -940,14 +929,12 @@ export class Room extends DurableObject {
         }
 
         this.saveStateThrottled();
-        // ★ 重置节流，确保立即协调
         this.lastCoordAt = 0;
         await this.runCoordination();
         return;
       }
 
       default: {
-        // ★ 已知 app_stream_* 必须带 to 且校验长度
         const knownStreamTypes = new Set([
           "app_stream_data", "app_stream_ack", "app_stream_close",
           "app_stream_open", "app_stream_open_ack",
@@ -1026,7 +1013,7 @@ export class Room extends DurableObject {
     const fromPeer = this.peers.get(from);
     if (fromPeer) fromPeer.lastSeen = Date.now();
 
-    // 1. N2NW 帧
+    // N2NW 帧
     if (
       data.length >= 6 &&
       data[0] === 0x4E && data[1] === 0x32 &&
@@ -1043,10 +1030,7 @@ export class Room extends DurableObject {
       const targetWs = this.sessions.get(targetClientId);
       if (!targetWs) return;
 
-      // ★ 新增：检查目标端是否支持 n2nw
-      //
-      // 旧版直接转发 → 旧客户端（只懂 IPv4 裸包）会静默丢弃 N2NW 帧。
-      // 混合房间的「新 → 旧」数据面在 N2NW 路径上不成立。
+      // 检查目标端是否支持 n2nw
       const toPeer = this.peers.get(targetClientId);
       if (!peerHasFeature(toPeer, "n2nw")) {
         console.warn(
@@ -1089,7 +1073,7 @@ export class Room extends DurableObject {
       return;
     }
 
-    // 2. N2NA 帧
+    // N2NA 帧
     if (
       data.length >= 7 &&
       data[0] === 0x4E && data[1] === 0x32 &&
@@ -1099,17 +1083,14 @@ export class Room extends DurableObject {
       return;
     }
 
-    // 3. 裸 IPv4 包
+    // 裸 IPv4 包
     if (data.length < 20) return;
     if (data[0] >> 4 !== 4) return;
 
-    const srcIP = `${data[12]}.${data[13]}.${data[14]}.${data[15]}`;   // ★ 新增
+    const srcIP = `${data[12]}.${data[13]}.${data[14]}.${data[15]}`;
     const dstIP = `${data[16]}.${data[17]}.${data[18]}.${data[19]}`;
 
-    // ★ 新增：源 IP 校验（防止 VIP 欺骗）
-    //
-    // 旧版只校验目的 IP 在虚拟网段内，不校验源 IP。
-    // 恶意客户端可伪造「源 IP = 另一个 peer 的 VIP」的裸包，造成 VIP 欺骗。
+    // 源 IP 校验（防止 VIP 欺骗）
     if (fromPeer && fromPeer.virtualIp && srcIP !== fromPeer.virtualIp) {
       console.warn(
         `[Room] 裸 IPv4 源 IP 欺骗: ${from} 声称 ${srcIP}，实际 VIP ${fromPeer.virtualIp}`
@@ -1257,11 +1238,6 @@ export class Room extends DurableObject {
     await this.webSocketClose(ws);
   }
 
-  // ★ 新增：runCoordination 节流
-  //
-  // p2p_metadata / p2p_state_info 每次进入都调 coordinate()，coordinate 是 O(N²)。
-  // 客户端 5 秒一次 metadata，N=10 房间 → 每 5 秒 45 对评估。
-  // 500ms 节流显著降低 Worker CPU 消耗。
   private async runCoordination(): Promise<void> {
     const now = Date.now();
     if (now - this.lastCoordAt < COORDINATE_THROTTLE_MS) return;
@@ -1374,14 +1350,16 @@ export class Room extends DurableObject {
         if (targetCode) connectionsByCode[targetCode] = type;
       }
 
-      let p2pCount = 0, relayCount = 0, turnCount = 0, availCount = 0;
+      // ★ 加 lanCount
+      let p2pCount = 0, relayCount = 0, turnCount = 0, availCount = 0, lanCount = 0;
       for (const t of p.connections.values()) {
-        if (t === "p2p") p2pCount++;
+        if (t === "lan") lanCount++;
+        else if (t === "p2p") p2pCount++;
         else if (t === "p2p-avail") availCount++;
         else if (t === "turn") turnCount++;
         else if (t === "relay") relayCount++;
       }
-      const totalConnections = p2pCount + availCount + turnCount + relayCount;
+      const totalConnections = lanCount + p2pCount + availCount + turnCount + relayCount;
 
       const relayBytesIn = p.relayBytesIn, relayBytesOut = p.relayBytesOut;
 
@@ -1392,7 +1370,7 @@ export class Room extends DurableObject {
           onlineFor: now - p.connectedAt,
           offlineFor: p.online ? 0 : (p.disconnectedAt ? now - p.disconnectedAt : 0),
           idleFor: now - p.lastSeen,
-          p2pCount, relayCount, turnCount, availCount,
+          lanCount, p2pCount, relayCount, turnCount, availCount,
           connectionsTotal: totalConnections,
           connections: connectionsByCode,
           natType: p.natType || "unknown",
@@ -1416,7 +1394,7 @@ export class Room extends DurableObject {
         offlineFor: p.online ? 0 : (p.disconnectedAt ? now - p.disconnectedAt : 0),
         idleFor: now - p.lastSeen,
         connections: connectionsByCode,
-        p2pCount, relayCount, turnCount, availCount,
+        lanCount, p2pCount, relayCount, turnCount, availCount,
         connectionsTotal: totalConnections,
         relayBytesIn, relayBytesOut,
         relayPacketsIn: p.relayPacketsIn, relayPacketsOut: p.relayPacketsOut,
@@ -1571,7 +1549,6 @@ export class Room extends DurableObject {
     );
   }
 
-  // ★ 修改：force=true 时 500ms 去抖，避免频繁重连打爆 DO Storage 写配额
   private async reportToRegistry(force = false): Promise<void> {
     const now = Date.now();
     if (force) {
