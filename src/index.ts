@@ -12,10 +12,13 @@ export interface Env {
   TURN_SERVERS?: string;
   TURN_USERNAME?: string;
   TURN_PASSWORD?: string;
-  VIRTUAL_NETWORK?: string;   // ★ 新增
+  VIRTUAL_NETWORK?: string;
 }
 
 const DEFAULT_ADMIN_TOKEN = "12332100";
+const TURN_API_TIMEOUT_MS = 5000;
+const TURN_TTL_MIN = 600;
+const TURN_TTL_MAX = 86400 * 7;
 
 function safeEqual(a: string, b: string): boolean {
   if (!a || !b) return false;
@@ -155,24 +158,8 @@ function generateCustomTURN(
 /**
  * 生成 Cloudflare TURN 凭证。
  *
- * 端点：https://rtc.live.cloudflare.com/v1/turn/keys/{keyId}/credentials/generate-ice-servers
- * 认证：Bearer <TURN_KEY_API_TOKEN>
- *
- * 新端点响应（数组格式）：
- * {
- *   "iceServers": [
- *     { "urls": ["stun:stun.cloudflare.com:3478"] },
- *     {
- *       "urls": [
- *         "turn:turn.cloudflare.com:3478?transport=udp",
- *         "turn:turn.cloudflare.com:3478?transport=tcp",
- *         "turns:turn.cloudflare.com:5349?transport=tcp"
- *       ],
- *       "username": "xxx",
- *       "credential": "yyy"
- *     }
- *   ]
- * }
+ * ★ 新增：5 秒超时（AbortController）。旧版 Cloudflare TURN API 慢时
+ *   Worker 请求会 hold 到 30 秒硬超时，影响所有客户端。
  */
 async function generateCloudflareTURN(
   env: Env,
@@ -181,14 +168,26 @@ async function generateCloudflareTURN(
   const apiUrl =
     `https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/generate-ice-servers`;
 
-  const resp = await fetch(apiUrl, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${env.TURN_KEY_API_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ ttl }),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TURN_API_TIMEOUT_MS);
+
+  let resp: Response;
+  try {
+    resp = await fetch(apiUrl, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${env.TURN_KEY_API_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ ttl }),
+      signal: controller.signal,
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    console.error("[TURN] fetch failed:", e);
+    return [];
+  }
+  clearTimeout(timer);
 
   if (!resp.ok) {
     const errText = await resp.text().catch(() => "");
@@ -331,7 +330,9 @@ export default {
         return jsonResp({ success: false, error: "TURN not configured", servers: [] });
       }
 
-      const ttl = parseInt(url.searchParams.get("ttl") || "86400");
+      // ★ 新增：ttl 上限（10 分钟 ~ 7 天）
+      const rawTtl = parseInt(url.searchParams.get("ttl") || "86400");
+      const ttl = Math.max(TURN_TTL_MIN, Math.min(rawTtl || 86400, TURN_TTL_MAX));
 
       try {
         let servers: Array<{ url: string; username: string; password: string; ttl: number }> = [];
@@ -375,175 +376,4 @@ export default {
       if (!roomId) return jsonResp({ error: "Missing roomId" }, 400);
       const id = env.ROOM.idFromName(roomId);
       return env.ROOM.get(id).fetch(
-        new Request(`http://internal/_status?public=1&community=${encodeURIComponent(roomId)}`)
-      );
-    }
-
-    const isAdminRoute =
-      pathname.startsWith("/api/admin/") ||
-      pathname === "/api/rooms" ||
-      pathname.startsWith("/api/status/") ||
-      pathname.startsWith("/api/nathole/");
-
-    if (isAdminRoute) {
-      if (!checkAdmin(request, env)) {
-        return jsonResp({ error: "Unauthorized" }, 401);
-      }
-
-      if (pathname === "/api/admin/rooms" || pathname === "/api/rooms") {
-        const reg = env.REGISTRY.get(env.REGISTRY.idFromName("global"));
-        return reg.fetch(new Request("http://internal/rooms"));
-      }
-
-      const statusMatch = pathname.match(/^\/api\/(admin\/)?status\/(.+)$/);
-      if (statusMatch) {
-        const roomId = decodeURIComponent(statusMatch[2]);
-        const id = env.ROOM.idFromName(roomId);
-        return env.ROOM.get(id).fetch(
-          new Request(`http://internal/_status?community=${encodeURIComponent(roomId)}`)
-        );
-      }
-
-      const natholeMatch = pathname.match(/^\/api\/(admin\/)?nathole\/(.+)$/);
-      if (natholeMatch) {
-        const roomId = decodeURIComponent(natholeMatch[2]);
-        const id = env.ROOM.idFromName(roomId);
-        return env.ROOM.get(id).fetch(
-          new Request(`http://internal/_nathole?community=${encodeURIComponent(roomId)}`)
-        );
-      }
-
-      if (pathname === "/api/admin/clear" && request.method === "POST") {
-        const room = url.searchParams.get("room");
-        const force = url.searchParams.get("force") === "1";
-        if (!room) return jsonResp({ error: "Missing room" }, 400);
-
-        let clearResp: Response;
-        try {
-          const id = env.ROOM.idFromName(room);
-          const clearUrl = force ? "http://internal/_clear?force=1" : "http://internal/_clear";
-          clearResp = await env.ROOM.get(id).fetch(new Request(clearUrl));
-        } catch (e) {
-          console.error(`[admin] clear room DO ${room} failed:`, e);
-          return jsonResp({ error: "Failed to clear room" }, 500);
-        }
-
-        if (clearResp.status === 409) {
-          const body: any = await clearResp.json().catch(() => ({}));
-          return jsonResp({
-            error: "Room has online peers",
-            room,
-            onlineCount: body.onlineCount || 0,
-            onlinePeers: body.onlinePeers || [],
-          }, 409);
-        }
-
-        if (!clearResp.ok) return jsonResp({ error: "Clear failed" }, 500);
-
-        try {
-          const reg = env.REGISTRY.get(env.REGISTRY.idFromName("global"));
-          await reg.fetch(new Request(
-            `http://internal/_clear-one?room=${encodeURIComponent(room)}`,
-            { method: "POST" }
-          ));
-        } catch (e) {
-          console.error(`[admin] clear registry ${room} failed:`, e);
-        }
-
-        return jsonResp({ ok: true, room });
-      }
-
-      if (pathname === "/api/admin/kick" && request.method === "POST") {
-        const room = url.searchParams.get("room");
-        const cid = url.searchParams.get("cid");
-        if (!room || !cid) return jsonResp({ error: "Missing room or cid" }, 400);
-
-        const id = env.ROOM.idFromName(room);
-        return env.ROOM.get(id).fetch(
-          new Request(`http://internal/_kick?cid=${encodeURIComponent(cid)}`, { method: "POST" })
-        );
-      }
-
-      if (pathname === "/api/admin/clear-all" && request.method === "POST") {
-        const force = url.searchParams.get("force") === "1";
-
-        let rooms: any[] = [];
-        try {
-          const reg = env.REGISTRY.get(env.REGISTRY.idFromName("global"));
-          const resp = await reg.fetch(new Request("http://internal/rooms"));
-          rooms = await resp.json();
-        } catch (e) {
-          console.error("[admin] list rooms failed:", e);
-        }
-
-        const cleared: string[] = [];
-        const skipped: any[] = [];
-        const failed: string[] = [];
-
-        for (const r of rooms) {
-          try {
-            const id = env.ROOM.idFromName(r.name);
-            const clearUrl = force ? "http://internal/_clear?force=1" : "http://internal/_clear";
-            const resp = await env.ROOM.get(id).fetch(new Request(clearUrl));
-
-            if (resp.ok) {
-              cleared.push(r.name);
-            } else if (resp.status === 409) {
-              const body: any = await resp.json().catch(() => ({}));
-              skipped.push({
-                room: r.name,
-                reason: "has online peers",
-                onlineCount: body.onlineCount || 0,
-              });
-            } else {
-              failed.push(r.name);
-            }
-          } catch (e) {
-            console.error(`[admin] clear room ${r.name} failed:`, e);
-            failed.push(r.name);
-          }
-        }
-
-        for (const name of cleared) {
-          try {
-            const reg = env.REGISTRY.get(env.REGISTRY.idFromName("global"));
-            await reg.fetch(new Request(
-              `http://internal/_clear-one?room=${encodeURIComponent(name)}`,
-              { method: "POST" }
-            ));
-          } catch (e) {
-            console.error(`[admin] clear registry ${name} failed:`, e);
-          }
-        }
-
-        return jsonResp({
-          ok: true,
-          cleared,
-          skipped,
-          failed,
-          count: cleared.length,
-          skippedCount: skipped.length,
-          failedCount: failed.length,
-        });
-      }
-
-      return new Response("Not found", { status: 404 });
-    }
-
-    if (pathname.startsWith("/ws/")) {
-      if (env.CONNECT_TOKEN && env.CONNECT_TOKEN.trim() !== "") {
-        const provided = url.searchParams.get("token") || "";
-        if (!safeEqual(provided, env.CONNECT_TOKEN)) {
-          return new Response("Invalid token", { status: 403 });
-        }
-      }
-
-      const roomId = pathname.split("/")[2];
-      if (!roomId) return jsonResp({ error: "Missing roomId" }, 400);
-      const id = env.ROOM.idFromName(roomId);
-      return env.ROOM.get(id).fetch(request);
-    }
-
-    return env.ASSETS.fetch(request);
-  },
-};
+        new
