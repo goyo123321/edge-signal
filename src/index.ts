@@ -20,6 +20,21 @@ const TURN_API_TIMEOUT_MS = 5000;
 const TURN_TTL_MIN = 600;
 const TURN_TTL_MAX = 86400 * 7;
 
+// ============================================================
+// ★ 记录最近一次实际成功的 TURN source
+// ============================================================
+//
+// 场景：配了 Cloudflare TURN，但 API 调用失败时 fallback 到自定义 TURN。
+// 面板 /api/public/turn-config 的 source 是「配置层面」的判断（有 Cloudflare
+// 配置就返回 cloudflare），但客户端实际可能拿到 custom。
+//
+// 用模块级变量记录「最近一次 /api/turn-credentials 实际返回的 source」，
+// publicTURNInfo 里返回 actualSource 供面板对比。
+//
+// 注意：Workers isolate 内跨请求保留，isolate 销毁后重置。足够用于面板提示。
+let lastActualTURNSource: "cloudflare" | "custom" | "none" = "none";
+let lastActualTURNAt = 0;
+
 function safeEqual(a: string, b: string): boolean {
   if (!a || !b) return false;
   if (a.length !== b.length) return false;
@@ -250,6 +265,8 @@ async function generateCloudflareTURN(
 function publicTURNInfo(env: Env): {
   enabled: boolean;
   source: "cloudflare" | "custom" | "none";
+  actualSource: "cloudflare" | "custom" | "none";
+  actualSourceAt: number;
   servers: Array<{ url: string }>;
   priority: Array<"cloudflare" | "custom">;
 } {
@@ -269,6 +286,8 @@ function publicTURNInfo(env: Env): {
     return {
       enabled: true,
       source: "cloudflare",
+      actualSource: lastActualTURNSource,
+      actualSourceAt: lastActualTURNAt,
       servers,
       priority,
     };
@@ -284,6 +303,8 @@ function publicTURNInfo(env: Env): {
     return {
       enabled: true,
       source: "custom",
+      actualSource: lastActualTURNSource,
+      actualSourceAt: lastActualTURNAt,
       servers,
       priority: ["custom"],
     };
@@ -292,6 +313,8 @@ function publicTURNInfo(env: Env): {
   return {
     enabled: false,
     source: "none",
+    actualSource: lastActualTURNSource,
+    actualSourceAt: lastActualTURNAt,
     servers: [],
     priority: [],
   };
@@ -344,6 +367,12 @@ export default {
 
         if (servers.length === 0) {
           return jsonResp({ success: false, error: "No TURN servers available", servers: [] });
+        }
+
+        // ★ 记录实际成功的 source
+        if (source === "cloudflare" || source === "custom") {
+          lastActualTURNSource = source;
+          lastActualTURNAt = Date.now();
         }
 
         return jsonResp({ success: true, source, servers });
