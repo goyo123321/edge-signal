@@ -657,7 +657,6 @@ export class Room extends DurableObject {
       peer.disconnectedAt = undefined;
       peer._publicIp = publicIp;
 
-      // 重连时重置，等客户端下次 p2p_metadata 重报
       peer.features = [];
       peer.connections = new Map();
       peer.lanEndpoints = [];
@@ -780,17 +779,6 @@ export class Room extends DurableObject {
         try { ws.send(JSON.stringify({ type: "pong", from, t: msg.ts || Date.now() })); } catch {}
         return;
 
-      // ============================================================
-      // ★ 修复：connection_status 双向状态同步检测
-      // ============================================================
-      //
-      // 场景：A 走 TURN，B 走 P2P（单向 P2P）。
-      //   A 的 TURN 为 B 开了 Permission，但 B 的 TURN 没为 A 开 Permission
-      //   → TURN 服务器拒绝转发 A 的包给 B
-      //   → B 收不到 A 的 TURN 帧 → 无法触发 peer-via-turn 降级
-      //   → 两端都不通
-      // 修复：服务端检测到 A→B=turn 但 B→A=p2p 时，
-      //   下发 force_fallback 让 B 也降级到 TURN
       case "connection_status":
         if (peer) {
           peer.connections = new Map(Object.entries(msg.payload?.connections || {})) as Map<string, ConnType>;
@@ -880,6 +868,7 @@ export class Room extends DurableObject {
             (typeof p.publicEndpoint === "string" && p.publicEndpoint) ||
             (typeof p.pubSocket === "string" && p.pubSocket) ||
             "";
+
           if (publicEndpoint && publicEndpoint !== "") {
             const oldIp = this.extractIp(oldPubSocket);
             const newIp = this.extractIp(publicEndpoint);
@@ -893,7 +882,25 @@ export class Room extends DurableObject {
             peer.publicEndpoint = publicEndpoint;
             peer.pubSocket = publicEndpoint;
           } else {
-            if (!peer.publicEndpoint) peer.pubSocket = "";
+            // ★ 修复：p2p_metadata 的空 publicEndpoint 表示客户端地址无效
+            //   无条件清空（不依赖 network_changed 是否到达）
+            //
+            // 场景：A 换网络 → OnNetworkChanged 清空 natMeta.PublicEndpoint
+            //   → reportMetadata 上报空 publicEndpoint
+            //   → 旧版：if (!peer.publicEndpoint) peer.pubSocket = ""
+            //     → 如果 peer.publicEndpoint 非空（旧地址未清），不清空
+            //     → 服务端保留旧地址 → 面板显示旧地址
+            //   → 新版：无条件清空 peer.pubSocket + peer.publicEndpoint
+            //
+            // 注意：不设置 pubChanged = true，避免广播空的 joined 给其他 peer
+            //   其他 peer 的 peer_network_changed / 新 p2p_metadata 到达时会更新
+            if (peer.pubSocket !== "" || peer.publicEndpoint !== "") {
+              console.log(
+                `[Room] ${from} p2p_metadata 空 publicEndpoint，清空 peer.pubSocket (old=${peer.pubSocket})`
+              );
+              peer.pubSocket = "";
+              peer.publicEndpoint = "";
+            }
           }
 
           if (typeof p.multiExit === "boolean") peer.multiExit = p.multiExit;
@@ -1082,7 +1089,6 @@ export class Room extends DurableObject {
     const fromPeer = this.peers.get(from);
     if (fromPeer) fromPeer.lastSeen = Date.now();
 
-    // 1. N2NW 帧
     if (
       data.length >= 6 &&
       data[0] === 0x4E && data[1] === 0x32 &&
@@ -1141,7 +1147,6 @@ export class Room extends DurableObject {
       return;
     }
 
-    // 2. N2NA 帧
     if (
       data.length >= 7 &&
       data[0] === 0x4E && data[1] === 0x32 &&
@@ -1151,7 +1156,6 @@ export class Room extends DurableObject {
       return;
     }
 
-    // 3. 裸 IPv4 包
     if (data.length < 20) return;
     if (data[0] >> 4 !== 4) return;
 
