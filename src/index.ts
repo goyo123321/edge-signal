@@ -155,12 +155,6 @@ function generateCustomTURN(
   return servers;
 }
 
-/**
- * 生成 Cloudflare TURN 凭证。
- *
- * ★ 新增：5 秒超时（AbortController）。旧版 Cloudflare TURN API 慢时
- *   Worker 请求会 hold 到 30 秒硬超时，影响所有客户端。
- */
 async function generateCloudflareTURN(
   env: Env,
   ttl: number
@@ -204,7 +198,6 @@ async function generateCloudflareTURN(
     return [];
   }
 
-  // 场景 1：新端点返回数组
   if (Array.isArray(iceServers)) {
     for (const ice of iceServers) {
       if (!ice) continue;
@@ -229,7 +222,6 @@ async function generateCloudflareTURN(
     return servers;
   }
 
-  // 场景 2：旧端点返回对象（兼容）
   if (typeof iceServers === "object") {
     const username = iceServers.username || "";
     const credential = iceServers.credential || "";
@@ -330,7 +322,6 @@ export default {
         return jsonResp({ success: false, error: "TURN not configured", servers: [] });
       }
 
-      // ★ 新增：ttl 上限（10 分钟 ~ 7 天）
       const rawTtl = parseInt(url.searchParams.get("ttl") || "86400");
       const ttl = Math.max(TURN_TTL_MIN, Math.min(rawTtl || 86400, TURN_TTL_MAX));
 
